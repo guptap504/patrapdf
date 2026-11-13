@@ -7,7 +7,6 @@ description = "Fill in, sign, redact and watermark PDFs on your own computer."
 authors = ["Prashant Gupta <6059565+guptap504@users.noreply.github.com>"]
 license = "MIT"
 repository = "https://github.com/guptap504/pdf-signer"
-homepage = "https://github.com/guptap504/pdf-signer"
 readme = "README.md"
 keywords = ["pdf", "signature", "forms", "redaction", "gpui"]
 categories = ["gui", "text-processing"]
