@@ -29,6 +29,11 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.2.0" date="2026-11-13">
+      <description>
+        <p>Automatic updates: new versions are downloaded in the background, verified against the project's signing key, and installed on restart.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-13"/>
   </releases>
 </component>
