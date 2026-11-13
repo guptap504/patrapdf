@@ -15,7 +15,8 @@ cargo run --release -- path/to/form.pdf   # the file argument is optional
 - **Edit**: drag items to move them, use the corner handle to resize images, press ⌫ or click ✕ to delete, and use arrow keys to nudge (hold Shift for 10pt steps). ⌘Z undoes and ⇧⌘Z redoes.
 - **Copy fields**: ⌘C / ⌘X / ⌘V copy, cut and paste the selected field. Pasting puts it on the page you're looking at, in the same spot (or slightly offset if that spot is taken). ⌘D duplicates. *Copy to every page* (the stacked-pages button above a selected field) puts it on every other page at the same position, which is handy for initials.
 - **Pages**: the right-hand rail shows a thumbnail of each page; click one to jump there. A blue badge counts the fields on that page.
-- **Zoom**: the percentage in the title bar opens *Fit width* (⌘1, the default), *Fit page* (⌘2) and fixed sizes. − / + step the zoom, ⌘0 is 100%. The fit modes follow the window as it is resized.
+- **Zoom**: pinch on the trackpad, or hold ⌘ (or Ctrl) and use the scroll wheel, to zoom around the pointer. The percentage in the title bar opens *Fit width* (⌘1, the default), *Fit page* (⌘2) and fixed sizes. − / + step the zoom, ⌘0 is 100%. The fit modes follow the window as it is resized.
+- **Pan**: drag any empty part of the page (or the grey area around it) to move around a zoomed-in document. Scrolling works in both directions too.
 - **Save** (⌘S) writes `<name>-signed.pdf`. The original file is never modified.
 - **Discard** (in the title bar when there are unsaved changes, or File → Discard Changes) reverts to the last save. ⌘Z brings the changes back.
 - **Recent documents**: every save adds the document to the start-up gallery, with a thumbnail. Clicking a card reopens the original with your fields still editable. If the original has moved, the saved copy opens instead. ⌘W (or the grid button) closes the document and returns to the gallery.
@@ -29,6 +30,7 @@ cargo run --release -- path/to/form.pdf   # the file argument is optional
 | `ui.rs` | Light and dark palettes (following the system appearance, live) plus shared components: buttons, menus, tooltips. |
 | `assets.rs` | Embedded SVG icon set. |
 | `recents.rs` | Gallery store: `recents/index.json`, first-page thumbnails, and copies of the signature images each entry uses, so entries survive removing a signature from the library. |
+| `gestures.rs` | Trackpad pinch: GPUI 0.2 has no gesture events, so this adds `magnifyWithEvent:` to GPUI's macOS view class and forwards pinches to the editor. |
 | `settings.rs` | User preferences (`settings.json`), currently the date format. |
 | `signatures.rs` | Imports signature images, removes the background, crops, and persists them. |
 | `model.rs` | Item and page geometry, stored in "view space" (points, top-left origin). |

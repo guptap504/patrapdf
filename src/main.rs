@@ -1,5 +1,6 @@
 mod assets;
 mod editor;
+mod gestures;
 mod model;
 mod pdf;
 mod recents;

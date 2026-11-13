@@ -11,13 +11,14 @@ use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
-    Subscription, Task, Window, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
+    Subscription, Task, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
     size,
 };
 
 use crate::model::{Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TextMetrics};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
+use crate::gestures;
 use crate::settings::{self, Settings};
 use crate::signatures;
 use crate::ui;
@@ -53,6 +54,8 @@ const DEFAULT_SIG_WIDTH: f32 = 150.0;
 const DEFAULT_SIG_MAX_HEIGHT: f32 = 55.0;
 const DEFAULT_CHECK_SIZE: f32 = 14.0;
 const SIDEBAR_W: f32 = 248.;
+/// Padding around the page column (`px_8` / `py_8`).
+const PAGES_PAD: f32 = 32.;
 const THUMB_RAIL_W: f32 = 148.;
 /// Thumbnail display width (points) and render width (pixels, 2× for Retina).
 const THUMB_W: f32 = 100.;
@@ -113,6 +116,12 @@ fn tool_label(tool: Tool) -> (&'static str, &'static str) {
         Tool::Date => ("calendar", "Date"),
         Tool::Check => ("check", "Checkmark"),
     }
+}
+
+/// Dragging the page canvas to scroll it.
+struct PanState {
+    start_mouse: Point<Pixels>,
+    start_offset: Point<Pixels>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,6 +221,13 @@ pub struct Editor {
     settings: Settings,
     /// Scroll state of the page list (children are the pages, in order).
     pages_scroll: ScrollHandle,
+    /// The page list's scroll offset when page bounds were last captured. Lets us
+    /// correct those (stale) bounds when the list has scrolled since the last paint.
+    painted_scroll: Rc<Cell<Point<Pixels>>>,
+    /// The zoom the pages were last painted at.
+    painted_zoom: Rc<Cell<f32>>,
+    pan: Option<PanState>,
+    _pinch_task: Task<()>,
     status: SharedString,
     metrics: TextMetrics,
     dirty: bool,
@@ -273,6 +289,22 @@ impl Editor {
             menu_dismissed: false,
             settings: Settings::load(),
             pages_scroll: ScrollHandle::new(),
+            painted_scroll: Rc::new(Cell::new(Point::default())),
+            painted_zoom: Rc::new(Cell::new(0.)),
+            pan: None,
+            _pinch_task: {
+                let mut pinches = gestures::subscribe();
+                cx.spawn_in(window, async move |this, cx| {
+                    use futures::StreamExt as _;
+                    while let Some(pinch) = pinches.next().await {
+                        let anchor = point(px(pinch.position.0), px(pinch.position.1));
+                        let alive = this.update_in(cx, |this, window, cx| this.zoom_by(pinch.factor, Some(anchor), window, cx));
+                        if alive.is_err() {
+                            break;
+                        }
+                    }
+                })
+            },
             status: "Ready".into(),
             metrics,
             dirty: false,
@@ -542,7 +574,7 @@ impl Editor {
     fn ensure_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
         let wanted = (self.zoom * window.scale_factor()).clamp(1.0, MAX_RENDER_SCALE);
-        let stale: Vec<usize> = doc
+        let mut stale: Vec<usize> = doc
             .pages
             .iter()
             .enumerate()
@@ -552,11 +584,22 @@ impl Editor {
         if stale.is_empty() {
             return;
         }
+        // The page in view first, then outwards.
+        let current = self.current_page().unwrap_or(0);
+        stale.sort_by_key(|&i| i.abs_diff(current));
+        // While zooming continuously (pinch, wheel), the stretched bitmaps are fine
+        // for a moment; wait for the zoom to settle rather than re-render every step.
+        // (Each call replaces `render_task`, cancelling the previous wait.) A
+        // page with nothing on screen yet renders at once.
+        let settle = stale.iter().all(|&i| doc.pages[i].image.is_some());
         // Render a bit above what's needed so small zoom steps don't re-render.
         let scale = (wanted * 1.25).min(MAX_RENDER_SCALE);
         let pdf = doc.loaded.pdf.clone();
         let path = doc.path.clone();
         self.render_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if settle {
+                cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
+            }
             for index in stale {
                 let pdf = pdf.clone();
                 let rendered = cx
@@ -903,18 +946,56 @@ impl Editor {
     // Pages & zoom
     // -----------------------------------------------------------------------
 
-    /// The page occupying most of the viewport (from the bounds captured at the last paint).
+    /// Two layout measurements from the last paint that don't depend on zoom:
+    /// the content-space top of the first page, and the space between consecutive
+    /// pages (page label + gaps).
+    fn layout_metrics(&self) -> (Pixels, Pixels) {
+        let fallback = (px(PAGES_PAD), px(48.));
+        let Some(doc) = &self.doc else { return fallback };
+        let first = doc.pages[0].bounds.get();
+        if self.painted_zoom.get() <= 0. || first.size.width <= px(0.) {
+            return fallback;
+        }
+        let lead = first.top() - self.pages_scroll.bounds().top() - self.painted_scroll.get().y;
+        let gap = match doc.pages.get(1) {
+            Some(second) => second.bounds.get().top() - first.bottom(),
+            None => fallback.1,
+        };
+        (lead, gap)
+    }
+
+    /// Where page `index` sits within the scrolled content at zoom `z`. Computed
+    /// from the layout rules rather than the last paint, so it is right even
+    /// before the pages have been painted at a new zoom or scroll position.
+    fn page_content_bounds(&self, index: usize, z: f32) -> Option<Bounds<Pixels>> {
+        let pages = &self.doc.as_ref()?.loaded.pages;
+        let geom = pages.get(index)?;
+        let (lead, gap) = self.layout_metrics();
+        let widest = pages.iter().map(|p| p.width).fold(0., f32::max);
+        // The page column is at least as wide as the viewport, and pages are centred in it.
+        let content_w = self.pages_scroll.bounds().size.width.max(px(widest * z + 2. * PAGES_PAD));
+        let top = pages[..index].iter().fold(lead, |top, p| top + px(p.height * z) + gap);
+        let w = px(geom.width * z);
+        Some(Bounds::new(point((content_w - w) / 2., top), size(w, px(geom.height * z))))
+    }
+
+    /// Where page `index` is on screen right now (window coordinates).
+    fn live_page_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let content = self.page_content_bounds(index, self.zoom)?;
+        let origin = self.pages_scroll.bounds().origin + self.pages_scroll.offset();
+        Some(Bounds::new(content.origin + origin, content.size))
+    }
+
+    /// The page occupying most of the viewport.
     fn current_page(&self) -> Option<usize> {
         let doc = self.doc.as_ref()?;
         let viewport = self.pages_scroll.bounds();
         if viewport.size.height <= px(0.) {
             return Some(0);
         }
-        doc.pages
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let b = p.bounds.get();
+        (0..doc.pages.len())
+            .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
+            .map(|(i, b)| {
                 let visible = (b.bottom().min(viewport.bottom()) - b.top().max(viewport.top())).max(px(0.));
                 (i, visible)
             })
@@ -923,12 +1004,11 @@ impl Editor {
     }
 
     fn scroll_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        let Some(doc) = &self.doc else { return };
-        let Some(view) = doc.pages.get(page) else { return };
+        let Some(bounds) = self.live_page_bounds(page) else { return };
         let viewport = self.pages_scroll.bounds();
         let offset = self.pages_scroll.offset();
         // Bring the page's top edge to just below the top of the viewport.
-        let delta = view.bounds.get().top() - viewport.top() - px(24.);
+        let delta = bounds.top() - viewport.top() - px(24.);
         self.pages_scroll.set_offset(point(offset.x, offset.y - delta));
         cx.notify();
     }
@@ -959,8 +1039,79 @@ impl Editor {
         self.zoom_mode = mode;
         self.zoom_menu_open = false;
         if let Some(zoom) = self.fit_zoom(mode) {
-            self.zoom = zoom;
-            self.ensure_rendered(window, cx);
+            let page = self.current_page();
+            self.apply_zoom(zoom, None, window, cx);
+            // "Fit page" is about seeing one whole page, so line it up.
+            if let (ZoomMode::FitPage, Some(page)) = (mode, page) {
+                self.scroll_to_page(page, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Multiply the zoom (wheel / pinch), keeping `anchor` fixed on screen.
+    fn zoom_by(&mut self, factor: f32, anchor: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.zoom_mode = ZoomMode::Fixed;
+        self.zoom_menu_open = false;
+        self.apply_zoom(self.zoom * factor, anchor, window, cx);
+    }
+
+    /// Change the zoom so that the document point under `anchor` (default: the
+    /// viewport centre) stays where it is on screen.
+    fn apply_zoom(&mut self, zoom: f32, anchor: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let viewport = self.pages_scroll.bounds();
+        let anchor = anchor.filter(|a| viewport.contains(a)).unwrap_or_else(|| viewport.center());
+        if let Some(offset) = self.offset_keeping(anchor, zoom) {
+            self.pages_scroll.set_offset(offset);
+        }
+        self.zoom = zoom;
+        self.ensure_rendered(window, cx);
+        cx.notify();
+    }
+
+    /// The scroll offset that keeps the document point under `anchor` in place
+    /// after zooming to `new_zoom`. (GPUI clamps it to the scrollable range.)
+    fn offset_keeping(&self, anchor: Point<Pixels>, new_zoom: f32) -> Option<Point<Pixels>> {
+        let doc = self.doc.as_ref()?;
+        let viewport = self.pages_scroll.bounds();
+        if viewport.size.width <= px(0.) {
+            return None;
+        }
+        // The page nearest the anchor, and the anchor's position on it in page points
+        // (it may lie a little outside the page, e.g. in the gap between pages).
+        let distance = |b: &Bounds<Pixels>| (b.top() - anchor.y).max(anchor.y - b.bottom()).max(px(0.));
+        let (index, bounds) = (0..doc.pages.len())
+            .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
+            .min_by(|a, b| distance(&a.1).partial_cmp(&distance(&b.1)).unwrap_or(std::cmp::Ordering::Equal))?;
+        let on_page = (anchor - bounds.origin).map(|v| v / px(self.zoom));
+        let after = self.page_content_bounds(index, new_zoom)?;
+        let anchor_in_content = after.origin + on_page.map(|v| px(v * new_zoom));
+        Some((anchor - viewport.origin) - anchor_in_content)
+    }
+
+    // -----------------------------------------------------------------------
+    // Panning
+    // -----------------------------------------------------------------------
+
+    fn can_pan(&self) -> bool {
+        let max = self.pages_scroll.max_offset();
+        max.width > px(0.) || max.height > px(0.)
+    }
+
+    fn start_pan(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.finish_editing(cx);
+        self.close_menus();
+        self.selected = None;
+        if self.drag.is_none() {
+            self.pan = Some(PanState {
+                start_mouse: event.position,
+                start_offset: self.pages_scroll.offset(),
+            });
         }
         cx.notify();
     }
@@ -1074,9 +1225,7 @@ impl Editor {
     fn set_zoom(&mut self, zoom: f32, window: &mut Window, cx: &mut Context<Self>) {
         self.zoom_mode = ZoomMode::Fixed;
         self.zoom_menu_open = false;
-        self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        self.ensure_rendered(window, cx);
-        cx.notify();
+        self.apply_zoom(zoom, None, window, cx);
     }
 
     // -----------------------------------------------------------------------
@@ -1089,8 +1238,10 @@ impl Editor {
         self.close_menus();
         let Some((page, x, y)) = self.page_at(event.position) else { return };
         if self.tool == Tool::Select {
+            // Let the press reach the canvas, which starts panning.
             self.selected = None;
         } else {
+            cx.stop_propagation();
             self.place_tool(self.tool, page, x, y, cx);
             self.tool = Tool::Select;
         }
@@ -1162,6 +1313,16 @@ impl Editor {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pan) = &self.pan {
+            if event.pressed_button == Some(MouseButton::Left) {
+                let offset = pan.start_offset + (event.position - pan.start_mouse);
+                self.pages_scroll.set_offset(offset);
+            } else {
+                self.pan = None;
+            }
+            cx.notify();
+            return;
+        }
         let Some(drag) = &mut self.drag else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             return;
@@ -1202,6 +1363,9 @@ impl Editor {
 
     fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.menu_dismissed = false;
+        if self.pan.take().is_some() {
+            cx.notify();
+        }
         if let Some(drag) = self.drag.take() {
             if drag.moved {
                 self.push_history(drag.snapshot);
@@ -1382,6 +1546,8 @@ impl Editor {
                                 .border_color(ui::border_strong())
                                 .bg(ui::surface())
                                 .shadow(ui::card_shadow())
+                                // Rapid clicks here must not register as a title-bar double-click.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     ui::icon_button("zoom-out", "minus")
                                         .size(px(28.))
@@ -2437,7 +2603,14 @@ impl Editor {
 
         let z = self.zoom;
         let page_count = doc.pages.len();
-        let cursor = if self.tool == Tool::Select { CursorStyle::Arrow } else { CursorStyle::Crosshair };
+        let hand = if self.pan.is_some() {
+            CursorStyle::ClosedHand
+        } else if self.can_pan() {
+            CursorStyle::OpenHand
+        } else {
+            CursorStyle::Arrow
+        };
+        let cursor = if self.tool == Tool::Select { hand } else { CursorStyle::Crosshair };
         let mut page_elements = Vec::with_capacity(page_count);
         for (index, (geom, view)) in doc.loaded.pages.iter().zip(&doc.pages).enumerate() {
             let items: Vec<_> = self
@@ -2448,6 +2621,8 @@ impl Editor {
                 .collect();
 
             let bounds = view.bounds.clone();
+            let (scroll, painted_scroll, painted_zoom) =
+                (self.pages_scroll.clone(), self.painted_scroll.clone(), self.painted_zoom.clone());
             let page = div()
                 .id(("page", index))
                 .relative()
@@ -2463,7 +2638,18 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| this.page_mouse_down(index, e, window, cx)),
                 )
-                .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+                .child(
+                    canvas(
+                        move |b, _, _| {
+                            bounds.set(b);
+                            painted_scroll.set(scroll.offset());
+                            painted_zoom.set(z);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
                 .when_some(view.image.clone(), |d, image| {
                     d.child(img(image).absolute().size_full().object_fit(ObjectFit::Fill))
                 })
@@ -2505,16 +2691,47 @@ impl Editor {
             Tool::Check => Some(("check", "Click on the page to add a checkmark")),
         };
 
+        // ⌘/Ctrl + wheel zooms around the pointer. Listening in the capture phase
+        // lets us take the event before the page list would scroll with it.
+        let editor = cx.entity().downgrade();
+        let wheel_zoom = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let editor = editor.clone();
+                window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                    let zoom_modifier = e.modifiers.platform || e.modifiers.control;
+                    if phase != DispatchPhase::Capture || !zoom_modifier || !bounds.contains(&e.position) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let dy = e.delta.pixel_delta(px(20.)).y / px(1.);
+                    let factor = (dy * 0.005).clamp(-0.5, 0.5).exp();
+                    let _ = editor.update(cx, |this, cx| this.zoom_by(factor, Some(e.position), window, cx));
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
         div()
             .relative()
             .flex_1()
             .h_full()
             .min_w_0()
+            .child(wheel_zoom)
             .child(
                 div()
                     .id("pages")
                     .size_full()
+                    // A row, so the page column can grow wider than the viewport
+                    // (and scroll horizontally) when zoomed in. `items_start` stops the
+                    // column being stretched to the viewport height, which would hide
+                    // its overflow from the scroll container.
+                    .flex()
+                    .items_start()
                     .overflow_scroll()
+                    .cursor(hand)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::start_pan))
                     .track_scroll(&self.pages_scroll)
                     // Keeps the thumbnail rail's "current page" highlight in sync.
                     .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.notify()))
@@ -2525,6 +2742,7 @@ impl Editor {
                             .flex_col()
                             .items_center()
                             .gap_6()
+                            .flex_none()
                             .px_8()
                             .py_8()
                             .min_w_full()
@@ -2947,9 +3165,76 @@ mod tests {
             assert!(e.doc.as_ref().unwrap().pages.iter().all(|p| p.thumb.is_some()));
             assert_eq!(e.current_page(), Some(0));
         });
-        editor.update(cx, |e, cx| e.scroll_to_page(1, cx));
+        // The highlight must follow straight away, before the pages are painted again
+        // (it's computed in the render that the click triggers).
+        editor.update(cx, |e, cx| {
+            e.scroll_to_page(1, cx);
+            assert_eq!(e.current_page(), Some(1));
+        });
         cx.run_until_parked();
         editor.read_with(cx, |e, _| assert_eq!(e.current_page(), Some(1)));
+        editor.update(cx, |e, cx| {
+            e.scroll_to_page(0, cx);
+            assert_eq!(e.current_page(), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn zooming_keeps_the_pointed_spot_and_dragging_pans(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+        let anchor = origin + point(px(200.), px(300.));
+        let state = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| (e.zoom, e.pages_scroll.offset(), e.pages_scroll.max_offset(), e.page_at(anchor)))
+        };
+
+        // Zoom in around a point: the same spot of the page stays under it.
+        editor.update_in(cx, |e, window, cx| e.zoom_by(3.0, Some(anchor), window, cx));
+        cx.run_until_parked();
+        let (zoom, start, max, hit) = state(&editor, cx);
+        assert_eq!(zoom, 3.0);
+        let (page, x, y) = hit.expect("anchor should still be over a page");
+        assert_eq!(page, 0);
+        assert!((x - 200.).abs() < 0.5 && (y - 300.).abs() < 0.5, "drifted to ({x}, {y})");
+        assert!(max.width > px(0.), "zoomed-in pages should scroll horizontally");
+
+        // Dragging empty page area pans (clamped to the scrollable range).
+        let delta = point(px(-150.), px(-90.));
+        cx.simulate_mouse_down(anchor, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(anchor + delta, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(anchor + delta, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let (_, panned, _, _) = state(&editor, cx);
+        let expected = point(
+            (start.x + delta.x).clamp(-max.width, px(0.)),
+            (start.y + delta.y).clamp(-max.height, px(0.)),
+        );
+        assert_eq!(panned, expected);
+        assert_ne!(panned, start);
+        editor.read_with(cx, |e, _| assert!(e.pan.is_none() && e.items.is_empty()));
+
+        // ⌘ + wheel zooms around the pointer instead of scrolling…
+        let wheel = |modifiers| ScrollWheelEvent {
+            position: anchor,
+            delta: gpui::ScrollDelta::Lines(point(0., 2.)),
+            modifiers,
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let before = editor.read_with(cx, |e, _| e.page_at(anchor)).unwrap();
+        cx.simulate_event(wheel(Modifiers::command()));
+        cx.run_until_parked();
+        let (zoomed, _, _, hit) = state(&editor, cx);
+        assert!(zoomed > 3.0, "zoom should grow, got {zoomed}");
+        let hit = hit.unwrap();
+        assert!((hit.1 - before.1).abs() < 0.5 && (hit.2 - before.2).abs() < 0.5);
+
+        // …while a plain wheel still scrolls.
+        let (_, offset, _, _) = state(&editor, cx);
+        cx.simulate_event(wheel(Modifiers::none()));
+        cx.run_until_parked();
+        let (zoom_after, offset_after, _, _) = state(&editor, cx);
+        assert_eq!(zoom_after, zoomed);
+        assert_ne!(offset_after, offset);
     }
 
     #[gpui::test]

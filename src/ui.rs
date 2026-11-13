@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AnyView, App, BoxShadow, Context, CursorStyle, Div, ElementId, FontWeight, Hsla, IntoElement, Render,
+    AnyView, App, BoxShadow, Context, CursorStyle, Div, ElementId, FontWeight, Hsla, IntoElement, MouseButton, Render,
     SharedString, Stateful, Svg, Window, WindowAppearance, div, point, prelude::*, px, rgb, rgba, svg,
 };
 
@@ -191,6 +191,15 @@ pub fn tooltip(
     }
 }
 
+/// A clickable element whose presses stay with it: without this, a mouse-down
+/// also reaches the parents, so e.g. two quick clicks on a title-bar button
+/// would count as a title-bar double-click (which zooms the window).
+pub fn button_base(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
 /// A square, borderless icon button (toolbar style).
 pub fn icon_button(id: impl Into<ElementId>, icon_name: &str) -> Stateful<Div> {
     icon_button_tinted(id, icon_name, text_primary())
@@ -198,8 +207,7 @@ pub fn icon_button(id: impl Into<ElementId>, icon_name: &str) -> Stateful<Div> {
 
 /// Like [`icon_button`], with a custom icon colour on hover (e.g. red for delete).
 pub fn icon_button_tinted(id: impl Into<ElementId>, icon_name: &str, hover_color: Hsla) -> Stateful<Div> {
-    div()
-        .id(id)
+    button_base(id)
         .flex()
         .flex_none()
         .items_center()
@@ -215,8 +223,7 @@ pub fn icon_button_tinted(id: impl Into<ElementId>, icon_name: &str, hover_color
 
 /// A filled accent button.
 pub fn primary_button(id: impl Into<ElementId>, icon_name: &str, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
+    button_base(id)
         .flex()
         .flex_none()
         .items_center()
@@ -237,8 +244,7 @@ pub fn primary_button(id: impl Into<ElementId>, icon_name: &str, label: &'static
 
 /// A white, bordered button.
 pub fn secondary_button(id: impl Into<ElementId>, icon_name: &str, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
+    button_base(id)
         .flex()
         .flex_none()
         .items_center()
@@ -282,8 +288,7 @@ pub fn hud_button(id: impl Into<ElementId>, icon_name: &str) -> Stateful<Div> {
 }
 
 pub fn hud_button_tinted(id: impl Into<ElementId>, icon_name: &str, hover_color: Hsla) -> Stateful<Div> {
-    div()
-        .id(id)
+    button_base(id)
         .flex()
         .items_center()
         .justify_center()
@@ -325,8 +330,7 @@ pub fn menu_item(
     checked: bool,
     shortcut: Option<&'static str>,
 ) -> Stateful<Div> {
-    div()
-        .id(id)
+    button_base(id)
         .flex()
         .items_center()
         .gap_2()
