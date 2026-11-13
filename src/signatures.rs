@@ -24,7 +24,14 @@ pub fn is_pdf(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
-pub fn library_dir() -> PathBuf {
+/// Root of the app's data directory
+/// (`~/Library/Application Support/pdf-signer` on macOS).
+/// Set `PDF_SIGNER_DATA_DIR` to use a different directory (handy for development).
+#[cfg(not(test))]
+pub fn app_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PDF_SIGNER_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let base = if cfg!(target_os = "macos") {
         home.join("Library/Application Support")
@@ -33,7 +40,17 @@ pub fn library_dir() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"))
     };
-    base.join("pdf-signer").join("signatures")
+    base.join("pdf-signer")
+}
+
+/// Tests must never touch the user's real library or recents.
+#[cfg(test)]
+pub fn app_data_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("pdf-signer-test-{}", std::process::id()))
+}
+
+pub fn library_dir() -> PathBuf {
+    app_data_dir().join("signatures")
 }
 
 /// Load all signatures from the library directory (oldest first).
@@ -49,7 +66,7 @@ pub fn load_library() -> Vec<Arc<Signature>> {
     paths.into_iter().filter_map(|p| open_signature(&p).ok()).collect()
 }
 
-fn open_signature(path: &Path) -> Result<Arc<Signature>> {
+pub fn open_signature(path: &Path) -> Result<Arc<Signature>> {
     let (width_px, height_px) = image::image_dimensions(path)?;
     Ok(Arc::new(Signature {
         path: path.to_path_buf(),

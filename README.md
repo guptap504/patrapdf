@@ -9,21 +9,33 @@ cargo run --release -- path/to/form.pdf   # the file argument is optional
 ## Using it
 
 - **Open** a PDF with ⌘O, or drop it onto the window.
-- **Text / Date / ✓ Check**: pick a tool, then click on the page. Type into text boxes directly. Enter adds a line, Esc finishes, ⌘V pastes.
+- **Fill in** (top of the left sidebar): *Text*, *Date* and *Checkmark*. Click one and then click the page, or drag it straight onto the page. Type into text boxes directly: Enter adds a line, Esc finishes, ⌘V pastes text.
+- **Date format**: *Format ▾* next to the Date tool offers `13.11.2026`, `13/11/2026`, `11/13/2026`, `2026-11-13`, `13 Nov 2026` and `November 13, 2026`. The choice is remembered in `settings.json`.
 - **Signatures**: use *+ Add signature image…* (PNG/JPEG). White paper is removed automatically and the result is kept in `~/Library/Application Support/pdf-signer/signatures`. Drag a signature from the sidebar onto a page, or drop an image file from Finder straight onto a page.
-- **Edit**: drag items to move them, use the corner handle to resize images, press ⌫ or click ✕ to delete, and use arrow keys to nudge (hold Shift for 10pt steps). ⌘Z undoes.
+- **Edit**: drag items to move them, use the corner handle to resize images, press ⌫ or click ✕ to delete, and use arrow keys to nudge (hold Shift for 10pt steps). ⌘Z undoes and ⇧⌘Z redoes.
+- **Copy fields**: ⌘C / ⌘X / ⌘V copy, cut and paste the selected field. Pasting puts it on the page you're looking at, in the same spot (or slightly offset if that spot is taken). ⌘D duplicates. *Copy to every page* (the stacked-pages button above a selected field) puts it on every other page at the same position, which is handy for initials.
+- **Pages**: the right-hand rail shows a thumbnail of each page; click one to jump there. A blue badge counts the fields on that page.
+- **Zoom**: the percentage in the title bar opens *Fit width* (⌘1, the default), *Fit page* (⌘2) and fixed sizes. − / + step the zoom, ⌘0 is 100%. The fit modes follow the window as it is resized.
 - **Save** (⌘S) writes `<name>-signed.pdf`. The original file is never modified.
+- **Discard** (in the title bar when there are unsaved changes, or File → Discard Changes) reverts to the last save. ⌘Z brings the changes back.
+- **Recent documents**: every save adds the document to the start-up gallery, with a thumbnail. Clicking a card reopens the original with your fields still editable. If the original has moved, the saved copy opens instead. ⌘W (or the grid button) closes the document and returns to the gallery.
 
 ## How it works
 
 | Module | Role |
 | --- | --- |
 | `pdf.rs` | Renders pages with `hayro` (pure Rust). Writes overlays with `lopdf` as a new content stream on each page: Helvetica text, an RGB image XObject with an alpha soft mask, and a vector checkmark. |
-| `editor.rs` | GPUI view: toolbar, signature sidebar, page canvas, mouse and keyboard handling. |
+| `editor.rs` | GPUI view: title bar, Fill in / signature sidebar, page canvas, thumbnail rail, menus, mouse and keyboard handling, undo/redo and the field clipboard. |
+| `ui.rs` | Light and dark palettes (following the system appearance, live) plus shared components: buttons, menus, tooltips. |
+| `assets.rs` | Embedded SVG icon set. |
+| `recents.rs` | Gallery store: `recents/index.json`, first-page thumbnails, and copies of the signature images each entry uses, so entries survive removing a signature from the library. |
+| `settings.rs` | User preferences (`settings.json`), currently the date format. |
 | `signatures.rs` | Imports signature images, removes the background, crops, and persists them. |
 | `model.rs` | Item and page geometry, stored in "view space" (points, top-left origin). |
 
 Each page's `view_to_user` matrix is the inverse of hayro's page transform. That handles `/Rotate` and offset crop boxes, so overlays land exactly where they appeared on screen. Text baselines use the measured metrics of the UI font.
+
+App data lives in `~/Library/Application Support/pdf-signer`. Set `PDF_SIGNER_DATA_DIR` to use another directory, for example for development.
 
 Building on macOS requires the Xcode Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). To build without it, enable gpui's `runtime_shaders` feature.
 
