@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- macOS icon grid: 824px rounded square on a 1024 canvas, with a soft shadow. -->
+  <defs><filter id="tile-shadow" x="-10%" y="-10%" width="120%" height="125%">
+    <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.28"/></filter></defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#2553D8" filter="url(#tile-shadow)"/>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B95FF"/>
+      <stop offset="1" stop-color="#2553D8"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#DCE5F6"/>
+      <stop offset="1" stop-color="#B9C8E6"/>
+    </linearGradient>
+    <filter id="page-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#0B2A7A" flood-opacity="0.35"/>
+    </filter>
+    <filter id="pen-shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0B2A7A" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- the page -->
+  <g filter="url(#page-shadow)">
+    <path d="M318 214 H600 L716 330 V778 a30 30 0 0 1 -30 30 H318 a30 30 0 0 1 -30 -30 V244 a30 30 0 0 1 30 -30 Z" fill="#FFFFFF"/>
+  </g>
+  <path d="M600 214 V300 a30 30 0 0 0 30 30 H716 Z" fill="url(#fold)"/>
+  <g fill="#D3DCEE">
+    <rect x="346" y="318" width="190" height="22" rx="11"/>
+    <rect x="346" y="378" width="314" height="22" rx="11"/>
+    <rect x="346" y="438" width="270" height="22" rx="11"/>
+    <rect x="346" y="498" width="300" height="22" rx="11"/>
+  </g>
+  <!-- signature line and signature -->
+  <rect x="346" y="712" width="314" height="8" rx="4" fill="#C3CEE4"/>
+  <path d="M352 690 C 372 640, 392 590, 418 588 C 446 586, 420 676, 444 680 C 468 684, 482 618, 506 620 C 528 622, 516 676, 540 676 C 566 676, 582 636, 610 640 C 630 643, 640 660, 668 650"
+        fill="none" stroke="#1E4FD6" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- pen -->
+  <g filter="url(#pen-shadow)" transform="translate(-6 34) rotate(38 712 560)">
+    <rect x="682" y="300" width="60" height="250" rx="16" fill="#FFB224"/>
+    <rect x="682" y="300" width="60" height="62" rx="16" fill="#1F2A44"/>
+    <rect x="682" y="346" width="60" height="16" fill="#1F2A44"/>
+    <path d="M682 548 H742 L712 622 Z" fill="#F4E3C3"/>
+    <path d="M702 597 L722 597 L712 622 Z" fill="#1F2A44"/>
+  </g>
+</svg>

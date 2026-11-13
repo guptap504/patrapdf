@@ -9,14 +9,14 @@ use std::sync::Arc;
 use futures::channel::oneshot;
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Task, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
     size,
 };
 
-use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TextMetrics};
+use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TEXT_FONT, TextMetrics};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
 use crate::gestures;
@@ -43,6 +43,7 @@ actions!(
         AddSignature,
         CloseDocument,
         DiscardChanges,
+        About,
         Quit
     ]
 );
@@ -282,6 +283,8 @@ pub struct Editor {
     saved_order: Vec<usize>,
     /// While dragging a page thumbnail: the gap it would be dropped into (0 = before page 1).
     page_drop_target: Option<usize>,
+    /// The mouse went down on the (self-drawn) title bar; a drag now moves the window.
+    titlebar_pressed: bool,
     watermark_menu_open: bool,
     /// Typing into the watermark text box.
     watermark_editing: bool,
@@ -353,7 +356,7 @@ impl Editor {
 
         // Measure the UI font so text lands on the same baseline in the PDF.
         let ts = window.text_system();
-        let font_id = ts.resolve_font(&font("Helvetica"));
+        let font_id = ts.resolve_font(&font(TEXT_FONT));
         let a = ts.ascent(font_id, px(1000.)) / px(1000.);
         let d = ts.descent(font_id, px(1000.)) / px(1000.);
         let metrics = TextMetrics {
@@ -370,6 +373,7 @@ impl Editor {
             saved_watermark: None,
             saved_order: Vec::new(),
             page_drop_target: None,
+            titlebar_pressed: false,
             watermark_menu_open: false,
             watermark_editing: false,
             watermark_replace: false,
@@ -437,7 +441,7 @@ impl Editor {
         })
     }
 
-    fn request_open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn request_open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let confirm = self.confirm_discard(window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = confirm {
@@ -605,7 +609,7 @@ impl Editor {
         self.editing = None;
         self.drag = None;
         self.dirty = false;
-        self.status = "Changes discarded. Press ⌘Z to bring them back.".into();
+        self.status = format!("Changes discarded. Press {} to bring them back.", ui::keys("⌘Z")).into();
         cx.notify();
     }
 
@@ -1048,7 +1052,7 @@ impl Editor {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
         }
         self.field_clipboard = Some(item);
-        self.status = "Field copied. Press ⌘V to paste it on any page.".into();
+        self.status = format!("Field copied. Press {} to paste it on any page.", ui::keys("⌘V")).into();
         cx.notify();
     }
 
@@ -1059,7 +1063,7 @@ impl Editor {
         let Some(item) = self.selected_item().cloned() else { return };
         self.field_clipboard = Some(item.clone());
         self.delete_item(item.id, cx);
-        self.status = "Field cut. Press ⌘V to paste it.".into();
+        self.status = format!("Field cut. Press {} to paste it.", ui::keys("⌘V")).into();
     }
 
     /// ⌘V: paste text while typing, otherwise paste the copied field.
@@ -1161,7 +1165,7 @@ impl Editor {
             doc.order.remove(page);
         }
         self.selected = None;
-        self.status = format!("Deleted page {}. Press ⌘Z to bring it back.", page + 1).into();
+        self.status = format!("Deleted page {}. Press {} to bring it back.", page + 1, ui::keys("⌘Z")).into();
         cx.notify();
     }
 
@@ -1794,7 +1798,7 @@ impl Editor {
     // Rendering
     // -----------------------------------------------------------------------
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_titlebar(&self, client_decorated: bool, maximized: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let has_doc = self.doc.is_some();
         let (title, subtitle) = match &self.doc {
             Some(doc) => {
@@ -1812,15 +1816,35 @@ impl Editor {
             .items_center()
             .gap_3()
             .h(px(52.))
-            .pl(px(84.))
+            // Room for the traffic lights on macOS.
+            .pl(px(if cfg!(target_os = "macos") { 84. } else { 14. }))
             .pr_3()
             .bg(ui::chrome_bg())
             .border_b_1()
             .border_color(ui::border())
-            .on_click(|e: &ClickEvent, window, _| {
+            .on_click(move |e: &ClickEvent, window, _| {
                 if e.click_count() == 2 {
-                    window.titlebar_double_click();
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else if client_decorated {
+                        window.zoom_window();
+                    }
                 }
+            })
+            // Where the app draws its own title bar (Linux compositors without
+            // server-side decorations), dragging it moves the window. The move
+            // starts on the first drag step so double-clicks still arrive.
+            .when(client_decorated, |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, _| this.titlebar_pressed = true),
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.titlebar_pressed = false))
+                .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, _| {
+                    if std::mem::take(&mut this.titlebar_pressed) && e.dragging() {
+                        window.start_window_move();
+                    }
+                }))
             })
             // Left: document identity.
             .child(
@@ -1981,6 +2005,33 @@ impl Editor {
                     }),
                 // No document: the start screen (gallery or empty state) has its own open action.
             )
+            .when(client_decorated, |d| {
+                let control = |id: &'static str, icon: &'static str| {
+                    ui::button_base(id)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(28.))
+                        .rounded_full()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(ui::hover_bg()))
+                        .child(ui::icon(icon, ui::text_secondary()).size(px(14.)))
+                };
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .ml_2()
+                        .child(control("win-minimize", "window-minimize").on_click(|_, window, _| window.minimize_window()))
+                        .child(
+                            control("win-maximize", if maximized { "window-restore" } else { "window-maximize" })
+                                .on_click(|_, window, _| window.zoom_window()),
+                        )
+                        .child(control("win-close", "close").on_click(|_, window, _| window.remove_window())),
+                )
+            })
     }
 
     /// Wrap a menu panel so it floats above everything, anchored below its trigger
@@ -2673,7 +2724,7 @@ impl Editor {
                 div()
                     .flex()
                     .flex_col()
-                    .font_family("Helvetica")
+                    .font_family(TEXT_FONT)
                     .text_size(fs)
                     .line_height(lh)
                     .text_color(gpui::black())
@@ -2879,7 +2930,11 @@ impl Editor {
                                     .text_sm()
                                     .text_center()
                                     .text_color(ui::text_secondary())
-                                    .child("Drop a file anywhere in this window, or choose one from your Mac."),
+                                    .child(if cfg!(target_os = "macos") {
+                                        "Drop a file anywhere in this window, or choose one from your Mac."
+                                    } else {
+                                        "Drop a file anywhere in this window, or choose one from your computer."
+                                    }),
                             ),
                     )
                     .child(
@@ -3486,9 +3541,11 @@ impl Render for Editor {
         let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
         self.page_slots.resize_with(page_count, Default::default);
         let field_count = self.items.len();
+        let client_decorated = matches!(window.window_decorations(), gpui::Decorations::Client { .. });
 
         div()
             .key_context("Editor")
+            .relative()
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -3512,6 +3569,7 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.set_zoom(1.0, window, cx)))
             .on_action(cx.listener(|this, _: &CloseDocument, window, cx| this.request_close(window, cx)))
             .on_action(cx.listener(|this, _: &DiscardChanges, window, cx| this.request_discard(window, cx)))
+            .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -3523,7 +3581,7 @@ impl Render for Editor {
                     cx.notify();
                 }
             }))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(client_decorated, window.is_maximized(), cx))
             .child(
                 div()
                     .flex()
@@ -3547,6 +3605,22 @@ impl Render for Editor {
                     .border_t_1()
                     .border_color(ui::border())
                     .child(div().truncate().child(self.status.clone()))
+                    .when(self.doc.is_none(), |d| {
+                        d.child(
+                            div()
+                                .id("about")
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .cursor(CursorStyle::PointingHand)
+                                .text_color(ui::text_tertiary())
+                                .hover(|s| s.text_color(ui::text_primary()))
+                                .child(ui::icon("info", ui::text_tertiary()).size(px(12.)))
+                                .child(format!("PDF Signer {}", crate::about::VERSION))
+                                .on_click(cx.listener(|_, _: &ClickEvent, window, cx| show_about(window, cx))),
+                        )
+                    })
                     .when(self.doc.is_some(), |d| {
                         d.child(
                             div()
@@ -3555,7 +3629,66 @@ impl Render for Editor {
                         )
                     }),
             )
+            .when(client_decorated && !window.is_maximized(), |d| d.children(resize_handles()))
     }
+}
+
+/// Invisible strips along the window's edges and corners that resize it, for
+/// windows without a system frame (client-side decorations on Linux).
+fn resize_handles() -> Vec<AnyElement> {
+    use gpui::ResizeEdge as E;
+    const EDGE: f32 = 5.;
+    const CORNER: f32 = 12.;
+    [
+        (E::Top, CursorStyle::ResizeUpDown),
+        (E::Bottom, CursorStyle::ResizeUpDown),
+        (E::Left, CursorStyle::ResizeLeftRight),
+        (E::Right, CursorStyle::ResizeLeftRight),
+        (E::TopLeft, CursorStyle::ResizeUpLeftDownRight),
+        (E::BottomRight, CursorStyle::ResizeUpLeftDownRight),
+        (E::TopRight, CursorStyle::ResizeUpRightDownLeft),
+        (E::BottomLeft, CursorStyle::ResizeUpRightDownLeft),
+    ]
+    .into_iter()
+    .map(|(edge, cursor)| {
+        let d = div().absolute().cursor(cursor);
+        let d = match edge {
+            E::Top => d.top_0().left(px(CORNER)).right(px(CORNER)).h(px(EDGE)),
+            E::Bottom => d.bottom_0().left(px(CORNER)).right(px(CORNER)).h(px(EDGE)),
+            E::Left => d.left_0().top(px(CORNER)).bottom(px(CORNER)).w(px(EDGE)),
+            E::Right => d.right_0().top(px(CORNER)).bottom(px(CORNER)).w(px(EDGE)),
+            E::TopLeft => d.top_0().left_0().size(px(CORNER)),
+            E::TopRight => d.top_0().right_0().size(px(CORNER)),
+            E::BottomLeft => d.bottom_0().left_0().size(px(CORNER)),
+            E::BottomRight => d.bottom_0().right_0().size(px(CORNER)),
+        };
+        d.id(SharedString::from(format!("resize-{edge:?}")))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                window.start_window_resize(edge);
+            })
+            .into_any_element()
+    })
+    .collect()
+}
+
+/// The About box: version, author and a link to the project.
+pub fn show_about(window: &mut Window, cx: &mut App) {
+    use crate::about;
+    let detail = format!(
+        "Version {}\n{}\n\nBy {}\n{}",
+        about::VERSION,
+        about::DESCRIPTION,
+        about::author(),
+        about::REPOSITORY
+    );
+    let answer = window.prompt(PromptLevel::Info, "PDF Signer", Some(&detail), &["OK", "Visit Website"], cx);
+    cx.spawn(async move |cx| {
+        if answer.await == Ok(1) {
+            let _ = cx.update(|cx| cx.open_url(about::REPOSITORY));
+        }
+    })
+    .detach();
 }
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", or a date.
@@ -3587,58 +3720,61 @@ fn file_name(path: &Path) -> String {
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
-        KeyBinding::new("cmd-o", Open, None),
-        KeyBinding::new("cmd-s", Save, None),
-        KeyBinding::new("cmd-z", Undo, None),
-        KeyBinding::new("cmd-shift-z", Redo, None),
-        KeyBinding::new("cmd-c", Copy, None),
-        KeyBinding::new("cmd-x", Cut, None),
-        KeyBinding::new("cmd-v", Paste, None),
-        KeyBinding::new("cmd-d", Duplicate, None),
-        KeyBinding::new("cmd-1", ZoomFitWidth, None),
-        KeyBinding::new("cmd-2", ZoomFitPage, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        KeyBinding::new("cmd-shift-s", AddSignature, None),
-        KeyBinding::new("cmd-w", CloseDocument, None),
-        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("secondary-o", Open, None),
+        KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-z", Undo, None),
+        KeyBinding::new("secondary-shift-z", Redo, None),
+        KeyBinding::new("secondary-c", Copy, None),
+        KeyBinding::new("secondary-x", Cut, None),
+        KeyBinding::new("secondary-v", Paste, None),
+        KeyBinding::new("secondary-d", Duplicate, None),
+        KeyBinding::new("secondary-1", ZoomFitWidth, None),
+        KeyBinding::new("secondary-2", ZoomFitPage, None),
+        KeyBinding::new("secondary-=", ZoomIn, None),
+        KeyBinding::new("secondary-+", ZoomIn, None),
+        KeyBinding::new("secondary--", ZoomOut, None),
+        KeyBinding::new("secondary-0", ZoomReset, None),
+        KeyBinding::new("secondary-shift-s", AddSignature, None),
+        KeyBinding::new("secondary-w", CloseDocument, None),
+        KeyBinding::new("secondary-q", Quit, None),
     ]);
 }
 
-pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<Entity<Editor>> {
+pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpui::WindowHandle<Editor>> {
     let bounds = Bounds::centered(None, size(px(1240.), px(900.)), cx);
-    let mut editor = None;
-    cx.open_window(
+    let window = cx.open_window(
         gpui::WindowOptions {
             window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("PDF Signer".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(18.), px(19.))),
+                // On macOS the toolbar doubles as the title bar, around the traffic lights.
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: cfg!(target_os = "macos").then(|| point(px(18.), px(19.))),
             }),
+            // Ask for the system's window frame. Some Linux compositors (GNOME) only
+            // do client-side decorations; then the app draws the controls itself.
+            window_decorations: Some(gpui::WindowDecorations::Server),
+            app_id: Some(crate::about::APP_ID.into()),
+            window_min_size: Some(size(px(760.), px(520.))),
             ..Default::default()
         },
         |window, cx| {
-            let entity = cx.new(|cx| {
+            cx.new(|cx| {
                 let mut e = Editor::new(window, cx);
                 if let Some(path) = initial {
                     e.open_path(path, window, cx);
                 }
                 e
-            });
-            editor = Some(entity.clone());
-            entity
+            })
         },
     )?;
-    editor.ok_or_else(|| anyhow::anyhow!("window was not created"))
+    Ok(window)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Editor>, &mut VisualTestContext) {
         let dir = std::env::temp_dir().join("pdf_signer_ui_test");
@@ -3698,7 +3834,7 @@ mod tests {
         });
 
         // Undo the move, then undo the creation.
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert!((e.items[0].x - x).abs() < 0.01));
     }
 
@@ -3726,7 +3862,7 @@ mod tests {
         });
         cx.simulate_keystrokes("backspace");
         editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
 
         let (bytes, pages, items, metrics) = editor.read_with(cx, |e, _| {
             let d = e.doc.as_ref().unwrap();
@@ -3748,11 +3884,11 @@ mod tests {
         assert_eq!(count(&editor, cx), 1);
 
         // Undo, then redo brings the field back.
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert_eq!(count(&editor, cx), 0);
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes("secondary-shift-z");
         assert_eq!(count(&editor, cx), 1);
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes("secondary-shift-z");
         assert_eq!(count(&editor, cx), 1, "nothing left to redo");
 
         // Copy + paste: a copy offset from the original on the visible page.
@@ -3760,7 +3896,7 @@ mod tests {
             e.selected = Some(e.items[0].id);
             e.items[0].clone()
         });
-        cx.simulate_keystrokes("cmd-c cmd-v");
+        cx.simulate_keystrokes("secondary-c secondary-v");
         editor.read_with(cx, |e, _| {
             assert_eq!(e.items.len(), 2);
             let pasted = &e.items[1];
@@ -3769,13 +3905,13 @@ mod tests {
             assert_eq!(e.selected, Some(pasted.id));
         });
         // Pasting again cascades instead of stacking on the previous copy.
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes("secondary-v");
         editor.read_with(cx, |e, _| assert_eq!(e.items[2].x, original.x + 24.));
 
         // Duplicate, then undo it; a new edit clears the redo stack.
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         assert_eq!(count(&editor, cx), 4);
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert_eq!(count(&editor, cx), 3);
         editor.update(cx, |e, cx| {
             e.selected = Some(original.id);
@@ -3789,7 +3925,7 @@ mod tests {
             assert_eq!((copy.x, copy.y), (original.x, original.y));
         });
         // One undo removes every copy made by "copy to every page".
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert_eq!(count(&editor, cx), 3);
     }
 
@@ -3826,7 +3962,7 @@ mod tests {
         let (editor, cx) = setup(cx);
 
         // Fit width: the widest page spans the viewport (minus padding).
-        cx.simulate_keystrokes("cmd-1");
+        cx.simulate_keystrokes("secondary-1");
         cx.run_until_parked();
         let (zoom, widest, viewport) = editor.read_with(cx, |e, _| {
             let widest = e.doc.as_ref().unwrap().loaded.pages.iter().map(|p| p.width).fold(0., f32::max);
@@ -3836,7 +3972,7 @@ mod tests {
         assert!((zoom - expected.clamp(MIN_ZOOM, MAX_ZOOM)).abs() < 0.01, "zoom {zoom} vs {expected}");
 
         // Fit page: a whole page fits vertically too.
-        cx.simulate_keystrokes("cmd-2");
+        cx.simulate_keystrokes("secondary-2");
         cx.run_until_parked();
         editor.read_with(cx, |e, _| {
             assert_eq!(e.zoom_mode, ZoomMode::FitPage);
@@ -3845,7 +3981,7 @@ mod tests {
         });
 
         // A fixed percentage leaves the fit modes.
-        cx.simulate_keystrokes("cmd-0");
+        cx.simulate_keystrokes("secondary-0");
         editor.read_with(cx, |e, _| assert_eq!((e.zoom_mode, e.zoom), (ZoomMode::Fixed, 1.0)));
 
         // Every page gets a thumbnail; clicking one scrolls that page into view.
@@ -3954,7 +4090,7 @@ mod tests {
             let (w, h) = DEFAULT_REDACTION;
             assert_eq!((r.x, r.y, r.w, r.h), (200. - w / 2., 400. - h / 2., w, h));
         });
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
 
         // Redactions resize freely (no fixed aspect ratio).
@@ -4006,19 +4142,19 @@ mod tests {
         // Presets and options are undoable steps too.
         editor.update(cx, |e, cx| e.update_watermark(cx, |w| w.text = "COPY".into()));
         editor.update(cx, |e, cx| e.update_watermark(cx, |w| w.color = 0xd93025));
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert_eq!(e.watermark.as_ref().unwrap().color, Watermark::default().color));
-        cx.simulate_keystrokes("cmd-z cmd-z");
+        cx.simulate_keystrokes("secondary-z secondary-z");
         assert_eq!(watermark_text(&editor, cx), None, "undone back to no watermark");
         cx.run_until_parked();
         editor.read_with(cx, |e, _| assert!(e.watermark_preview.images.is_empty(), "preview cleared"));
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes("secondary-shift-z");
         assert_eq!(watermark_text(&editor, cx).as_deref(), Some("draft "));
 
         // Discard returns to the last save (no watermark); removing works too.
         editor.update(cx, |e, cx| e.discard_changes(cx));
         assert_eq!(watermark_text(&editor, cx), None);
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert!(watermark_text(&editor, cx).is_some());
         editor.update(cx, |e, cx| e.remove_watermark(cx));
         assert_eq!(watermark_text(&editor, cx), None);
@@ -4084,10 +4220,10 @@ mod tests {
         assert_eq!(order(&editor, cx), vec![0]);
 
         // Undo brings the page back with its field; redo deletes it again.
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert_eq!(order(&editor, cx), vec![1, 0]);
         assert_eq!(pages_of(&editor, cx), vec![(1, 10.), (0, 20.)]);
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes("secondary-shift-z");
         assert_eq!(order(&editor, cx), vec![0]);
 
         // Discard returns to the saved (original) order.
@@ -4120,7 +4256,7 @@ mod tests {
         });
 
         // ...and ⌘Z brings it back.
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
     }
 

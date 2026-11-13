@@ -185,7 +185,7 @@ pub fn tooltip(
     move |_, cx| {
         cx.new(|_| Tooltip {
             text: text.clone(),
-            shortcut: shortcut.map(SharedString::from),
+            shortcut: shortcut.map(keys),
         })
         .into()
     }
@@ -265,6 +265,37 @@ pub fn secondary_button(id: impl Into<ElementId>, icon_name: &str, label: &'stat
 }
 
 /// A keyboard shortcut chip, e.g. "⌘O".
+/// A shortcut label written the macOS way ("⇧⌘Z", "⌘C  ⌘V") in the running
+/// platform's convention ("Ctrl+Shift+Z" on Windows and Linux).
+pub fn keys(mac: &str) -> SharedString {
+    keys_for(mac, cfg!(target_os = "macos"))
+}
+
+fn keys_for(mac: &str, is_mac: bool) -> SharedString {
+    if is_mac {
+        return SharedString::from(mac.to_string());
+    }
+    mac.split(' ')
+        .map(|token| {
+            let mut mods = Vec::new();
+            let mut key = String::new();
+            for c in token.chars() {
+                match c {
+                    '⌘' => mods.push((0, "Ctrl")),
+                    '⌥' => mods.push((1, "Alt")),
+                    '⇧' => mods.push((2, "Shift")),
+                    '⌫' => key.push_str("Delete"),
+                    c => key.push(c),
+                }
+            }
+            mods.sort();
+            mods.into_iter().map(|(_, m)| m).chain((!key.is_empty()).then_some(key.as_str())).collect::<Vec<_>>().join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into()
+}
+
 pub fn kbd(keys: &'static str) -> Div {
     div()
         .flex_none()
@@ -275,7 +306,7 @@ pub fn kbd(keys: &'static str) -> Div {
         .bg(surface())
         .text_color(text_secondary())
         .text_xs()
-        .child(keys)
+        .child(self::keys(keys))
 }
 
 pub fn vertical_divider() -> Div {
@@ -348,7 +379,7 @@ pub fn menu_item(
                 .when(checked, |d| d.child(icon("check", accent()).size(px(14.)))),
         )
         .child(div().flex_1().child(label.into()))
-        .when_some(shortcut, |d, s| d.child(div().text_xs().text_color(text_tertiary()).child(s)))
+        .when_some(shortcut, |d, s| d.child(div().text_xs().text_color(text_tertiary()).child(keys(s))))
 }
 
 pub fn menu_separator() -> Div {
@@ -375,4 +406,19 @@ pub fn chip(id: impl Into<ElementId>, label: &'static str, active: bool) -> Stat
 /// A small caption above a group of options in a menu.
 pub fn menu_caption(text: &'static str) -> Div {
     div().px_2().pt_1p5().pb_1().text_xs().text_color(text_tertiary()).child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keys_for;
+
+    #[test]
+    fn shortcut_labels_follow_the_platform() {
+        assert_eq!(keys_for("⇧⌘Z", true).as_ref(), "⇧⌘Z");
+        assert_eq!(keys_for("⇧⌘Z", false).as_ref(), "Ctrl+Shift+Z");
+        assert_eq!(keys_for("⌘C  ⌘V", false).as_ref(), "Ctrl+C  Ctrl+V");
+        assert_eq!(keys_for("⌘−", false).as_ref(), "Ctrl+−");
+        assert_eq!(keys_for("⌫", false).as_ref(), "Delete");
+        assert_eq!(keys_for("←↑→↓", false).as_ref(), "←↑→↓");
+    }
 }

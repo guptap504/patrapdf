@@ -1,3 +1,7 @@
+// Release builds on Windows are GUI apps: no console window behind them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod about;
 mod assets;
 mod editor;
 mod gestures;
@@ -8,23 +12,38 @@ mod settings;
 mod signatures;
 mod ui;
 
+use std::path::PathBuf;
+
+use futures::StreamExt;
 use gpui::{Application, Menu, MenuItem};
 
 use editor::{
-    AddSignature, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, Undo, ZoomFitPage,
+    About, AddSignature, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, Undo, ZoomFitPage,
     ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
 };
 
 fn main() {
-    let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let initial = std::env::args_os().nth(1).map(PathBuf::from);
 
-    Application::new().with_assets(assets::Assets).run(move |cx| {
+    let app = Application::new().with_assets(assets::Assets);
+    // PDFs opened from the Finder ("Open With", or dropped on the Dock icon) arrive
+    // as file URLs, possibly before the window exists; queue them until it does.
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    app.on_open_urls(move |urls| {
+        let _ = open_tx.unbounded_send(urls);
+    });
+
+    app.run(move |cx| {
         editor::bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
             Menu {
                 name: "PDF Signer".into(),
-                items: vec![MenuItem::action("Quit PDF Signer", Quit)],
+                items: vec![
+                    MenuItem::action("About PDF Signer", About),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit PDF Signer", Quit),
+                ],
             },
             Menu {
                 name: "File".into(),
@@ -61,10 +80,73 @@ fn main() {
             },
         ]);
 
-        if let Err(e) = editor::open_editor(cx, initial.clone()) {
-            eprintln!("failed to open window: {e:#}");
-            cx.quit();
+        match editor::open_editor(cx, initial.clone()) {
+            Ok(window) => {
+                cx.spawn(async move |cx| {
+                    while let Some(urls) = open_rx.next().await {
+                        for path in urls.iter().filter_map(|u| file_url_path(u)) {
+                            let _ = window.update(cx, |editor, window, cx| {
+                                window.activate_window();
+                                editor.request_open(Some(path), window, cx);
+                            });
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(e) => {
+                eprintln!("failed to open window: {e:#}");
+                cx.quit();
+            }
         }
+        // A single-window app: closing the window quits.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
+}
+
+/// The local path of a `file://` URL (percent-decoded), or `None` for other URLs.
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    // Skip an optional host ("file://localhost/...").
+    let rest = &rest[rest.find('/')?..];
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).and_then(|&b| hex(b)), bytes.get(i + 2).and_then(|&b| hex(b))) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    // "file:///C:/x.pdf" on Windows.
+    let path = if cfg!(windows) { path.trim_start_matches('/').to_string() } else { path };
+    Some(PathBuf::from(path))
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::file_url_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_urls_become_paths() {
+        assert_eq!(file_url_path("file:///Users/me/My%20Form.pdf"), Some(PathBuf::from("/Users/me/My Form.pdf")));
+        assert_eq!(file_url_path("file://localhost/tmp/a.pdf"), Some(PathBuf::from("/tmp/a.pdf")));
+        assert_eq!(file_url_path("file:///tmp/%C3%A9t%C3%A9.pdf"), Some(PathBuf::from("/tmp/été.pdf")));
+        assert_eq!(file_url_path("https://example.com/a.pdf"), None);
+    }
 }

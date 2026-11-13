@@ -10,6 +10,16 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+/// The on-screen font for text fields. Saved PDFs use Helvetica; Arial (Windows)
+/// and Liberation Sans (Linux) have the same metrics, so text lines up the same.
+pub const TEXT_FONT: &str = if cfg!(target_os = "macos") {
+    "Helvetica"
+} else if cfg!(target_os = "windows") {
+    "Arial"
+} else {
+    "Liberation Sans"
+};
+
 /// Line height used for text overlays, as a multiple of the font size.
 pub const LINE_HEIGHT: f32 = 1.2;
 

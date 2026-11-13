@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.guptap504.PdfSigner</id>
+  <name>PDF Signer</name>
+  <summary>Fill in, sign, redact and watermark PDFs</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.guptap504">
+    <name>Prashant Gupta</name>
+  </developer>
+  <description>
+    <p>
+      PDF Signer fills in and signs PDF forms entirely on your computer. Nothing is uploaded.
+    </p>
+    <ul>
+      <li>Type text, add dates and checkmarks anywhere on a page</li>
+      <li>Place your signature from an image; the paper background is removed automatically</li>
+      <li>Redact: black out content and remove it from the file for good</li>
+      <li>Stamp a watermark across every page</li>
+      <li>Delete and reorder pages</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.guptap504.PdfSigner.desktop</launchable>
+  <url type="homepage">https://github.com/guptap504/pdf-signer</url>
+  <url type="bugtracker">https://github.com/guptap504/pdf-signer/issues</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>pdf-signer</binary>
+    <mediatype>application/pdf</mediatype>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-11-13"/>
+  </releases>
+</component>

@@ -24,16 +24,24 @@ pub fn is_pdf(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
-/// Root of the app's data directory
-/// (`~/Library/Application Support/pdf-signer` on macOS).
+/// Root of the app's data directory: `~/Library/Application Support/pdf-signer`
+/// on macOS, `%APPDATA%\pdf-signer` on Windows, `$XDG_DATA_HOME/pdf-signer`
+/// (`~/.local/share/pdf-signer`) on Linux.
 /// Set `PDF_SIGNER_DATA_DIR` to use a different directory (handy for development).
 #[cfg(not(test))]
 pub fn app_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PDF_SIGNER_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let base = if cfg!(target_os = "macos") {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Roaming"))
+    } else if cfg!(target_os = "macos") {
         home.join("Library/Application Support")
     } else {
         std::env::var_os("XDG_DATA_HOME")

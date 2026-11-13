@@ -1,10 +1,42 @@
+<p align="center"><img src="packaging/icon/icon-256.png" width="128" alt=""></p>
+
 # PDF Signer
 
-A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in PDFs: place text boxes, dates, checkmarks and signature images anywhere on a page, then save a flattened copy.
+A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in PDFs: place text boxes, dates, checkmarks and signature images anywhere on a page, redact, watermark, delete and reorder pages, then save a flattened copy. Everything happens on your computer; nothing is uploaded.
+
+## Install
+
+Download the package for your system from the [latest release](https://github.com/guptap504/pdf-signer/releases/latest).
+
+| System | Download |
+| --- | --- |
+| macOS, Apple silicon | `PDF-Signer-<version>-macos-arm64.dmg` |
+| macOS, Intel | `PDF-Signer-<version>-macos-x86_64.dmg` |
+| Windows 10/11 (x64) | `PDF-Signer-<version>-windows-x64-setup.exe` (installer) or `…-portable.zip` |
+| Debian, Ubuntu | `pdf-signer_<version>-1_amd64.deb` |
+| Fedora, RHEL, openSUSE | `pdf-signer-<version>-1.x86_64.rpm` |
+| Any Linux (x86_64) | `PDF-Signer-<version>-linux-x86_64.AppImage` |
+
+- **macOS**: open the .dmg and drag PDF Signer to Applications. The app isn't notarized by Apple, so the first time, right-click it and choose **Open** (on macOS 15 and later: try to open it, then go to System Settings → Privacy & Security → **Open Anyway**).
+- **Windows**: the installer doesn't need admin rights and adds PDF Signer to the Start menu and to "Open with" for PDFs. SmartScreen may warn that the app is unrecognised (it isn't code-signed): choose **More info → Run anyway**.
+- **Linux**: `sudo apt install ./pdf-signer_*.deb` or `sudo dnf install ./pdf-signer-*.rpm`. For the AppImage: `chmod +x PDF-Signer-*.AppImage` and run it. The app draws with Vulkan, so it needs a Vulkan driver (Mesa provides one for Intel/AMD GPUs).
+
+## Build from source
 
 ```sh
 cargo run --release -- path/to/form.pdf   # the file argument is optional
 ```
+
+On Debian/Ubuntu, install the system libraries first with `packaging/linux/install-build-deps.sh`. Windows needs the MSVC build tools.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (and add a `<release>` to `packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml`).
+2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The [Release workflow](.github/workflows/release.yml) builds the macOS .dmg files (Apple silicon and Intel), the Windows installer and portable zip, and the Linux .deb, .rpm and AppImage, then publishes them as a GitHub release with SHA-256 checksums. Run it by hand from the Actions tab to build the packages without publishing.
+
+Packaging files live in `packaging/`: the icon sources and generated icons (`icon/generate.sh` regenerates them), the macOS `Info.plist` and bundling script, the Windows Inno Setup script, and the Linux desktop entry, AppStream metadata and AppImage script. The Debian and RPM layouts are in `Cargo.toml` (`[package.metadata.deb]`, `[package.metadata.generate-rpm]`).
 
 ## Using it
 
@@ -34,12 +66,13 @@ cargo run --release -- path/to/form.pdf   # the file argument is optional
 | `recents.rs` | Gallery store: `recents/index.json`, first-page thumbnails, and copies of the signature images each entry uses, so entries survive removing a signature from the library. |
 | `gestures.rs` | Trackpad pinch: GPUI 0.2 has no gesture events, so this adds `magnifyWithEvent:` to GPUI's macOS view class and forwards pinches to the editor. |
 | `settings.rs` | User preferences (`settings.json`), currently the date format. |
+| `about.rs` | Version, description, author and repository from `Cargo.toml`, for the About box and the window's app id. |
 | `signatures.rs` | Imports signature images, removes the background, crops, and persists them. |
 | `model.rs` | Item and page geometry, stored in "view space" (points, top-left origin). |
 
 Each page's `view_to_user` matrix is the inverse of hayro's page transform. That handles `/Rotate` and offset crop boxes, so overlays land exactly where they appeared on screen. Text baselines use the measured metrics of the UI font.
 
-App data lives in `~/Library/Application Support/pdf-signer`. Set `PDF_SIGNER_DATA_DIR` to use another directory, for example for development.
+App data lives in `~/Library/Application Support/pdf-signer` (macOS), `%APPDATA%\pdf-signer` (Windows) or `~/.local/share/pdf-signer` (Linux). Set `PDF_SIGNER_DATA_DIR` to use another directory, for example for development.
 
 Building on macOS requires the Xcode Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). To build without it, enable gpui's `runtime_shaders` feature.
 
@@ -49,3 +82,7 @@ Building on macOS requires the Xcode Metal toolchain (`xcodebuild -downloadCompo
 - Filling AcroForm fields natively. Text is overlaid on top of the fields instead.
 - Password-protected PDFs, beyond those with an empty user password.
 - Non-Latin text. Output uses the standard Helvetica font with WinAnsi encoding.
+
+## License
+
+[MIT](LICENSE)
