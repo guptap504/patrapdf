@@ -60,3 +60,16 @@ Root: HKA; Subkey: "Software\Classes\Applications\pdf-signer.exe\shell\open\comm
 
 [Run]
 Filename: "{app}\pdf-signer.exe"; Description: "{cm:LaunchProgram,PDF Signer}"; Flags: nowait postinstall skipifsilent
+; The in-app updater runs this installer silently with /RELAUNCH: start the new version.
+Filename: "{app}\pdf-signer.exe"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
+
+[Code]
+function ShouldRelaunch: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+      Result := True;
+end;

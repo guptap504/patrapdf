@@ -1,15 +1,22 @@
 name: Release
 
-# Push a tag like v0.1.0 to build every package and publish a GitHub release.
-# Run it by hand (Actions → Release → Run workflow) to build the packages
-# without publishing; they're attached to the run as artifacts.
+# Push a tag like v0.2.0 to build every package and publish a signed GitHub
+# release. Run it by hand (Actions → Release → Run workflow) to build the
+# packages without publishing; they're attached to the run as artifacts.
+#
+# The in-app updater only installs releases whose SHA256SUMS.txt is signed with
+# the release key (secret MINISIGN_SECRET_KEY; public half in src/updater.rs).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,14 +28,22 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
-            exit 1
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+              exit 1
+            fi
+            if ! grep -q "<release version=\"$version\"" packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml; then
+              echo "::error::Add <release version=\"$version\" …/> to packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml"
+              exit 1
+            fi
           fi
 
   macos:
@@ -46,16 +61,19 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.15.7"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: packaging/macos/bundle.sh ${{ matrix.target }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-${{ matrix.arch }}
           path: dist/*
@@ -71,9 +89,13 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --locked
       - name: Portable zip
         shell: pwsh
@@ -90,7 +112,7 @@ jobs:
           iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
           command -v iscc >/dev/null && iscc=iscc
           "$iscc" //DAppVersion="$VERSION" packaging/windows/installer.iss
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x64
           path: dist/*
@@ -102,11 +124,15 @@ jobs:
     # The oldest supported runner, so the binaries work on older glibc too.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: packaging/linux/install-build-deps.sh
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deb,cargo-generate-rpm
       - run: cargo build --release --locked
@@ -124,7 +150,7 @@ jobs:
           rpm -qpil dist/*.rpm
           rpm -qpR dist/*.rpm
           desktop-file-validate packaging/linux/io.github.guptap504.PdfSigner.desktop
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-x86_64
           path: dist/*
@@ -135,18 +161,49 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [version, macos, windows, linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # build provenance
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: src/updater.rs
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Sign the checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::Secret MINISIGN_SECRET_KEY is missing. Releases must be signed for the in-app updater (see README → Releasing)."
+            exit 1
+          fi
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends minisign
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          minisign -S -s "$key" -m dist/SHA256SUMS.txt -t "pdf-signer v$VERSION"
+          rm -f "$key"
+          # The signature must verify with the key the app ships with.
+          public_key=$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/updater.rs)
+          minisign -V -P "$public_key" -m dist/SHA256SUMS.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "PDF Signer ${{ needs.version.outputs.version }}" \
-            --generate-notes
+            --title "PDF Signer $VERSION" \
+            --generate-notes \
+            --verify-tag

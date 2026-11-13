@@ -11,6 +11,7 @@ mod recents;
 mod settings;
 mod signatures;
 mod ui;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ use futures::StreamExt;
 use gpui::{Application, Menu, MenuItem};
 
 use editor::{
-    About, AddSignature, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, Undo, ZoomFitPage,
+    About, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, Undo, ZoomFitPage,
     ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
 };
 
@@ -35,15 +36,17 @@ fn main() {
 
     app.run(move |cx| {
         editor::bind_keys(cx);
+        let updater = updater::init(settings::Settings::load().check_for_updates, cx);
+        let self_updating = updater.read(cx).support().is_ok();
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
             Menu {
                 name: "PDF Signer".into(),
-                items: vec![
-                    MenuItem::action("About PDF Signer", About),
-                    MenuItem::separator(),
-                    MenuItem::action("Quit PDF Signer", Quit),
-                ],
+                items: [MenuItem::action("About PDF Signer", About)]
+                    .into_iter()
+                    .chain(self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates)))
+                    .chain([MenuItem::separator(), MenuItem::action("Quit PDF Signer", Quit)])
+                    .collect(),
             },
             Menu {
                 name: "File".into(),

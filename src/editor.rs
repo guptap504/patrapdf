@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::channel::oneshot;
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Task, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
@@ -23,6 +23,7 @@ use crate::gestures;
 use crate::settings::{self, Settings};
 use crate::signatures;
 use crate::ui;
+use crate::updater::{self, Updater};
 
 actions!(
     pdf_signer,
@@ -44,6 +45,7 @@ actions!(
         CloseDocument,
         DiscardChanges,
         About,
+        CheckForUpdates,
         Quit
     ]
 );
@@ -334,6 +336,9 @@ pub struct Editor {
     render_task: Option<Task<()>>,
     thumb_task: Option<Task<()>>,
     _appearance_observer: Subscription,
+    /// The app's updater (absent in tests), and our subscriptions to it.
+    updater: Option<Entity<Updater>>,
+    _updater_subscriptions: Vec<Subscription>,
 }
 
 impl Focusable for Editor {
@@ -349,6 +354,7 @@ impl Editor {
 
         // Follow the system light/dark setting, including live changes.
         ui::set_appearance(window.appearance());
+        let updater = updater::global(cx);
         let appearance_observer = cx.observe_window_appearance(window, |_, window, cx| {
             ui::set_appearance(window.appearance());
             cx.notify();
@@ -421,6 +427,11 @@ impl Editor {
             render_task: None,
             thumb_task: None,
             _appearance_observer: appearance_observer,
+            updater: updater.clone(),
+            _updater_subscriptions: updater
+                .iter()
+                .flat_map(|u| [cx.observe(u, |_, _, cx| cx.notify()), cx.subscribe_in(u, window, Self::on_update_event)])
+                .collect(),
         }
     }
 
@@ -1136,6 +1147,171 @@ impl Editor {
         }
         self.status = format!("Copied to {} other page{}", page_count - 1, if page_count == 2 { "" } else { "s" }).into();
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // About & updates
+    // -----------------------------------------------------------------------
+
+    /// The About box: version, author, link, and the update controls.
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::about;
+        let support = match &self.updater {
+            Some(u) => u.read(cx).support(),
+            None => Err(updater::NoUpdates::Development),
+        };
+        let auto = self.settings.check_for_updates;
+        let updates = match support {
+            Ok(()) if auto => "Automatic updates are on.",
+            Ok(()) => "Automatic updates are off.",
+            Err(reason) => reason.message(),
+        };
+        let detail = format!(
+            "Version {}\n{}\n\nBy {}\n{}\n\n{updates}",
+            about::VERSION,
+            about::DESCRIPTION,
+            about::author(),
+            about::REPOSITORY
+        );
+        let mut buttons = vec!["OK"];
+        if support.is_ok() {
+            buttons.push("Check for Updates");
+            buttons.push(if auto { "Turn Off Automatic Updates" } else { "Turn On Automatic Updates" });
+        }
+        buttons.push("Visit Website");
+        let answer = window.prompt(PromptLevel::Info, "PDF Signer", Some(&detail), &buttons, cx);
+        cx.spawn(async move |this, cx| {
+            let Ok(choice) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| match buttons.get(choice).copied() {
+                Some("Check for Updates") => this.check_for_updates(cx),
+                Some("Turn Off Automatic Updates") => this.set_automatic_updates(false, cx),
+                Some("Turn On Automatic Updates") => this.set_automatic_updates(true, cx),
+                Some("Visit Website") => cx.open_url(about::REPOSITORY),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if let Some(updater) = &self.updater {
+            updater.update(cx, |u, cx| u.check(true, cx));
+        }
+    }
+
+    fn set_automatic_updates(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.check_for_updates = on;
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Couldn't save settings: {e}").into();
+        }
+        if let Some(updater) = &self.updater {
+            updater.update(cx, |u, cx| u.set_enabled(on, cx));
+        }
+        cx.notify();
+    }
+
+    fn on_update_event(
+        &mut self,
+        _: &Entity<Updater>,
+        event: &updater::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            updater::Event::UpToDate => {
+                let detail = format!("PDF Signer {} is the newest version.", crate::about::VERSION);
+                let _ = window.prompt(PromptLevel::Info, "You're up to date", Some(&detail), &["OK"], cx);
+            }
+            updater::Event::Failed(message) => {
+                self.show_update_error("Couldn't check for updates", message, window, cx);
+            }
+            updater::Event::Ready { manual: true } => self.prompt_install_update(window, cx),
+            // Found by the daily check: the status bar offers it, without interrupting.
+            updater::Event::Ready { manual: false } => {}
+        }
+    }
+
+    fn show_update_error(&mut self, title: &str, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(PromptLevel::Warning, title, Some(message), &["OK", "Open Downloads Page"], cx);
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(1) {
+                let _ = cx.update(|cx| cx.open_url(updater::RELEASES_PAGE));
+            }
+        })
+        .detach();
+    }
+
+    /// Offer to install the downloaded update: now (restart), later (on quit), or never.
+    fn prompt_install_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(updater) = self.updater.clone() else { return };
+        let Some(release) = updater.read(cx).release().cloned() else { return };
+        let mut detail = release.notes.clone();
+        if !detail.is_empty() {
+            detail.push_str("\n\n");
+        }
+        detail.push_str(if self.dirty {
+            "Restarting now discards your unsaved changes. Choose Later to save them first; the update is installed when you quit."
+        } else {
+            "PDF Signer restarts to finish. Choose Later to install it when you quit."
+        });
+        let restart = if self.dirty { "Discard Changes and Restart" } else { "Restart Now" };
+        let title = format!("PDF Signer {} is ready to install", release.version);
+        let answer = window.prompt(PromptLevel::Info, &title, Some(&detail), &[restart, "Later", "Skip This Version"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(choice) = answer.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| match choice {
+                0 => this.install_update_and_restart(window, cx),
+                2 => updater.update(cx, |u, cx| u.skip(cx)),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn install_update_and_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(updater) = self.updater.clone() else { return };
+        match updater.update(cx, |u, cx| u.install_and_restart(cx)) {
+            Ok(()) => cx.quit(),
+            Err(e) => {
+                let message = format!("{e:#}\n\nYou can download the new version from GitHub instead.");
+                self.show_update_error("The update couldn't be installed", &message, window, cx);
+            }
+        }
+    }
+
+    /// The status-bar notice for updates (empty when there's nothing to say).
+    fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let updater = self.updater.as_ref()?.read(cx);
+        let manual = updater.is_manual();
+        let text = |t: String| div().flex_none().text_color(ui::text_tertiary()).child(t).into_any_element();
+        match updater.status() {
+            updater::Status::Checking if manual => Some(text("Checking for updates…".into())),
+            updater::Status::Downloading { version, fraction } if manual => {
+                Some(text(format!("Downloading {version}… {:.0}%", fraction * 100.)))
+            }
+            updater::Status::Ready { version } => Some(
+                div()
+                    .id("update-ready")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(18.))
+                    .rounded_full()
+                    .bg(ui::accent())
+                    .text_color(gpui::white())
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.bg(ui::accent_hover()))
+                    .child(ui::icon("save", gpui::white()).size(px(11.)))
+                    .child(format!("Update to {version}"))
+                    .tooltip(ui::tooltip("A new version is downloaded and ready to install", None))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.prompt_install_update(window, cx)))
+                    .into_any_element(),
+            ),
+            _ => None,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3569,7 +3745,8 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.set_zoom(1.0, window, cx)))
             .on_action(cx.listener(|this, _: &CloseDocument, window, cx| this.request_close(window, cx)))
             .on_action(cx.listener(|this, _: &DiscardChanges, window, cx| this.request_discard(window, cx)))
-            .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &About, window, cx| this.show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -3604,7 +3781,8 @@ impl Render for Editor {
                     .bg(ui::chrome_bg())
                     .border_t_1()
                     .border_color(ui::border())
-                    .child(div().truncate().child(self.status.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(self.status.clone()))
+                    .when_some(self.render_update_notice(cx), |d, notice| d.child(div().flex_none().mx_3().child(notice)))
                     .when(self.doc.is_none(), |d| {
                         d.child(
                             div()
@@ -3618,7 +3796,7 @@ impl Render for Editor {
                                 .hover(|s| s.text_color(ui::text_primary()))
                                 .child(ui::icon("info", ui::text_tertiary()).size(px(12.)))
                                 .child(format!("PDF Signer {}", crate::about::VERSION))
-                                .on_click(cx.listener(|_, _: &ClickEvent, window, cx| show_about(window, cx))),
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_about(window, cx))),
                         )
                     })
                     .when(self.doc.is_some(), |d| {
@@ -3670,25 +3848,6 @@ fn resize_handles() -> Vec<AnyElement> {
             .into_any_element()
     })
     .collect()
-}
-
-/// The About box: version, author and a link to the project.
-pub fn show_about(window: &mut Window, cx: &mut App) {
-    use crate::about;
-    let detail = format!(
-        "Version {}\n{}\n\nBy {}\n{}",
-        about::VERSION,
-        about::DESCRIPTION,
-        about::author(),
-        about::REPOSITORY
-    );
-    let answer = window.prompt(PromptLevel::Info, "PDF Signer", Some(&detail), &["OK", "Visit Website"], cx);
-    cx.spawn(async move |cx| {
-        if answer.await == Ok(1) {
-            let _ = cx.update(|cx| cx.open_url(about::REPOSITORY));
-        }
-    })
-    .detach();
 }
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", or a date.
@@ -3774,7 +3933,7 @@ pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Editor>, &mut VisualTestContext) {
         // A file per test: tests run in parallel, and rewriting a shared file

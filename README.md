@@ -21,6 +21,17 @@ Download the package for your system from the [latest release](https://github.co
 - **Windows**: the installer doesn't need admin rights and adds PDF Signer to the Start menu and to "Open with" for PDFs. SmartScreen may warn that the app is unrecognised (it isn't code-signed): choose **More info → Run anyway**.
 - **Linux**: `sudo apt install ./pdf-signer_*.deb` or `sudo dnf install ./pdf-signer-*.rpm`. For the AppImage: `chmod +x PDF-Signer-*.AppImage` and run it. The app draws with Vulkan, so it needs a Vulkan driver (Mesa provides one for Intel/AMD GPUs).
 
+## Updates
+
+PDF Signer keeps itself up to date when installed from the macOS .dmg, the Windows installer or portable zip, or the AppImage:
+
+- About once a day (first 10 seconds after launch) it asks GitHub for the latest release. That request goes to `api.github.com` and carries nothing but the app's version and OS in the User-Agent.
+- A newer version is downloaded in the background and verified: `SHA256SUMS.txt` must carry a valid signature from the project's release key (built into the app), and the download must match its checksum and size. Anything that fails verification is deleted, never installed.
+- A blue **Update to x.y.z** button then appears in the status bar. Click it to restart into the new version now, or leave it: the update installs when you quit. **Skip This Version** stops offering that release.
+- **About PDF Signer** has **Check for Updates** and a switch to turn the automatic checks off (or set `"check_for_updates": false` in `settings.json`).
+
+Installs from the .deb or .rpm don't update themselves; your package manager is in charge of those. Pre-releases and drafts are never offered.
+
 ## Build from source
 
 ```sh
@@ -31,10 +42,14 @@ On Debian/Ubuntu, install the system libraries first with `packaging/linux/insta
 
 ## Releasing
 
-1. Bump `version` in `Cargo.toml` (and add a `<release>` to `packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml`).
+1. Bump `version` in `Cargo.toml` and add a `<release>` to `packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml` (the workflow refuses a tag without both).
 2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 
-The [Release workflow](.github/workflows/release.yml) builds the macOS .dmg files (Apple silicon and Intel), the Windows installer and portable zip, and the Linux .deb, .rpm and AppImage, then publishes them as a GitHub release with SHA-256 checksums. Run it by hand from the Actions tab to build the packages without publishing.
+The [Release workflow](.github/workflows/release.yml) builds the macOS .dmg files (Apple silicon and Intel), the Windows installer and portable zip, and the Linux .deb, .rpm and AppImage. It then writes `SHA256SUMS.txt`, signs it with the release key (`SHA256SUMS.txt.minisig`, trusted comment `pdf-signer v<version>`), checks the signature against the public key in `src/updater.rs`, records build provenance attestations, and publishes the GitHub release. Run it by hand from the Actions tab to build the packages without publishing.
+
+**The release key.** The updater only installs releases signed with the [minisign](https://jedisct1.github.io/minisign/) key whose public half is `PUBLIC_KEY` in `src/updater.rs`. The secret half is the repository secret `MINISIGN_SECRET_KEY`; keep an offline backup (for example in a password manager). Anyone holding it can sign updates that every installed copy will accept. If it's lost, existing installs can't be updated automatically any more (users would need to download the next version by hand); if it leaks, put a new public key in the app, release that version signed with the *old* key, and sign everything after it with the new one.
+
+To check a download by hand: `minisign -Vm SHA256SUMS.txt -P RWTARJ/FySmzrKbcWQS1MDc3JSBXIFZ35/3IJLRtZAVfjR+80jlr58Zt`, then `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`. Build provenance: `gh attestation verify <file> --repo guptap504/pdf-signer`.
 
 Packaging files live in `packaging/`: the icon sources and generated icons (`icon/generate.sh` regenerates them), the macOS `Info.plist` and bundling script, the Windows Inno Setup script, and the Linux desktop entry, AppStream metadata and AppImage script. The Debian and RPM layouts are in `Cargo.toml` (`[package.metadata.deb]`, `[package.metadata.generate-rpm]`).
 
@@ -66,6 +81,7 @@ Packaging files live in `packaging/`: the icon sources and generated icons (`ico
 | `recents.rs` | Gallery store: `recents/index.json`, first-page thumbnails, and copies of the signature images each entry uses, so entries survive removing a signature from the library. |
 | `gestures.rs` | Trackpad pinch: GPUI 0.2 has no gesture events, so this adds `magnifyWithEvent:` to GPUI's macOS view class and forwards pinches to the editor. |
 | `settings.rs` | User preferences (`settings.json`), currently the date format. |
+| `updater.rs` | Automatic updates: daily check of the latest GitHub release, background download, minisign + SHA-256 verification, and installing per install type (.app swap, silent Inno Setup upgrade, portable .exe self-replace, AppImage replace). |
 | `about.rs` | Version, description, author and repository from `Cargo.toml`, for the About box and the window's app id. |
 | `signatures.rs` | Imports signature images, removes the background, crops, and persists them. |
 | `model.rs` | Item and page geometry, stored in "view space" (points, top-left origin). |

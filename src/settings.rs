@@ -13,12 +13,15 @@ pub const DATE_FORMATS: &[&str] = &["%d.%m.%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%
 #[serde(default)]
 pub struct Settings {
     pub date_format: String,
+    /// Look for new versions about once a day (see `updater.rs`).
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             date_format: DATE_FORMATS[0].to_string(),
+            check_for_updates: true,
         }
     }
 }
@@ -29,16 +32,15 @@ fn path() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Self {
-        let settings: Self = std::fs::read(path())
+        let mut settings: Self = std::fs::read(path())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         // Ignore formats we no longer offer (e.g. a hand-edited file).
-        if DATE_FORMATS.contains(&settings.date_format.as_str()) {
-            settings
-        } else {
-            Self::default()
+        if !DATE_FORMATS.contains(&settings.date_format.as_str()) {
+            settings.date_format = Self::default().date_format;
         }
+        settings
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
