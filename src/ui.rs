@@ -354,3 +354,25 @@ pub fn menu_item(
 pub fn menu_separator() -> Div {
     div().h(px(1.)).mx_1().my_1().bg(border())
 }
+
+/// One option in a small row of choices (e.g. inside a menu).
+pub fn chip(id: impl Into<ElementId>, label: &'static str, active: bool) -> Stateful<Div> {
+    button_base(id)
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .h(px(24.))
+        .px_2()
+        .rounded(px(5.))
+        .text_xs()
+        .cursor(CursorStyle::PointingHand)
+        .when(active, |d| d.bg(accent_soft()).text_color(accent()).font_weight(FontWeight::MEDIUM))
+        .when(!active, |d| d.text_color(text_secondary()).hover(|s| s.bg(hover_bg()).text_color(text_primary())))
+        .child(label)
+}
+
+/// A small caption above a group of options in a menu.
+pub fn menu_caption(text: &'static str) -> Div {
+    div().px_2().pt_1p5().pb_1().text_xs().text_color(text_tertiary()).child(text)
+}

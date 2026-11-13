@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 /// Line height used for text overlays, as a multiple of the font size.
 pub const LINE_HEIGHT: f32 = 1.2;
 
@@ -42,6 +44,8 @@ pub enum ItemKind {
     Text { text: String, font_size: f32 },
     Image { sig: Arc<Signature> },
     Check,
+    /// A redaction box. On save, everything under it is removed from the file.
+    Redact,
 }
 
 /// An overlay placed on a page.
@@ -61,6 +65,33 @@ pub struct Item {
 impl Item {
     pub fn is_text(&self) -> bool {
         matches!(self.kind, ItemKind::Text { .. })
+    }
+
+    pub fn is_redaction(&self) -> bool {
+        matches!(self.kind, ItemKind::Redact)
+    }
+}
+
+/// A text watermark stamped across every page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Watermark {
+    pub text: String,
+    /// `0xRRGGBB`.
+    pub color: u32,
+    /// 0 (invisible) to 1 (opaque).
+    pub opacity: f32,
+    /// Corner to corner (true) or horizontal across the middle.
+    pub diagonal: bool,
+}
+
+impl Default for Watermark {
+    fn default() -> Self {
+        Self {
+            text: "CONFIDENTIAL".into(),
+            color: 0x8a8a8a,
+            opacity: 0.22,
+            diagonal: true,
+        }
     }
 }
 

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Item, ItemKind, Signature};
+use crate::model::{Item, ItemKind, Signature, Watermark};
 use crate::{pdf, signatures};
 
 const MAX_ENTRIES: usize = 40;
@@ -40,6 +40,8 @@ pub struct RecentEntry {
     pub thumb_width: u32,
     pub thumb_height: u32,
     pub items: Vec<SavedItem>,
+    #[serde(default)]
+    pub watermark: Option<Watermark>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +60,7 @@ pub enum SavedKind {
     Text { text: String, font_size: f32 },
     Image { path: PathBuf },
     Check,
+    Redact,
 }
 
 /// A rendered first-page thumbnail, ready to be written to disk.
@@ -141,6 +144,7 @@ pub fn record(
     output: &Path,
     page_count: usize,
     items: &[Item],
+    watermark: Option<&Watermark>,
     thumbnail: Option<Thumbnail>,
 ) -> Result<Vec<RecentEntry>> {
     let id = hash_hex(original);
@@ -158,6 +162,7 @@ pub fn record(
                     path: store_asset(&sig.path).ok()?,
                 },
                 ItemKind::Check => SavedKind::Check,
+                ItemKind::Redact => SavedKind::Redact,
             };
             Some(SavedItem {
                 page: item.page,
@@ -200,6 +205,7 @@ pub fn record(
             thumb_width,
             thumb_height,
             items: saved_items,
+            watermark: watermark.cloned(),
         },
     );
     for dropped in entries.split_off(entries.len().min(MAX_ENTRIES)) {
@@ -240,6 +246,7 @@ pub fn restore_items(entry: &RecentEntry, page_count: usize, mut next_id: impl F
                     ItemKind::Image { sig }
                 }
                 SavedKind::Check => ItemKind::Check,
+                SavedKind::Redact => ItemKind::Redact,
             };
             Some(Item {
                 id: next_id(),
@@ -297,11 +304,13 @@ mod tests {
             Item { id: 1, page: 0, x: 10., y: 20., w: 50., h: 14., kind: ItemKind::Text { text: "Hi".into(), font_size: 12. } },
             Item { id: 2, page: 1, x: 30., y: 40., w: 80., h: 40., kind: ItemKind::Image { sig } },
             Item { id: 3, page: 5, x: 1., y: 1., w: 9., h: 9., kind: ItemKind::Check },
+            Item { id: 4, page: 0, x: 5., y: 5., w: 90., h: 12., kind: ItemKind::Redact },
         ];
+        let watermark = Watermark { text: "COPY".into(), ..Watermark::default() };
         let thumb = make_thumbnail(pdf::tests::sample_pdf()).expect("thumbnail");
         assert!(thumb.width > 0 && thumb.height > thumb.width);
 
-        let entries = record(Vec::new(), &original, &output, 2, &items, Some(thumb)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(thumb)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -315,13 +324,16 @@ mod tests {
             n
         });
         // The item on page 5 no longer fits a 2-page document.
-        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.len(), 3);
         assert!(matches!(&restored[0].kind, ItemKind::Text { text, .. } if text == "Hi"));
         assert!(matches!(&restored[1].kind, ItemKind::Image { .. }));
+        assert!(restored[2].is_redaction());
         assert_eq!(restored[1].id, 102);
+        assert_eq!(loaded[0].watermark.as_ref(), Some(&watermark));
 
         // Saving the same original again updates the entry instead of adding one.
-        let entries = record(loaded, &original, &output, 2, &restored, None).unwrap();
+        let entries = record(loaded, &original, &output, 2, &restored, None, None).unwrap();
+        assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 
         let id = entries[0].id.clone();

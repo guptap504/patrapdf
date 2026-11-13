@@ -1,6 +1,7 @@
 //! The main editor window: toolbar, signature library sidebar and page view.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use gpui::{
     size,
 };
 
-use crate::model::{Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TextMetrics};
+use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TextMetrics};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
 use crate::gestures;
@@ -72,6 +73,7 @@ enum Tool {
     Text,
     Date,
     Check,
+    Redact,
 }
 
 /// How the zoom level is chosen.
@@ -115,7 +117,36 @@ fn tool_label(tool: Tool) -> (&'static str, &'static str) {
         Tool::Text => ("text", "Text"),
         Tool::Date => ("calendar", "Date"),
         Tool::Check => ("check", "Checkmark"),
+        Tool::Redact => ("redact", "Redact"),
     }
+}
+
+/// Watermark choices offered in the menu.
+const WATERMARK_PRESETS: &[&str] = &["CONFIDENTIAL", "DRAFT", "COPY", "SAMPLE", "DO NOT COPY"];
+const WATERMARK_COLORS: &[(&str, u32)] = &[("Gray", 0x8a8a8a), ("Red", 0xd93025), ("Blue", 0x1a5fd6)];
+const WATERMARK_STRENGTHS: &[(&str, f32)] = &[("Light", 0.12), ("Medium", 0.22), ("Strong", 0.38)];
+const WATERMARK_MAX_CHARS: usize = 40;
+/// A redaction box placed with a click (rather than drawn), in points.
+const DEFAULT_REDACTION: (f32, f32) = (140., 18.);
+
+/// Everything undo/redo and "discard" restore.
+#[derive(Clone)]
+struct Snapshot {
+    items: Vec<Item>,
+    watermark: Option<Watermark>,
+}
+
+/// The rendered watermark preview, one transparent image per page size.
+#[derive(Default)]
+struct WatermarkPreview {
+    images: HashMap<(u32, u32), Arc<RenderImage>>,
+    /// The watermark and scale last requested (rendering or rendered).
+    requested: Option<(Watermark, f32)>,
+    task: Option<Task<()>>,
+}
+
+fn page_size_key(geom: &PageGeom) -> (u32, u32) {
+    ((geom.width * 100.).round() as u32, (geom.height * 100.).round() as u32)
 }
 
 /// Dragging the page canvas to scroll it.
@@ -128,6 +159,8 @@ struct PanState {
 enum DragMode {
     Move,
     Resize,
+    /// Drawing a new redaction box from the point where the drag started.
+    Draw,
 }
 
 struct DragState {
@@ -135,7 +168,7 @@ struct DragState {
     mode: DragMode,
     start_mouse: Point<Pixels>,
     start: (f32, f32, f32, f32),
-    snapshot: Vec<Item>,
+    snapshot: Snapshot,
     moved: bool,
 }
 
@@ -199,6 +232,15 @@ pub struct Editor {
     items: Vec<Item>,
     /// The fields as of the last open/save; "Discard changes" reverts to this.
     saved_items: Vec<Item>,
+    watermark: Option<Watermark>,
+    saved_watermark: Option<Watermark>,
+    watermark_menu_open: bool,
+    /// Typing into the watermark text box.
+    watermark_editing: bool,
+    /// The next keystroke replaces the whole watermark text (like a selected field).
+    watermark_replace: bool,
+    watermark_checkpointed: bool,
+    watermark_preview: WatermarkPreview,
     /// Recently saved documents, shown in the gallery when no document is open.
     recents: Vec<RecentEntry>,
     next_id: u64,
@@ -208,9 +250,9 @@ pub struct Editor {
     tool: Tool,
     zoom: f32,
     drag: Option<DragState>,
-    history: Vec<Vec<Item>>,
+    history: Vec<Snapshot>,
     /// Undone states, for redo. Cleared by any new edit.
-    future: Vec<Vec<Item>>,
+    future: Vec<Snapshot>,
     /// A copied field, pasted with ⌘V.
     field_clipboard: Option<Item>,
     zoom_mode: ZoomMode,
@@ -272,6 +314,13 @@ impl Editor {
             signatures: signatures::load_library(),
             items: Vec::new(),
             saved_items: Vec::new(),
+            watermark: None,
+            saved_watermark: None,
+            watermark_menu_open: false,
+            watermark_editing: false,
+            watermark_replace: false,
+            watermark_checkpointed: false,
+            watermark_preview: WatermarkPreview::default(),
             recents: recents::load(),
             next_id: 1,
             selected: None,
@@ -400,8 +449,11 @@ impl Editor {
         });
         self.items.clear();
         self.saved_items.clear();
+        self.watermark = None;
+        self.saved_watermark = None;
         self.history.clear();
         self.future.clear();
+        self.close_menus();
         self.selected = None;
         self.editing = None;
         self.drag = None;
@@ -422,6 +474,10 @@ impl Editor {
                     cx.drop_image(image, Some(window));
                 }
             }
+        }
+        let preview = std::mem::take(&mut self.watermark_preview);
+        for image in preview.images.into_values() {
+            cx.drop_image(image, Some(window));
         }
         self.render_task = None;
         self.thumb_task = None;
@@ -449,8 +505,11 @@ impl Editor {
         self.release_document(window, cx);
         self.items.clear();
         self.saved_items.clear();
+        self.watermark = None;
+        self.saved_watermark = None;
         self.history.clear();
         self.future.clear();
+        self.close_menus();
         self.selected = None;
         self.editing = None;
         self.drag = None;
@@ -479,6 +538,8 @@ impl Editor {
         }
         self.checkpoint();
         self.items = self.saved_items.clone();
+        self.watermark = self.saved_watermark.clone();
+        self.close_menus();
         self.selected = None;
         self.editing = None;
         self.drag = None;
@@ -502,6 +563,8 @@ impl Editor {
             });
             self.next_id = next_id + 1;
             self.saved_items = self.items.clone();
+            self.watermark = entry.watermark.clone();
+            self.saved_watermark = self.watermark.clone();
             if let Some(doc) = &mut self.doc {
                 doc.last_output = Some(entry.output.clone());
             }
@@ -649,6 +712,13 @@ impl Editor {
         let pages: Vec<PageGeom> = doc.loaded.pages.clone();
         let page_count = pages.len();
         let items = self.items.clone();
+        let watermark = self.watermark.clone().filter(|w| !w.text.trim().is_empty());
+        let redacted_pages = items
+            .iter()
+            .filter(|i| i.is_redaction())
+            .map(|i| i.page)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         let metrics = self.metrics;
         let revision = self.revision;
 
@@ -656,10 +726,11 @@ impl Editor {
             let Ok(Ok(Some(path))) = picker.await else { return };
             let target = path.clone();
             let saved_items = items.clone();
+            let saved_watermark = watermark.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let out = pdf::write(&bytes, &pages, &items, metrics)?;
+                    let out = pdf::write(&bytes, &pages, &items, watermark.as_ref(), metrics)?;
                     std::fs::write(&target, &out)?;
                     anyhow::Ok(recents::make_thumbnail(out))
                 })
@@ -671,14 +742,33 @@ impl Editor {
                         this.dirty = false;
                     }
                     this.saved_items = saved_items.clone();
+                    this.saved_watermark = saved_watermark.clone();
                     if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
                         doc.last_output = Some(path.clone());
                     }
-                    match recents::record(this.recents.clone(), &original, &path, page_count, &saved_items, thumbnail) {
+                    let recorded = recents::record(
+                        this.recents.clone(),
+                        &original,
+                        &path,
+                        page_count,
+                        &saved_items,
+                        saved_watermark.as_ref(),
+                        thumbnail,
+                    );
+                    match recorded {
                         Ok(entries) => this.recents = entries,
                         Err(e) => eprintln!("could not update recents: {e:#}"),
                     }
-                    this.status = format!("Saved {}", path.display()).into();
+                    this.status = match redacted_pages {
+                        0 => format!("Saved {}", path.display()),
+                        n => format!(
+                            "Saved {} · {n} redacted page{} saved as image{} (their text is no longer selectable)",
+                            path.display(),
+                            if n == 1 { "" } else { "s" },
+                            if n == 1 { "" } else { "s" },
+                        ),
+                    }
+                    .into();
                     cx.notify();
                 }
                 Err(e) => this.show_error("Couldn't save the PDF", &format!("{e:#}"), window, cx),
@@ -804,13 +894,28 @@ impl Editor {
         self.revision += 1;
     }
 
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            items: self.items.clone(),
+            watermark: self.watermark.clone(),
+        }
+    }
+
+    /// Switch to `snapshot`, returning the state it replaced.
+    fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
+        let current = self.snapshot();
+        self.items = snapshot.items;
+        self.watermark = snapshot.watermark;
+        current
+    }
+
     fn checkpoint(&mut self) {
-        let snapshot = self.items.clone();
+        let snapshot = self.snapshot();
         self.push_history(snapshot);
     }
 
     /// Record a state to undo back to. Any new edit invalidates the redo stack.
-    fn push_history(&mut self, snapshot: Vec<Item>) {
+    fn push_history(&mut self, snapshot: Snapshot) {
         self.history.push(snapshot);
         if self.history.len() > 200 {
             self.history.remove(0);
@@ -821,8 +926,8 @@ impl Editor {
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         self.finish_editing(cx);
-        if let Some(items) = self.history.pop() {
-            let current = std::mem::replace(&mut self.items, items);
+        if let Some(snapshot) = self.history.pop() {
+            let current = self.restore(snapshot);
             self.future.push(current);
             self.after_history_jump(cx);
         }
@@ -830,14 +935,15 @@ impl Editor {
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         self.finish_editing(cx);
-        if let Some(items) = self.future.pop() {
-            let current = std::mem::replace(&mut self.items, items);
+        if let Some(snapshot) = self.future.pop() {
+            let current = self.restore(snapshot);
             self.history.push(current);
             self.after_history_jump(cx);
         }
     }
 
     fn after_history_jump(&mut self, cx: &mut Context<Self>) {
+        self.watermark_editing = false;
         self.selected = None;
         self.editing = None;
         self.drag = None;
@@ -879,6 +985,13 @@ impl Editor {
 
     /// ⌘V: paste text while typing, otherwise paste the copied field.
     fn paste(&mut self, cx: &mut Context<Self>) {
+        if self.watermark_editing {
+            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                let line = text.lines().next().unwrap_or_default().to_string();
+                self.edit_watermark_text(cx, |t| t.push_str(&line));
+            }
+            return;
+        }
         if self.editing.is_some() {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
                 let text = text.replace("\r\n", "\n");
@@ -1237,13 +1350,29 @@ impl Editor {
         self.finish_editing(cx);
         self.close_menus();
         let Some((page, x, y)) = self.page_at(event.position) else { return };
-        if self.tool == Tool::Select {
+        match self.tool {
             // Let the press reach the canvas, which starts panning.
-            self.selected = None;
-        } else {
-            cx.stop_propagation();
-            self.place_tool(self.tool, page, x, y, cx);
-            self.tool = Tool::Select;
+            Tool::Select => self.selected = None,
+            // Draw a box. Like the other tools, it's one box per use (a sticky tool
+            // turns the next "click to deselect" into an unwanted box).
+            Tool::Redact => {
+                cx.stop_propagation();
+                self.tool = Tool::Select;
+                let id = self.add_item(page, x, y, 0., 0., ItemKind::Redact, cx);
+                self.drag = Some(DragState {
+                    id,
+                    mode: DragMode::Draw,
+                    start_mouse: event.position,
+                    start: (x, y, 0., 0.),
+                    snapshot: self.snapshot(),
+                    moved: false,
+                });
+            }
+            tool => {
+                cx.stop_propagation();
+                self.place_tool(tool, page, x, y, cx);
+                self.tool = Tool::Select;
+            }
         }
         cx.notify();
     }
@@ -1268,6 +1397,10 @@ impl Editor {
                 let s = DEFAULT_CHECK_SIZE;
                 self.add_item(page, x - s / 2., y - s / 2., s, s, ItemKind::Check, cx);
             }
+            Tool::Redact => {
+                let (w, h) = DEFAULT_REDACTION;
+                self.add_item(page, x - w / 2., y - h / 2., w, h, ItemKind::Redact, cx);
+            }
         }
     }
 
@@ -1286,6 +1419,12 @@ impl Editor {
     fn close_menus(&mut self) {
         self.zoom_menu_open = false;
         self.date_menu_open = false;
+        self.watermark_menu_open = false;
+        self.watermark_editing = false;
+    }
+
+    fn any_menu_open(&self) -> bool {
+        self.zoom_menu_open || self.date_menu_open || self.watermark_menu_open
     }
 
     fn item_mouse_down(&mut self, id: u64, mode: DragMode, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1301,7 +1440,7 @@ impl Editor {
             mode,
             start_mouse: event.position,
             start: (item.x, item.y, item.w, item.h),
-            snapshot: self.items.clone(),
+            snapshot: self.snapshot(),
             moved: false,
         });
         self.selected = Some(id);
@@ -1340,6 +1479,26 @@ impl Editor {
                 item.x = x0 + dx;
                 item.y = y0 + dy;
             }
+            DragMode::Draw => {
+                item.x = x0.min(x0 + dx);
+                item.y = y0.min(y0 + dy);
+                item.w = dx.abs();
+                item.h = dy.abs();
+                if let Some(g) = self.page_geom(item.page) {
+                    item.x = item.x.max(0.);
+                    item.y = item.y.max(0.);
+                    item.w = item.w.min(g.width - item.x);
+                    item.h = item.h.min(g.height - item.y);
+                }
+            }
+            DragMode::Resize if item.is_redaction() => {
+                item.w = (w0 + dx).max(4.);
+                item.h = (h0 + dy).max(4.);
+                if let Some(g) = self.page_geom(item.page) {
+                    item.w = item.w.min(g.width - item.x);
+                    item.h = item.h.min(g.height - item.y);
+                }
+            }
             DragMode::Resize => {
                 let aspect = w0 / h0.max(0.01);
                 let w = (w0 + dx).max(8.);
@@ -1367,7 +1526,21 @@ impl Editor {
             cx.notify();
         }
         if let Some(drag) = self.drag.take() {
-            if drag.moved {
+            if drag.mode == DragMode::Draw {
+                // `add_item` already recorded the undo step. A click (or a tiny drag)
+                // places a default-sized box instead.
+                let (x0, y0, _, _) = drag.start;
+                if let Some(mut item) = self.items.iter().find(|i| i.id == drag.id).cloned() {
+                    if item.w < 4. || item.h < 4. {
+                        let (w, h) = DEFAULT_REDACTION;
+                        (item.x, item.y, item.w, item.h) = (x0 - w / 2., y0 - h / 2., w, h);
+                        self.clamp_item(&mut item);
+                        if let Some(slot) = self.item_mut(drag.id) {
+                            *slot = item;
+                        }
+                    }
+                }
+            } else if drag.moved {
                 self.push_history(drag.snapshot);
             }
             cx.notify();
@@ -1399,7 +1572,26 @@ impl Editor {
             return;
         }
 
-        if ks.key == "escape" && (self.zoom_menu_open || self.date_menu_open) {
+        if self.watermark_editing {
+            match ks.key.as_str() {
+                "escape" | "enter" => {
+                    self.watermark_editing = false;
+                    cx.notify();
+                }
+                "backspace" => self.edit_watermark_text(cx, |t| {
+                    t.pop();
+                }),
+                "tab" => {}
+                _ if !shortcut => {
+                    let Some(ch) = ks.key_char.clone().filter(|c| !c.chars().any(char::is_control)) else { return };
+                    self.edit_watermark_text(cx, |t| t.push_str(&ch));
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if ks.key == "escape" && self.any_menu_open() {
             self.close_menus();
             cx.notify();
             return;
@@ -1577,8 +1769,9 @@ impl Editor {
                                             if std::mem::take(&mut this.menu_dismissed) {
                                                 return;
                                             }
-                                            this.date_menu_open = false;
-                                            this.zoom_menu_open = !this.zoom_menu_open;
+                                            let open = !this.zoom_menu_open;
+                                            this.close_menus();
+                                            this.zoom_menu_open = open;
                                             cx.notify();
                                         }))
                                         .when(self.zoom_menu_open, |d| d.child(self.render_zoom_menu(cx))),
@@ -1627,12 +1820,8 @@ impl Editor {
                                 .tooltip(ui::tooltip("Save a filled copy", Some("⌘S")))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx))),
                         )
-                    })
-                    .when(!has_doc, |d| {
-                        d.child(ui::secondary_button("open", "open", "Open PDF…").on_click(cx.listener(
-                            |this, _: &ClickEvent, window, cx| this.request_open(None, window, cx),
-                        )))
                     }),
+                // No document: the start screen (gallery or empty state) has its own open action.
             )
     }
 
@@ -1640,7 +1829,7 @@ impl Editor {
     /// (`align_right`: right edges line up), and closes on any click outside it.
     fn floating_menu(&self, panel: gpui::Div, align_right: bool, cx: &mut Context<Self>) -> AnyElement {
         let panel = panel.occlude().on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-            if this.zoom_menu_open || this.date_menu_open {
+            if this.any_menu_open() {
                 this.close_menus();
                 // The same click may land on the menu's trigger; don't let it reopen the menu.
                 this.menu_dismissed = true;
@@ -1712,6 +1901,208 @@ impl Editor {
         self.floating_menu(panel, false, cx)
     }
 
+    // -----------------------------------------------------------------------
+    // Watermark
+    // -----------------------------------------------------------------------
+
+    /// Change a watermark setting (adding the default watermark if there is none).
+    fn update_watermark(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Watermark)) {
+        self.checkpoint();
+        self.watermark_editing = false;
+        f(self.watermark.get_or_insert_with(Watermark::default));
+        cx.notify();
+    }
+
+    fn remove_watermark(&mut self, cx: &mut Context<Self>) {
+        if self.watermark.is_some() {
+            self.checkpoint();
+            self.watermark = None;
+        }
+        self.close_menus();
+        cx.notify();
+    }
+
+    fn start_watermark_typing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.selected = None;
+        self.watermark_editing = true;
+        self.watermark_replace = true;
+        self.watermark_checkpointed = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn edit_watermark_text(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut String)) {
+        if !self.watermark_checkpointed {
+            self.checkpoint();
+            self.watermark_checkpointed = true;
+        } else {
+            self.mark_dirty();
+        }
+        let watermark = self.watermark.get_or_insert_with(Watermark::default);
+        if std::mem::take(&mut self.watermark_replace) {
+            watermark.text.clear();
+        }
+        f(&mut watermark.text);
+        if watermark.text.chars().count() > WATERMARK_MAX_CHARS {
+            watermark.text = watermark.text.chars().take(WATERMARK_MAX_CHARS).collect();
+        }
+        cx.notify();
+    }
+
+    /// Keep the watermark preview images in step with the watermark and zoom.
+    /// Called from `render`, so undo/redo, typing and zooming all just work.
+    fn sync_watermark_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
+        let Some(watermark) = self.watermark.clone().filter(|w| !w.text.trim().is_empty()) else {
+            let preview = std::mem::take(&mut self.watermark_preview);
+            for image in preview.images.into_values() {
+                cx.drop_image(image, Some(window));
+            }
+            return;
+        };
+        // Big soft lettering: up to 3× is plenty, even zoomed far in.
+        let scale = (self.zoom * window.scale_factor() * 1.25).clamp(1.0, 3.0);
+        if let Some((requested, requested_scale)) = &self.watermark_preview.requested {
+            if *requested == watermark && *requested_scale >= scale * 0.8 && *requested_scale <= scale * 2.5 {
+                return;
+            }
+        }
+        let mut sizes: Vec<((u32, u32), f32, f32)> = Vec::new();
+        for geom in &doc.loaded.pages {
+            let key = page_size_key(geom);
+            if !sizes.iter().any(|(k, _, _)| *k == key) {
+                sizes.push((key, geom.width, geom.height));
+            }
+        }
+        self.watermark_preview.requested = Some((watermark.clone(), scale));
+        self.watermark_preview.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let wm = watermark.clone();
+            let rendered = cx
+                .background_executor()
+                .spawn(async move {
+                    sizes
+                        .into_iter()
+                        .filter_map(|(key, w, h)| Some((key, pdf::render_watermark(w, h, &wm, scale)?)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                // Superseded by a newer request (or the watermark was removed)?
+                if this.watermark_preview.requested.as_ref() != Some(&(watermark, scale)) {
+                    return;
+                }
+                for image in std::mem::take(&mut this.watermark_preview.images).into_values() {
+                    cx.drop_image(image, Some(window));
+                }
+                for (key, page) in rendered {
+                    if let Some(image) = to_render_image(page) {
+                        this.watermark_preview.images.insert(key, image);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn render_watermark_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.watermark.clone();
+        let editing = self.watermark_editing;
+        let text = current.as_ref().map(|w| w.text.clone()).unwrap_or_default();
+        let selected_text = editing && self.watermark_replace && !text.is_empty();
+
+        let input = div()
+            .id("watermark-text")
+            .flex()
+            .items_center()
+            .h(px(30.))
+            .mx_1()
+            .mb_1()
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if editing { ui::accent() } else { ui::border_strong() })
+            .bg(ui::surface())
+            .text_sm()
+            .cursor(CursorStyle::IBeam)
+            .overflow_hidden()
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.start_watermark_typing(window, cx)))
+            .when(text.is_empty(), |d| {
+                d.child(div().text_color(ui::text_tertiary()).child(if editing { "" } else { "Type your own…" }))
+            })
+            .when(!text.is_empty(), |d| {
+                d.child(
+                    div()
+                        .whitespace_nowrap()
+                        .when(selected_text, |d| d.bg(ui::accent().opacity(0.25)).rounded(px(2.)))
+                        .child(text.clone()),
+                )
+            })
+            .when(editing && !selected_text, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(ui::accent())));
+
+        let mut panel = ui::menu_panel()
+            .w(px(250.))
+            .child(ui::menu_caption("Watermark text"))
+            .child(input);
+        for (i, preset) in WATERMARK_PRESETS.iter().enumerate() {
+            let checked = current.as_ref().is_some_and(|w| w.text == *preset);
+            panel = panel.child(ui::menu_item(("wm-preset", i), *preset, checked, None).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| this.update_watermark(cx, |w| w.text = preset.to_string()),
+            )));
+        }
+
+        let color = current.as_ref().map(|w| w.color);
+        let swatches = WATERMARK_COLORS.iter().enumerate().map(|(i, &(name, rgb_value))| {
+            let active = color == Some(rgb_value);
+            ui::button_base(("wm-color", i))
+                .size(px(22.))
+                .rounded_full()
+                .bg(rgb(rgb_value))
+                .cursor(CursorStyle::PointingHand)
+                .border_2()
+                .border_color(if active { ui::accent() } else { ui::surface() })
+                .tooltip(ui::tooltip(name, None))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.update_watermark(cx, |w| w.color = rgb_value)))
+        });
+        let opacity = current.as_ref().map(|w| w.opacity);
+        let strengths = WATERMARK_STRENGTHS.iter().enumerate().map(|(i, &(name, value))| {
+            let active = opacity.is_some_and(|o| (o - value).abs() < 0.01);
+            ui::chip(("wm-strength", i), name, active)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.update_watermark(cx, |w| w.opacity = value)))
+        });
+        let diagonal = current.as_ref().map(|w| w.diagonal);
+        let directions = [("Diagonal", true), ("Across", false)].into_iter().enumerate().map(|(i, (name, value))| {
+            ui::chip(("wm-direction", i), name, diagonal == Some(value))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.update_watermark(cx, |w| w.diagonal = value)))
+        });
+
+        panel = panel
+            .child(ui::menu_separator())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .child(div().text_xs().text_color(ui::text_secondary()).child("Colour"))
+                    .child(div().flex().gap_1p5().children(swatches)),
+            )
+            .child(ui::menu_caption("Strength"))
+            .child(div().flex().gap_1().px_1().children(strengths))
+            .child(ui::menu_caption("Direction"))
+            .child(div().flex().gap_1().px_1().pb_1().children(directions));
+        if current.is_some() {
+            panel = panel.child(ui::menu_separator()).child(
+                ui::menu_item("wm-remove", "Remove watermark", false, None)
+                    .text_color(ui::danger())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.remove_watermark(cx))),
+            );
+        }
+        self.floating_menu(panel, false, cx)
+    }
+
     fn current_font_size(&self) -> f32 {
         self.selected
             .and_then(|id| self.items.iter().find(|i| i.id == id))
@@ -1724,55 +2115,134 @@ impl Editor {
 
     /// The "Fill in" tool list: click a tool then the page, or drag it onto the page.
     fn render_fill_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let has_doc = self.doc.is_some();
         let mut rows = Vec::new();
         for tool in [Tool::Text, Tool::Date, Tool::Check] {
+            rows.push(self.render_tool_row(tool, cx));
+        }
+        Self::sidebar_section("Fill in", rows)
+    }
+
+    fn sidebar_section(title: &'static str, rows: Vec<AnyElement>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap_0p5()
+            .px_3()
+            .pt_4()
+            .pb_3()
+            .child(
+                div()
+                    .px_1()
+                    .pb_1()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// "Protect": redaction and the watermark.
+    fn render_protect_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_doc = self.doc.is_some();
+        let watermark_on = self.watermark.as_ref().is_some_and(|w| !w.text.trim().is_empty());
+        let sublabel: SharedString = match &self.watermark {
+            Some(w) if watermark_on => w.text.clone().into(),
+            _ => "None".into(),
+        };
+        let watermark_row = Self::sidebar_row("protect-watermark", "watermark", "Watermark", sublabel, watermark_on, has_doc)
+            .relative()
+            .child(ui::icon("chevron-down", ui::text_tertiary()).size(px(12.)).mr_1())
+            .when(has_doc, |d| {
+                d.cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if std::mem::take(&mut this.menu_dismissed) {
+                            return;
+                        }
+                        let open = !this.watermark_menu_open;
+                        this.close_menus();
+                        this.watermark_menu_open = open;
+                        window.focus(&this.focus);
+                        cx.notify();
+                    }))
+            })
+            .when(self.watermark_menu_open, |d| d.child(self.render_watermark_menu(cx)))
+            .into_any_element();
+        Self::sidebar_section("Protect", vec![self.render_tool_row(Tool::Redact, cx), watermark_row])
+    }
+
+    /// The shared look of a sidebar row: icon tile, label and a one-line description.
+    fn sidebar_row(
+        id: &'static str,
+        icon_name: &'static str,
+        label: &'static str,
+        sublabel: SharedString,
+        active: bool,
+        enabled: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .h(px(42.))
+            .px_2()
+            .rounded_md()
+            .when(active, |d| d.bg(ui::accent_soft()))
+            .when(!active && enabled, |d| d.hover(|s| s.bg(ui::hover_bg())))
+            .when(!enabled, |d| d.opacity(0.45))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(px(28.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if active { ui::accent() } else { ui::border() })
+                    .bg(if active { ui::accent() } else { ui::surface() })
+                    .child(ui::icon(icon_name, if active { gpui::white() } else { ui::text_secondary() }).size(px(15.))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if active { ui::accent() } else { ui::text_primary() })
+                            .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                            .child(label),
+                    )
+                    .child(div().text_xs().text_color(ui::text_tertiary()).truncate().child(sublabel)),
+            )
+    }
+
+    /// A tool row: click it then the page, or drag it onto the page.
+    fn render_tool_row(&self, tool: Tool, cx: &mut Context<Self>) -> AnyElement {
+        let has_doc = self.doc.is_some();
+        {
             let (icon_name, label) = tool_label(tool);
             let active = self.tool == tool;
             let sublabel: SharedString = match tool {
                 Tool::Date => self.settings.today().into(),
                 Tool::Text => "Type anywhere on the page".into(),
+                Tool::Redact => "Black out & remove for good".into(),
                 _ => "Tick a box".into(),
             };
-            let row = div()
-                .id(SharedString::from(format!("fill-{label}")))
-                .flex()
-                .items_center()
-                .gap_2p5()
-                .h(px(42.))
-                .px_2()
-                .rounded_md()
-                .when(active, |d| d.bg(ui::accent_soft()))
-                .when(!active && has_doc, |d| d.hover(|s| s.bg(ui::hover_bg())))
-                .when(!has_doc, |d| d.opacity(0.45))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .size(px(28.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if active { ui::accent() } else { ui::border() })
-                        .bg(if active { ui::accent() } else { ui::surface() })
-                        .child(ui::icon(icon_name, if active { gpui::white() } else { ui::text_secondary() }).size(px(15.))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(if active { ui::accent() } else { ui::text_primary() })
-                                .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(label),
-                        )
-                        .child(div().text_xs().text_color(ui::text_tertiary()).truncate().child(sublabel)),
-                )
+            let id = match tool {
+                Tool::Text => "fill-Text",
+                Tool::Date => "fill-Date",
+                Tool::Check => "fill-Checkmark",
+                Tool::Redact => "protect-Redact",
+                Tool::Select => "fill-Select",
+            };
+            let row = Self::sidebar_row(id, icon_name, label, sublabel, active, has_doc)
                 .when(tool == Tool::Date, |d| {
                     d.child(
                         div()
@@ -1798,8 +2268,9 @@ impl Editor {
                                 if std::mem::take(&mut this.menu_dismissed) {
                                     return;
                                 }
-                                this.zoom_menu_open = false;
-                                this.date_menu_open = !this.date_menu_open;
+                                let open = !this.date_menu_open;
+                                this.close_menus();
+                                this.date_menu_open = open;
                                 cx.notify();
                             }))
                             .when(self.date_menu_open, |d| d.child(self.render_date_menu(cx))),
@@ -1816,27 +2287,8 @@ impl Editor {
                         }))
                         .on_drag(ToolDrag(tool), |drag: &ToolDrag, _, _, cx| cx.new(|_| *drag))
                 });
-            rows.push(row);
+            row.into_any_element()
         }
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap_0p5()
-            .px_3()
-            .pt_4()
-            .pb_3()
-            .child(
-                div()
-                    .px_1()
-                    .pb_1()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Fill in"),
-            )
-            .children(rows)
-            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1921,6 +2373,8 @@ impl Editor {
             .border_r_1()
             .border_color(ui::border())
             .child(self.render_fill_section(cx))
+            .child(div().mx_4().h(px(1.)).bg(ui::border()))
+            .child(self.render_protect_section(cx))
             .child(div().mx_4().h(px(1.)).bg(ui::border()))
             .child(
                 div()
@@ -2080,6 +2534,13 @@ impl Editor {
                 .w(px(item.w * z))
                 .h(px(item.h * z))
                 .object_fit(ObjectFit::Fill)
+                .into_any_element(),
+            // Semi-transparent while selected, so you can see what you're covering.
+            ItemKind::Redact => div()
+                .w(px(item.w * z))
+                .h(px(item.h * z))
+                .bg(gpui::black())
+                .when(selected, |d| d.opacity(0.6))
                 .into_any_element(),
             ItemKind::Check => {
                 let s = item.w * z;
@@ -2485,10 +2946,7 @@ impl Editor {
                                             .text_color(ui::text_secondary())
                                             .child("Reopen a document to keep editing. The fields you placed stay editable."),
                                     ),
-                            )
-                            .child(ui::primary_button("gallery-open-btn", "open", "Open PDF…").on_click(cx.listener(
-                                |this, _: &ClickEvent, window, cx| this.request_open(None, window, cx),
-                            ))),
+                            ),
                     )
                     .child(div().flex().flex_wrap().gap_5().child(open_tile).children(cards)),
             )
@@ -2613,12 +3071,14 @@ impl Editor {
         let cursor = if self.tool == Tool::Select { hand } else { CursorStyle::Crosshair };
         let mut page_elements = Vec::with_capacity(page_count);
         for (index, (geom, view)) in doc.loaded.pages.iter().zip(&doc.pages).enumerate() {
-            let items: Vec<_> = self
-                .items
-                .iter()
-                .filter(|i| i.page == index)
-                .map(|item| self.render_item(item, cx))
-                .collect();
+            // Redactions always cover the other fields (they do in the saved file, too).
+            let mut on_page: Vec<&Item> = self.items.iter().filter(|i| i.page == index).collect();
+            on_page.sort_by_key(|i| i.is_redaction());
+            let items: Vec<_> = on_page.into_iter().map(|item| self.render_item(item, cx)).collect();
+            let watermark_image = self
+                .watermark
+                .as_ref()
+                .and_then(|_| self.watermark_preview.images.get(&page_size_key(geom)).cloned());
 
             let bounds = view.bounds.clone();
             let (scroll, painted_scroll, painted_zoom) =
@@ -2666,6 +3126,10 @@ impl Editor {
                             .child("Rendering…"),
                     )
                 })
+                // Over the page, under the fields — where the writer puts it.
+                .when_some(watermark_image, |d, image| {
+                    d.child(img(image).absolute().size_full().object_fit(ObjectFit::Fill))
+                })
                 .children(items);
 
             page_elements.push(
@@ -2689,6 +3153,7 @@ impl Editor {
             Tool::Text => Some(("text", "Click on the page to add a text box")),
             Tool::Date => Some(("calendar", "Click on the page to add today's date")),
             Tool::Check => Some(("check", "Click on the page to add a checkmark")),
+            Tool::Redact => Some(("redact", "Drag over anything to black it out. It's removed from the file when you save")),
         };
 
         // ⌘/Ctrl + wheel zooms around the pointer. Listening in the capture phase
@@ -2796,6 +3261,7 @@ impl Render for Editor {
                 _ => {}
             }
         }
+        self.sync_watermark_preview(window, cx);
         let field_count = self.items.len();
 
         div()
@@ -3044,7 +3510,7 @@ mod tests {
             (d.loaded.bytes.clone(), d.loaded.pages.clone(), e.items.clone(), e.metrics)
         });
         assert_eq!(items.len(), 2);
-        let out = crate::pdf::write(&bytes, &pages, &items, metrics).unwrap();
+        let out = crate::pdf::write(&bytes, &pages, &items, None, metrics).unwrap();
         assert_eq!(crate::pdf::load(out).unwrap().pages.len(), 2);
     }
 
@@ -3238,6 +3704,104 @@ mod tests {
     }
 
     #[gpui::test]
+    fn redaction_boxes_are_drawn_by_dragging(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+
+        // Drag from bottom-right to top-left: the box still comes out right.
+        editor.update(cx, |e, _| e.tool = Tool::Redact);
+        let (from, to) = (origin + point(px(360.), px(150.)), origin + point(px(60.), px(60.)));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 1);
+            let r = &e.items[0];
+            assert!(r.is_redaction());
+            assert_eq!((r.page, r.x, r.y, r.w, r.h), (0, 60., 60., 300., 90.));
+            assert_eq!(e.tool, Tool::Select, "one box per use, like the other tools");
+            assert_eq!(e.history.len(), 1, "one undo step per box");
+        });
+
+        // A plain click places a default-sized box centred on the click.
+        editor.update(cx, |e, _| e.tool = Tool::Redact);
+        cx.simulate_click(origin + point(px(200.), px(400.)), Modifiers::none());
+        editor.read_with(cx, |e, _| {
+            let r = &e.items[1];
+            let (w, h) = DEFAULT_REDACTION;
+            assert_eq!((r.x, r.y, r.w, r.h), (200. - w / 2., 400. - h / 2., w, h));
+        });
+        cx.simulate_keystrokes("cmd-z");
+        editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
+
+        // Redactions resize freely (no fixed aspect ratio).
+        let id = editor.read_with(cx, |e, _| e.items[0].id);
+        let corner = origin + point(px(360.), px(150.));
+        editor.update_in(cx, |e, window, cx| {
+            let down = MouseDownEvent { button: MouseButton::Left, position: corner, modifiers: Modifiers::none(), click_count: 1, first_mouse: false };
+            e.item_mouse_down(id, DragMode::Resize, &down, window, cx);
+        });
+        cx.simulate_mouse_move(corner + point(px(40.), px(-50.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(corner + point(px(40.), px(-50.)), MouseButton::Left, Modifiers::none());
+        editor.read_with(cx, |e, _| assert_eq!((e.items[0].w, e.items[0].h), (340., 40.)));
+
+        // Saving removes the covered text from the file.
+        let (bytes, pages, items, metrics) = editor.read_with(cx, |e, _| {
+            let d = e.doc.as_ref().unwrap();
+            (d.loaded.bytes.clone(), d.loaded.pages.clone(), e.items.clone(), e.metrics)
+        });
+        let out = crate::pdf::write(&bytes, &pages, &items, None, metrics).unwrap();
+        let mut doc = lopdf::Document::load_mem(&out).unwrap();
+        doc.decompress();
+        let mut raw = Vec::new();
+        doc.save_to(&mut raw).unwrap();
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(!raw.contains("Page 1 - Name:") && raw.contains("Page 2 - Name:"));
+    }
+
+    #[gpui::test]
+    fn watermark_typing_presets_undo_and_discard(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let watermark_text = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.watermark.as_ref().map(|w| w.text.clone()))
+        };
+
+        // Typing replaces the suggested text; the whole typing session is one undo step.
+        editor.update_in(cx, |e, window, cx| {
+            e.watermark_menu_open = true;
+            e.start_watermark_typing(window, cx);
+        });
+        cx.simulate_keystrokes("d r a f t space shift-x backspace");
+        assert_eq!(watermark_text(&editor, cx).as_deref(), Some("draft "));
+        cx.simulate_keystrokes("enter");
+        editor.read_with(cx, |e, _| assert!(e.dirty && !e.watermark_editing && e.history.len() == 1));
+
+        // The preview is rendered for each page size (the sample has two).
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert_eq!(e.watermark_preview.images.len(), 2));
+
+        // Presets and options are undoable steps too.
+        editor.update(cx, |e, cx| e.update_watermark(cx, |w| w.text = "COPY".into()));
+        editor.update(cx, |e, cx| e.update_watermark(cx, |w| w.color = 0xd93025));
+        cx.simulate_keystrokes("cmd-z");
+        editor.read_with(cx, |e, _| assert_eq!(e.watermark.as_ref().unwrap().color, Watermark::default().color));
+        cx.simulate_keystrokes("cmd-z cmd-z");
+        assert_eq!(watermark_text(&editor, cx), None, "undone back to no watermark");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(e.watermark_preview.images.is_empty(), "preview cleared"));
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(watermark_text(&editor, cx).as_deref(), Some("draft "));
+
+        // Discard returns to the last save (no watermark); removing works too.
+        editor.update(cx, |e, cx| e.discard_changes(cx));
+        assert_eq!(watermark_text(&editor, cx), None);
+        cx.simulate_keystrokes("cmd-z");
+        assert!(watermark_text(&editor, cx).is_some());
+        editor.update(cx, |e, cx| e.remove_watermark(cx));
+        assert_eq!(watermark_text(&editor, cx), None);
+    }
+
+    #[gpui::test]
     fn discard_reverts_to_last_save_and_is_undoable(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
         let origin = page_origin(&editor, cx, 0);
@@ -3286,7 +3850,9 @@ mod tests {
             items: vec![
                 SavedItem { page: 0, x: 40., y: 60., w: 50., h: 14., kind: SavedKind::Text { text: "Restored".into(), font_size: 14. } },
                 SavedItem { page: 1, x: 70., y: 80., w: 16., h: 16., kind: SavedKind::Check },
+                SavedItem { page: 0, x: 20., y: 20., w: 90., h: 14., kind: SavedKind::Redact },
             ],
+            watermark: Some(Watermark { text: "COPY".into(), ..Watermark::default() }),
         }];
 
         editor.update_in(cx, |e, window, cx| {
@@ -3299,7 +3865,9 @@ mod tests {
         cx.run_until_parked();
         editor.read_with(cx, |e, _| {
             assert!(e.doc.is_some());
-            assert_eq!(e.items.len(), 2);
+            assert_eq!(e.items.len(), 3);
+            assert!(e.items[2].is_redaction());
+            assert_eq!(e.watermark.as_ref().map(|w| w.text.as_str()), Some("COPY"));
             assert!(!e.dirty, "a freshly reopened document has no unsaved changes");
             assert!(matches!(&e.items[0].kind, ItemKind::Text { text, .. } if text == "Restored"));
             assert_eq!(e.doc.as_ref().unwrap().last_output.as_deref(), Some(original.with_file_name("out.pdf").as_path()));
@@ -3311,6 +3879,6 @@ mod tests {
         let first = editor.read_with(cx, |e, _| e.items[0].id);
         editor.update(cx, |e, cx| e.delete_item(first, cx));
         editor.update(cx, |e, cx| e.discard_changes(cx));
-        editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 2));
+        editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 3));
     }
 }
