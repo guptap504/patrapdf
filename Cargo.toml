@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui = "0.2.2"
 hayro = "0.9.0"
 lopdf = "0.47.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -12,4 +12,4 @@ anyhow = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
-gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
+gpui = { version = "0.2.2", features = ["test-support"] }

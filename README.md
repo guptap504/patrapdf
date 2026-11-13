@@ -25,7 +25,7 @@ cargo run --release -- path/to/form.pdf   # the file argument is optional
 
 Each page's `view_to_user` matrix is the inverse of hayro's page transform. That handles `/Rotate` and offset crop boxes, so overlays land exactly where they appeared on screen. Text baselines use the measured metrics of the UI font.
 
-GPUI is built with `runtime_shaders`, so the Xcode Metal toolchain isn't required.
+Building on macOS requires the Xcode Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). To build without it, enable gpui's `runtime_shaders` feature.
 
 ## Not yet supported
 
