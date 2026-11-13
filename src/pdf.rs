@@ -142,15 +142,31 @@ const REDACT_SCALE: f32 = 3.0;
 
 /// Produce a new PDF with the watermark and all overlay items burned into the
 /// page content, then apply any redactions.
+///
+/// `source_pages` are the original document's pages; `order` lists, for each
+/// page of the output, which original page it is (pages left out are deleted).
+/// Item page numbers refer to positions in `order`.
 pub fn write(
     original: &[u8],
-    pages: &[PageGeom],
+    source_pages: &[PageGeom],
+    order: &[usize],
     items: &[Item],
     watermark: Option<&Watermark>,
     metrics: TextMetrics,
 ) -> Result<Vec<u8>> {
+    let identity = order.len() == source_pages.len() && order.iter().enumerate().all(|(i, &p)| i == p);
+    let (arranged, pages): (Vec<u8>, Vec<PageGeom>) = if identity {
+        (original.to_vec(), source_pages.to_vec())
+    } else {
+        let pages = order
+            .iter()
+            .map(|&i| source_pages.get(i).cloned().ok_or_else(|| anyhow!("page {} does not exist", i + 1)))
+            .collect::<Result<_>>()?;
+        (arrange_pages(original, order)?, pages)
+    };
+    let pages = pages.as_slice();
     let watermark = watermark.filter(|w| !w.text.trim().is_empty());
-    let flattened = write_overlays(original, pages, items, watermark, metrics)?;
+    let flattened = write_overlays(&arranged, pages, items, watermark, metrics)?;
     let redactions: Vec<&Item> = items.iter().filter(|i| i.is_redaction() && i.w >= 1. && i.h >= 1.).collect();
     if redactions.is_empty() {
         return Ok(flattened);
@@ -165,12 +181,7 @@ fn write_overlays(
     watermark: Option<&Watermark>,
     metrics: TextMetrics,
 ) -> Result<Vec<u8>> {
-    let mut doc = Document::load_mem(original).context("lopdf could not parse the PDF")?;
-    if doc.is_encrypted() {
-        // Most "encrypted" forms only use an owner password; try the empty user password.
-        doc.decrypt("").map_err(|_| anyhow!("this PDF is password protected"))?;
-        doc.trailer.remove(b"Encrypt");
-    }
+    let mut doc = open_document(original)?;
 
     let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
     if page_ids.len() != pages.len() {
@@ -285,6 +296,128 @@ fn write_overlays(
     let mut out = Vec::new();
     doc.save_to(&mut out).context("could not serialize PDF")?;
     Ok(out)
+}
+
+fn open_document(bytes: &[u8]) -> Result<Document> {
+    let mut doc = Document::load_mem(bytes).context("lopdf could not parse the PDF")?;
+    if doc.is_encrypted() {
+        // Most "encrypted" forms only use an owner password; try the empty user password.
+        doc.decrypt("").map_err(|_| anyhow!("this PDF is password protected"))?;
+        doc.trailer.remove(b"Encrypt");
+    }
+    Ok(doc)
+}
+
+fn save_document(mut doc: Document) -> Result<Vec<u8>> {
+    doc.compress();
+    let mut out = Vec::new();
+    doc.save_to(&mut out).context("could not serialize PDF")?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Page order
+// ---------------------------------------------------------------------------
+
+/// Page attributes a page can inherit from its ancestors in the page tree.
+const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
+
+/// Rebuild the page tree as `order` (indices into the original pages).
+///
+/// The new tree is flat, so each kept page first gets its own copy of any
+/// attribute it used to inherit. Deleted pages are removed from the file, not
+/// just from the page list: references to them (bookmarks, links, named
+/// destinations) are cleared, form fields living on them are dropped, as is the
+/// structure tree, and everything left unreferenced is pruned.
+fn arrange_pages(original: &[u8], order: &[usize]) -> Result<Vec<u8>> {
+    let mut doc = open_document(original)?;
+    let ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
+    if order.is_empty() {
+        bail!("a PDF needs at least one page");
+    }
+    let mut kept = Vec::with_capacity(order.len());
+    for &i in order {
+        let id = *ids.get(i).ok_or_else(|| anyhow!("page {} does not exist", i + 1))?;
+        if kept.contains(&id) {
+            bail!("page {} appears twice", i + 1);
+        }
+        kept.push(id);
+    }
+    let removed: HashSet<ObjectId> = ids.iter().filter(|id| !kept.contains(id)).copied().collect();
+
+    let catalog_id = doc.trailer.get(b"Root").and_then(Object::as_reference)?;
+    let root_id = doc.get_dictionary(catalog_id)?.get(b"Pages").and_then(Object::as_reference)?;
+
+    for &id in &kept {
+        for key in INHERITABLE {
+            if doc.get_dictionary(id)?.has(key.as_bytes()) {
+                continue;
+            }
+            if let Some(value) = inherited(&doc, id, key) {
+                doc.get_dictionary_mut(id)?.set(key, value);
+            }
+        }
+    }
+    for &id in &kept {
+        doc.get_dictionary_mut(id)?.set("Parent", root_id);
+    }
+    let root = doc.get_dictionary_mut(root_id)?;
+    root.set("Kids", kept.iter().map(|&id| Object::Reference(id)).collect::<Vec<_>>());
+    root.set("Count", kept.len() as i64);
+
+    if !removed.is_empty() {
+        let mut removed_annots = HashSet::new();
+        for &id in &removed {
+            removed_annots.extend(page_annotations(&doc, id));
+        }
+        strip_form_fields(&mut doc, &removed_annots);
+        if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
+            catalog.remove(b"StructTreeRoot");
+            catalog.remove(b"MarkInfo");
+        }
+        for object in doc.objects.values_mut() {
+            clear_references(object, &removed);
+        }
+        doc.prune_objects();
+    }
+    save_document(doc)
+}
+
+/// The value of `key` inherited from the page's ancestors, if any.
+fn inherited(doc: &Document, page_id: ObjectId, key: &str) -> Option<Object> {
+    let mut current = doc.get_dictionary(page_id).ok()?.get(b"Parent").and_then(Object::as_reference).ok();
+    for _ in 0..64 {
+        let dict = doc.get_dictionary(current?).ok()?;
+        if let Ok(value) = dict.get(key.as_bytes()) {
+            return Some(value.clone());
+        }
+        current = dict.get(b"Parent").and_then(Object::as_reference).ok();
+    }
+    None
+}
+
+/// Replace references to any of `targets` with null, recursively.
+fn clear_references(object: &mut Object, targets: &HashSet<ObjectId>) {
+    match object {
+        Object::Reference(id) if targets.contains(id) => *object = Object::Null,
+        Object::Array(items) => items.iter_mut().for_each(|o| clear_references(o, targets)),
+        Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, o)| clear_references(o, targets)),
+        Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, o)| clear_references(o, targets)),
+        _ => {}
+    }
+}
+
+/// The annotation objects of a page.
+fn page_annotations(doc: &Document, page_id: ObjectId) -> Vec<ObjectId> {
+    let annots = doc.get_dictionary(page_id).ok().and_then(|p| p.get(b"Annots").ok().cloned());
+    let annots = match annots {
+        Some(Object::Reference(id)) => doc.get_object(id).ok().cloned(),
+        other => other,
+    };
+    match annots {
+        Some(Object::Array(annots)) => annots.iter().filter_map(|a| a.as_reference().ok()).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn num(v: f64) -> String {
@@ -611,14 +744,7 @@ fn redact(bytes: &[u8], pages: &[PageGeom], redactions: &[&Item]) -> Result<Vec<
         let _ = content.compress();
         let content_id = doc.add_object(content);
 
-        let annots = doc.get_dictionary(page_id)?.get(b"Annots").ok().cloned();
-        let annots = match annots {
-            Some(Object::Reference(id)) => doc.get_object(id).ok().cloned(),
-            other => other,
-        };
-        if let Some(Object::Array(annots)) = annots {
-            removed_annots.extend(annots.iter().filter_map(|a| a.as_reference().ok()));
-        }
+        removed_annots.extend(page_annotations(&doc, page_id));
 
         let page = doc.get_dictionary_mut(page_id)?;
         // Anything else on the page that could carry the original content.
@@ -632,10 +758,7 @@ fn redact(bytes: &[u8], pages: &[PageGeom], redactions: &[&Item]) -> Result<Vec<
 
     strip_document_text(&mut doc, &removed_annots);
     doc.prune_objects();
-    doc.compress();
-    let mut out = Vec::new();
-    doc.save_to(&mut out).context("could not serialize PDF")?;
-    Ok(out)
+    save_document(doc)
 }
 
 /// Remove document-level copies of redacted content: form fields whose
@@ -647,6 +770,12 @@ fn strip_document_text(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
         catalog.remove(b"StructTreeRoot");
         catalog.remove(b"MarkInfo");
     }
+    strip_form_fields(doc, removed_annots);
+}
+
+/// Drop form fields that are (or whose widgets all are) among `removed_annots`.
+fn strip_form_fields(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
+    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
 
     let Some(form) = doc.get_dictionary(catalog_id).ok().and_then(|c| c.get(b"AcroForm").ok().cloned()) else {
         return;
@@ -773,7 +902,7 @@ pub(crate) mod tests {
         }
 
         let watermark = Watermark::default();
-        let written = write(&bytes, &loaded.pages, &items, Some(&watermark), TextMetrics::default()).unwrap();
+        let written = write(&bytes, &loaded.pages, &[0, 1], &items, Some(&watermark), TextMetrics::default()).unwrap();
         let reloaded = load(written.clone()).unwrap();
         assert_eq!(reloaded.pages.len(), 2);
 
@@ -842,7 +971,7 @@ pub(crate) mod tests {
             // A field on the other page must survive as real text.
             Item { id: 3, page: 1, x: 80., y: 120., w: 100., h: 16., kind: ItemKind::Text { text: "kept".into(), font_size: 12. } },
         ];
-        let out = write(&bytes, &loaded.pages, &items, Some(&Watermark::default()), TextMetrics::default()).unwrap();
+        let out = write(&bytes, &loaded.pages, &[0, 1], &items, Some(&Watermark::default()), TextMetrics::default()).unwrap();
         if let Some(dir) = std::env::var_os("PDF_SIGNER_TEST_OUT").map(PathBuf::from) {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("redacted.pdf"), &out).unwrap();
@@ -871,7 +1000,7 @@ pub(crate) mod tests {
 
         // Rotated, cropped page 2 can be redacted too.
         let items = vec![Item { id: 1, page: 1, x: 0., y: 0., w: 750., h: 580., kind: ItemKind::Redact }];
-        let out = write(&bytes, &loaded.pages, &items, None, TextMetrics::default()).unwrap();
+        let out = write(&bytes, &loaded.pages, &[0, 1], &items, None, TextMetrics::default()).unwrap();
         assert!(!all_text(&out).contains("Page 2 - Name:"));
         let reloaded = load(out).unwrap();
         assert_eq!((reloaded.pages[1].width, reloaded.pages[1].height), (750., 580.));
@@ -884,7 +1013,7 @@ pub(crate) mod tests {
         let bytes = sample_pdf();
         let loaded = load(bytes.clone()).unwrap();
         let watermark = Watermark { text: "DRAFT".into(), color: 0xff0000, opacity: 0.5, diagonal: true };
-        let out = write(&bytes, &loaded.pages, &[], Some(&watermark), TextMetrics::default()).unwrap();
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[], Some(&watermark), TextMetrics::default()).unwrap();
         let text = all_text(&out);
         assert_eq!(text.matches(&winansi_hex("DRAFT")).count(), 2, "one watermark per page");
         assert!(text.contains("Helvetica-Bold"));
@@ -911,7 +1040,50 @@ pub(crate) mod tests {
 
         // Blank text means no watermark.
         let blank = Watermark { text: "  ".into(), ..watermark };
-        let out = write(&bytes, &loaded.pages, &[], Some(&blank), TextMetrics::default()).unwrap();
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[], Some(&blank), TextMetrics::default()).unwrap();
         assert!(!all_text(&out).contains("Helvetica-Bold"));
+    }
+
+    /// The decompressed content of one page of `pdf` (1-based).
+    fn page_content(pdf: &[u8], page: u32) -> String {
+        let mut doc = Document::load_mem(pdf).unwrap();
+        doc.decompress();
+        let id = doc.get_pages()[&page];
+        String::from_utf8_lossy(&doc.get_page_content(id)).into_owned()
+    }
+
+    #[test]
+    fn pages_can_be_reordered_and_deleted() {
+        let bytes = sample_with_form_field();
+        let loaded = load(bytes.clone()).unwrap();
+        let note = |page| Item { id: 1, page, x: 80., y: 120., w: 60., h: 16., kind: ItemKind::Text { text: "note".into(), font_size: 12. } };
+
+        // Swap the pages; a field on (new) page 1 lands on what was page 2.
+        let out = write(&bytes, &loaded.pages, &[1, 0], &[note(0)], None, TextMetrics::default()).unwrap();
+        let swapped = load(out.clone()).unwrap();
+        assert_eq!(swapped.pages.len(), 2);
+        // Page 2 kept its rotation and crop box, which it used to inherit from the tree.
+        assert_eq!((swapped.pages[0].width, swapped.pages[0].height), (750., 580.));
+        assert_eq!(swapped.pages[0].view_to_user, loaded.pages[1].view_to_user);
+        assert_eq!((swapped.pages[1].width, swapped.pages[1].height), (612., 792.));
+        assert!(page_content(&out, 1).contains("Page 2 - Name:"));
+        assert!(page_content(&out, 1).contains(&winansi_hex("note")));
+        assert!(page_content(&out, 2).contains("Page 1 - Name:"));
+        // Fonts inherited from the page tree still resolve: it renders text, not nothing.
+        let page = render_page(&swapped.pdf, 1, 1.0).unwrap();
+        assert!(page.bgra.chunks_exact(4).filter(|p| p[0] < 100).count() > 200);
+
+        // Delete page 1: its content and its form field are gone from the file.
+        let out = write(&bytes, &loaded.pages, &[1], &[], None, TextMetrics::default()).unwrap();
+        let text = all_text(&out);
+        assert_eq!(load(out).unwrap().pages.len(), 1);
+        assert!(!text.contains("Page 1 - Name:"), "deleted page content must be gone");
+        assert!(!text.contains("secret-field-value"), "fields on a deleted page must be gone");
+        assert!(text.contains("Page 2 - Name:"));
+
+        // Nonsense orders are refused rather than producing a broken file.
+        assert!(write(&bytes, &loaded.pages, &[], &[], None, TextMetrics::default()).is_err());
+        assert!(write(&bytes, &loaded.pages, &[0, 0], &[], None, TextMetrics::default()).is_err());
+        assert!(write(&bytes, &loaded.pages, &[2], &[], None, TextMetrics::default()).is_err());
     }
 }

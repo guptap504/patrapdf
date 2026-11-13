@@ -42,6 +42,10 @@ pub struct RecentEntry {
     pub items: Vec<SavedItem>,
     #[serde(default)]
     pub watermark: Option<Watermark>,
+    /// Page order after deleting/reordering (indices into the original's pages);
+    /// `None` when unchanged.
+    #[serde(default)]
+    pub order: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +149,7 @@ pub fn record(
     page_count: usize,
     items: &[Item],
     watermark: Option<&Watermark>,
+    order: Option<&[usize]>,
     thumbnail: Option<Thumbnail>,
 ) -> Result<Vec<RecentEntry>> {
     let id = hash_hex(original);
@@ -206,6 +211,7 @@ pub fn record(
             thumb_height,
             items: saved_items,
             watermark: watermark.cloned(),
+            order: order.map(<[usize]>::to_vec),
         },
     );
     for dropped in entries.split_off(entries.len().min(MAX_ENTRIES)) {
@@ -310,7 +316,7 @@ mod tests {
         let thumb = make_thumbnail(pdf::tests::sample_pdf()).expect("thumbnail");
         assert!(thumb.width > 0 && thumb.height > thumb.width);
 
-        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(thumb)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(&[1, 0]), Some(thumb)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -330,9 +336,10 @@ mod tests {
         assert!(restored[2].is_redaction());
         assert_eq!(restored[1].id, 102);
         assert_eq!(loaded[0].watermark.as_ref(), Some(&watermark));
+        assert_eq!(loaded[0].order.as_deref(), Some(&[1, 0][..]));
 
         // Saving the same original again updates the entry instead of adding one.
-        let entries = record(loaded, &original, &output, 2, &restored, None, None).unwrap();
+        let entries = record(loaded, &original, &output, 2, &restored, None, None, None).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

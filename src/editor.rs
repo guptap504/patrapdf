@@ -134,6 +134,7 @@ const DEFAULT_REDACTION: (f32, f32) = (140., 18.);
 struct Snapshot {
     items: Vec<Item>,
     watermark: Option<Watermark>,
+    order: Vec<usize>,
 }
 
 /// The rendered watermark preview, one transparent image per page size.
@@ -176,17 +177,61 @@ struct PageView {
     image: Option<Arc<RenderImage>>,
     /// Small render for the page thumbnail rail.
     thumb: Option<Arc<RenderImage>>,
+    /// Where the thumbnail was last painted (for drag-to-reorder).
+    thumb_bounds: Rc<Cell<Bounds<Pixels>>>,
     rendered_scale: f32,
-    /// Screen bounds of the page, captured during the last paint.
-    bounds: Rc<Cell<Bounds<Pixels>>>,
 }
 
 struct OpenDoc {
     path: PathBuf,
     loaded: LoadedPdf,
+    /// One per page of the original file (rendered images etc.), by original index.
     pages: Vec<PageView>,
+    /// The document's pages as shown and saved: `order[i]` is the original index of
+    /// page `i`. Deleting or moving pages only changes this list. Item page numbers
+    /// and everything else in the UI use positions in this list.
+    order: Vec<usize>,
     /// Where this document was last saved to (suggested on the next save).
     last_output: Option<PathBuf>,
+}
+
+impl OpenDoc {
+    fn page_count(&self) -> usize {
+        self.order.len()
+    }
+
+    fn geom(&self, page: usize) -> Option<&PageGeom> {
+        self.loaded.pages.get(*self.order.get(page)?)
+    }
+
+    fn view(&self, page: usize) -> Option<&PageView> {
+        self.pages.get(*self.order.get(page)?)
+    }
+
+    /// The displayed pages, in order.
+    fn geoms(&self) -> impl Iterator<Item = &PageGeom> + '_ {
+        self.order.iter().map(|&i| &self.loaded.pages[i])
+    }
+}
+
+/// Payload when dragging a page thumbnail to reorder pages.
+#[derive(Clone)]
+struct PageDrag {
+    from: usize,
+    image: Option<Arc<RenderImage>>,
+    size: (f32, f32),
+}
+
+impl Render for PageDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(self.size.0))
+            .h(px(self.size.1))
+            .bg(gpui::white())
+            .opacity(0.85)
+            .shadow(ui::lifted_shadow())
+            .when_some(self.image.clone(), |d, image| d.child(img(image).size_full().object_fit(ObjectFit::Fill)))
+    }
 }
 
 /// Payload when dragging a signature from the sidebar.
@@ -234,6 +279,9 @@ pub struct Editor {
     saved_items: Vec<Item>,
     watermark: Option<Watermark>,
     saved_watermark: Option<Watermark>,
+    saved_order: Vec<usize>,
+    /// While dragging a page thumbnail: the gap it would be dropped into (0 = before page 1).
+    page_drop_target: Option<usize>,
     watermark_menu_open: bool,
     /// Typing into the watermark text box.
     watermark_editing: bool,
@@ -263,6 +311,10 @@ pub struct Editor {
     settings: Settings,
     /// Scroll state of the page list (children are the pages, in order).
     pages_scroll: ScrollHandle,
+    /// Where each page *position* was last painted (window coordinates). Kept per
+    /// position rather than per page, so the layout measurements stay valid when
+    /// pages are reordered: position 1 is always where the first page goes.
+    page_slots: Vec<Rc<Cell<Bounds<Pixels>>>>,
     /// The page list's scroll offset when page bounds were last captured. Lets us
     /// correct those (stale) bounds when the list has scrolled since the last paint.
     painted_scroll: Rc<Cell<Point<Pixels>>>,
@@ -316,6 +368,8 @@ impl Editor {
             saved_items: Vec::new(),
             watermark: None,
             saved_watermark: None,
+            saved_order: Vec::new(),
+            page_drop_target: None,
             watermark_menu_open: false,
             watermark_editing: false,
             watermark_replace: false,
@@ -338,6 +392,7 @@ impl Editor {
             menu_dismissed: false,
             settings: Settings::load(),
             pages_scroll: ScrollHandle::new(),
+            page_slots: Vec::new(),
             painted_scroll: Rc::new(Cell::new(Point::default())),
             painted_zoom: Rc::new(Cell::new(0.)),
             pan: None,
@@ -435,16 +490,19 @@ impl Editor {
             .map(|_| PageView {
                 image: None,
                 thumb: None,
+                thumb_bounds: Rc::new(Cell::new(Bounds::default())),
                 rendered_scale: 0.0,
-                bounds: Rc::new(Cell::new(Bounds::default())),
             })
             .collect();
         self.status = format!("Opened {} ({} pages)", file_name(&path), loaded.pages.len()).into();
         window.set_window_title(&format!("PDF Signer — {}", file_name(&path)));
+        let order = (0..loaded.pages.len()).collect::<Vec<_>>();
+        self.saved_order = order.clone();
         self.doc = Some(OpenDoc {
             path,
             loaded,
             pages,
+            order,
             last_output: None,
         });
         self.items.clear();
@@ -539,6 +597,9 @@ impl Editor {
         self.checkpoint();
         self.items = self.saved_items.clone();
         self.watermark = self.saved_watermark.clone();
+        if let Some(doc) = self.doc.as_mut().filter(|_| !self.saved_order.is_empty()) {
+            doc.order = self.saved_order.clone();
+        }
         self.close_menus();
         self.selected = None;
         self.editing = None;
@@ -555,7 +616,16 @@ impl Editor {
             if !self.open_path(entry.original.clone(), window, cx) {
                 return;
             }
-            let page_count = self.doc.as_ref().map_or(0, |d| d.pages.len());
+            if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
+                let n = doc.pages.len();
+                let mut seen = vec![false; n];
+                let valid = !order.is_empty() && order.iter().all(|&i| i < n && !std::mem::replace(&mut seen[i], true));
+                if valid {
+                    doc.order = order.clone();
+                    self.saved_order = order.clone();
+                }
+            }
+            let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
             let mut next_id = self.next_id;
             self.items = recents::restore_items(&entry, page_count, || {
                 next_id += 1;
@@ -637,19 +707,20 @@ impl Editor {
     fn ensure_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
         let wanted = (self.zoom * window.scale_factor()).clamp(1.0, MAX_RENDER_SCALE);
+        // Original page indices, for the displayed pages only.
         let mut stale: Vec<usize> = doc
-            .pages
+            .order
             .iter()
-            .enumerate()
-            .filter(|(_, p)| p.rendered_scale < wanted * 0.95)
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| doc.pages[i].rendered_scale < wanted * 0.95)
             .collect();
         if stale.is_empty() {
             return;
         }
         // The page in view first, then outwards.
         let current = self.current_page().unwrap_or(0);
-        stale.sort_by_key(|&i| i.abs_diff(current));
+        let position = |source: usize| doc.order.iter().position(|&i| i == source).unwrap_or(0);
+        stale.sort_by_key(|&i| position(i).abs_diff(current));
         // While zooming continuously (pinch, wheel), the stretched bitmaps are fine
         // for a moment; wait for the zoom to settle rather than re-render every step.
         // (Each call replaces `render_task`, cancelling the previous wait.) A
@@ -710,7 +781,8 @@ impl Editor {
         let original = doc.path.clone();
         let bytes = doc.loaded.bytes.clone();
         let pages: Vec<PageGeom> = doc.loaded.pages.clone();
-        let page_count = pages.len();
+        let order = doc.order.clone();
+        let page_count = order.len();
         let items = self.items.clone();
         let watermark = self.watermark.clone().filter(|w| !w.text.trim().is_empty());
         let redacted_pages = items
@@ -727,10 +799,11 @@ impl Editor {
             let target = path.clone();
             let saved_items = items.clone();
             let saved_watermark = watermark.clone();
+            let saved_order = order.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let out = pdf::write(&bytes, &pages, &items, watermark.as_ref(), metrics)?;
+                    let out = pdf::write(&bytes, &pages, &order, &items, watermark.as_ref(), metrics)?;
                     std::fs::write(&target, &out)?;
                     anyhow::Ok(recents::make_thumbnail(out))
                 })
@@ -743,6 +816,7 @@ impl Editor {
                     }
                     this.saved_items = saved_items.clone();
                     this.saved_watermark = saved_watermark.clone();
+                    this.saved_order = saved_order.clone();
                     if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
                         doc.last_output = Some(path.clone());
                     }
@@ -753,6 +827,7 @@ impl Editor {
                         page_count,
                         &saved_items,
                         saved_watermark.as_ref(),
+                        Some(saved_order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p)),
                         thumbnail,
                     );
                     match recorded {
@@ -855,8 +930,8 @@ impl Editor {
     /// Which page (and where on it, in points) is under the given window position.
     fn page_at(&self, position: Point<Pixels>) -> Option<(usize, f32, f32)> {
         let doc = self.doc.as_ref()?;
-        doc.pages.iter().enumerate().find_map(|(i, p)| {
-            let b = p.bounds.get();
+        (0..doc.page_count()).find_map(|i| {
+            let b = self.slot_bounds(i)?;
             b.contains(&position).then(|| {
                 let local = position - b.origin;
                 (i, local.x / px(self.zoom), local.y / px(self.zoom))
@@ -898,6 +973,7 @@ impl Editor {
         Snapshot {
             items: self.items.clone(),
             watermark: self.watermark.clone(),
+            order: self.doc.as_ref().map(|d| d.order.clone()).unwrap_or_default(),
         }
     }
 
@@ -906,6 +982,9 @@ impl Editor {
         let current = self.snapshot();
         self.items = snapshot.items;
         self.watermark = snapshot.watermark;
+        if let Some(doc) = self.doc.as_mut().filter(|_| !snapshot.order.is_empty()) {
+            doc.order = snapshot.order;
+        }
         current
     }
 
@@ -1038,7 +1117,7 @@ impl Editor {
     fn copy_to_all_pages(&mut self, cx: &mut Context<Self>) {
         self.finish_editing(cx);
         let Some(source) = self.selected_item().cloned() else { return };
-        let page_count = self.doc.as_ref().map_or(0, |d| d.pages.len());
+        let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
         if page_count < 2 {
             return;
         }
@@ -1056,6 +1135,74 @@ impl Editor {
     }
 
     // -----------------------------------------------------------------------
+    // Deleting & reordering pages
+    // -----------------------------------------------------------------------
+
+    /// Delete page `page` (and the fields on it). Undoable.
+    fn delete_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let Some(count) = self.doc.as_ref().map(|d| d.page_count()) else { return };
+        if page >= count {
+            return;
+        }
+        if count == 1 {
+            self.status = "A PDF needs at least one page.".into();
+            cx.notify();
+            return;
+        }
+        self.finish_editing(cx);
+        self.checkpoint();
+        self.items.retain(|i| i.page != page);
+        for item in &mut self.items {
+            if item.page > page {
+                item.page -= 1;
+            }
+        }
+        if let Some(doc) = &mut self.doc {
+            doc.order.remove(page);
+        }
+        self.selected = None;
+        self.status = format!("Deleted page {}. Press ⌘Z to bring it back.", page + 1).into();
+        cx.notify();
+    }
+
+    /// Move page `from` into gap `gap` (0 = before the first page, n = after the
+    /// last). Fields move with their page. Undoable.
+    fn move_page(&mut self, from: usize, gap: usize, cx: &mut Context<Self>) {
+        let Some(count) = self.doc.as_ref().map(|d| d.page_count()) else { return };
+        if from >= count || gap > count || gap == from || gap == from + 1 {
+            return;
+        }
+        let to = if gap > from { gap - 1 } else { gap };
+        self.finish_editing(cx);
+        self.checkpoint();
+        // `positions[new] = old`.
+        let mut positions: Vec<usize> = (0..count).collect();
+        let moved = positions.remove(from);
+        positions.insert(to, moved);
+        let mut new_of_old = vec![0; count];
+        for (new, &old) in positions.iter().enumerate() {
+            new_of_old[old] = new;
+        }
+        for item in &mut self.items {
+            item.page = new_of_old[item.page];
+        }
+        if let Some(doc) = &mut self.doc {
+            let old = doc.order.clone();
+            doc.order = positions.iter().map(|&p| old[p]).collect();
+        }
+        self.status = format!("Moved page {} to position {}", from + 1, to + 1).into();
+        cx.notify();
+    }
+
+    /// The gap between thumbnails closest to window y (0 = above the first).
+    fn page_gap_at(&self, y: Pixels) -> usize {
+        let Some(doc) = &self.doc else { return 0 };
+        (0..doc.page_count())
+            .filter(|&i| doc.view(i).is_some_and(|v| v.thumb_bounds.get().center().y < y))
+            .count()
+    }
+
+    // -----------------------------------------------------------------------
     // Pages & zoom
     // -----------------------------------------------------------------------
 
@@ -1065,13 +1212,16 @@ impl Editor {
     fn layout_metrics(&self) -> (Pixels, Pixels) {
         let fallback = (px(PAGES_PAD), px(48.));
         let Some(doc) = &self.doc else { return fallback };
-        let first = doc.pages[0].bounds.get();
+        if doc.page_count() == 0 {
+            return fallback;
+        }
+        let Some(first) = self.slot_bounds(0) else { return fallback };
         if self.painted_zoom.get() <= 0. || first.size.width <= px(0.) {
             return fallback;
         }
         let lead = first.top() - self.pages_scroll.bounds().top() - self.painted_scroll.get().y;
-        let gap = match doc.pages.get(1) {
-            Some(second) => second.bounds.get().top() - first.bottom(),
+        let gap = match self.slot_bounds(1) {
+            Some(second) => second.top() - first.bottom(),
             None => fallback.1,
         };
         (lead, gap)
@@ -1081,8 +1231,8 @@ impl Editor {
     /// from the layout rules rather than the last paint, so it is right even
     /// before the pages have been painted at a new zoom or scroll position.
     fn page_content_bounds(&self, index: usize, z: f32) -> Option<Bounds<Pixels>> {
-        let pages = &self.doc.as_ref()?.loaded.pages;
-        let geom = pages.get(index)?;
+        let pages: Vec<&PageGeom> = self.doc.as_ref()?.geoms().collect();
+        let geom = *pages.get(index)?;
         let (lead, gap) = self.layout_metrics();
         let widest = pages.iter().map(|p| p.width).fold(0., f32::max);
         // The page column is at least as wide as the viewport, and pages are centred in it.
@@ -1090,6 +1240,11 @@ impl Editor {
         let top = pages[..index].iter().fold(lead, |top, p| top + px(p.height * z) + gap);
         let w = px(geom.width * z);
         Some(Bounds::new(point((content_w - w) / 2., top), size(w, px(geom.height * z))))
+    }
+
+    /// Where position `index` was last painted.
+    fn slot_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        self.page_slots.get(index).map(|b| b.get()).filter(|b| b.size.width > px(0.))
     }
 
     /// Where page `index` is on screen right now (window coordinates).
@@ -1106,7 +1261,7 @@ impl Editor {
         if viewport.size.height <= px(0.) {
             return Some(0);
         }
-        (0..doc.pages.len())
+        (0..doc.page_count())
             .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
             .map(|(i, b)| {
                 let visible = (b.bottom().min(viewport.bottom()) - b.top().max(viewport.top())).max(px(0.));
@@ -1136,12 +1291,12 @@ impl Editor {
         // Matches the page list's padding (px_8 / py_8) and the page label below each page.
         let avail_w = viewport.size.width / px(1.) - 2. * 32. - 8.;
         let avail_h = viewport.size.height / px(1.) - 2. * 32. - 26.;
-        let widest = doc.loaded.pages.iter().map(|p| p.width).fold(1., f32::max);
+        let widest = doc.geoms().map(|p| p.width).fold(1., f32::max);
         let zoom = match mode {
             ZoomMode::Fixed => return None,
             ZoomMode::FitWidth => avail_w / widest,
             ZoomMode::FitPage => {
-                let page = &doc.loaded.pages[self.current_page().unwrap_or(0)];
+                let page = doc.geom(self.current_page().unwrap_or(0))?;
                 (avail_w / page.width).min(avail_h / page.height)
             }
         };
@@ -1197,7 +1352,7 @@ impl Editor {
         // The page nearest the anchor, and the anchor's position on it in page points
         // (it may lie a little outside the page, e.g. in the gap between pages).
         let distance = |b: &Bounds<Pixels>| (b.top() - anchor.y).max(anchor.y - b.bottom()).max(px(0.));
-        let (index, bounds) = (0..doc.pages.len())
+        let (index, bounds) = (0..doc.page_count())
             .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
             .min_by(|a, b| distance(&a.1).partial_cmp(&distance(&b.1)).unwrap_or(std::cmp::Ordering::Equal))?;
         let on_page = (anchor - bounds.origin).map(|v| v / px(self.zoom));
@@ -1239,7 +1394,7 @@ impl Editor {
     }
 
     fn page_geom(&self, page: usize) -> Option<&PageGeom> {
-        self.doc.as_ref()?.loaded.pages.get(page)
+        self.doc.as_ref()?.geom(page)
     }
 
     fn clamp_item(&self, item: &mut Item) {
@@ -1522,6 +1677,9 @@ impl Editor {
 
     fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.menu_dismissed = false;
+        if self.page_drop_target.take().is_some() {
+            cx.notify();
+        }
         if self.pan.take().is_some() {
             cx.notify();
         }
@@ -1640,7 +1798,7 @@ impl Editor {
         let has_doc = self.doc.is_some();
         let (title, subtitle) = match &self.doc {
             Some(doc) => {
-                let n = doc.pages.len();
+                let n = doc.page_count();
                 let pages = format!("{n} page{}", if n == 1 { "" } else { "s" });
                 (file_name(&doc.path), if self.dirty { format!("{pages} · Edited") } else { pages })
             }
@@ -2568,7 +2726,7 @@ impl Editor {
         };
 
         let is_text = item.is_text();
-        let multi_page = self.doc.as_ref().is_some_and(|d| d.pages.len() > 1);
+        let multi_page = self.doc.as_ref().is_some_and(|d| d.page_count() > 1);
         // Show the HUD above the field, or below it when there's no room on the page.
         let hud_above = item.y * z > 44.;
         let hud = div()
@@ -2956,13 +3114,27 @@ impl Editor {
     fn render_thumbnail_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(doc) = &self.doc else { return div().into_any_element() };
         let current = self.current_page();
+        let page_count = doc.page_count();
+        let can_delete = page_count > 1;
+        let drop_target = self.page_drop_target;
+        // The line showing where a dragged page would land.
+        let drop_line = |top: bool| {
+            div()
+                .absolute()
+                .left(px(-8.))
+                .right(px(-8.))
+                .h(px(3.))
+                .rounded_full()
+                .bg(ui::accent())
+                .when(top, |d| d.top(px(-12.)))
+                .when(!top, |d| d.bottom(px(-12.)))
+        };
         let thumbs: Vec<_> = doc
-            .loaded
-            .pages
+            .order
             .iter()
-            .zip(&doc.pages)
             .enumerate()
-            .map(|(index, (geom, view))| {
+            .map(|(index, &source)| {
+                let (geom, view) = (&doc.loaded.pages[source], &doc.pages[source]);
                 let is_current = current == Some(index);
                 let fields = self.items.iter().filter(|i| i.page == index).count();
                 let aspect = geom.width / geom.height.max(1.);
@@ -2971,9 +3143,12 @@ impl Editor {
                 } else {
                     (1.5 * THUMB_W * aspect, 1.5 * THUMB_W)
                 };
+                let bounds = view.thumb_bounds.clone();
+                let drag = PageDrag { from: index, image: view.thumb.clone(), size: (w, h) };
                 div()
                     .id(("thumb", index))
                     .group("thumb")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_none()
@@ -2981,6 +3156,10 @@ impl Editor {
                     .gap_1p5()
                     .cursor(CursorStyle::PointingHand)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.scroll_to_page(index, cx)))
+                    .on_drag(drag, |drag: &PageDrag, _, _, cx| cx.new(|_| drag.clone()))
+                    .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+                    .when(drop_target == Some(index), |d| d.child(drop_line(true)))
+                    .when(index + 1 == page_count && drop_target == Some(page_count), |d| d.child(drop_line(false)))
                     .child(
                         div()
                             .relative()
@@ -3010,6 +3189,34 @@ impl Editor {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(fields.to_string()),
                                 )
+                            })
+                            // Delete, shown on hover (top-left; the field count sits top-right).
+                            .when(can_delete, |d| {
+                                d.child(
+                                    ui::button_base(("delete-page", index))
+                                        .absolute()
+                                        .top(px(-8.))
+                                        .left(px(-8.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(22.))
+                                        .rounded_full()
+                                        .bg(ui::hud_bg())
+                                        .border_1()
+                                        .border_color(rgba(0xffffff33))
+                                        .shadow(ui::card_shadow())
+                                        .cursor(CursorStyle::PointingHand)
+                                        .opacity(0.)
+                                        .group_hover("thumb", |s| s.opacity(1.))
+                                        .hover(|s| s.bg(ui::danger()))
+                                        .tooltip(ui::tooltip(format!("Delete page {}", index + 1), None))
+                                        .child(ui::icon("close", gpui::white()).size(px(12.)))
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_page(index, cx);
+                                        })),
+                                )
                             }),
                     )
                     .child(
@@ -3038,6 +3245,19 @@ impl Editor {
             .bg(ui::sidebar_bg())
             .border_l_1()
             .border_color(ui::border())
+            .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<PageDrag>, _, cx| {
+                let target = e.bounds.contains(&e.event.position).then(|| this.page_gap_at(e.event.position.y));
+                if target != this.page_drop_target {
+                    this.page_drop_target = target;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, drag: &PageDrag, _, cx| {
+                if let Some(gap) = this.page_drop_target.take() {
+                    this.move_page(drag.from, gap, cx);
+                }
+                cx.notify();
+            }))
             .child(
                 div()
                     .w_full()
@@ -3060,7 +3280,7 @@ impl Editor {
         };
 
         let z = self.zoom;
-        let page_count = doc.pages.len();
+        let page_count = doc.page_count();
         let hand = if self.pan.is_some() {
             CursorStyle::ClosedHand
         } else if self.can_pan() {
@@ -3070,7 +3290,8 @@ impl Editor {
         };
         let cursor = if self.tool == Tool::Select { hand } else { CursorStyle::Crosshair };
         let mut page_elements = Vec::with_capacity(page_count);
-        for (index, (geom, view)) in doc.loaded.pages.iter().zip(&doc.pages).enumerate() {
+        for (index, &source) in doc.order.iter().enumerate() {
+            let (geom, view) = (&doc.loaded.pages[source], &doc.pages[source]);
             // Redactions always cover the other fields (they do in the saved file, too).
             let mut on_page: Vec<&Item> = self.items.iter().filter(|i| i.page == index).collect();
             on_page.sort_by_key(|i| i.is_redaction());
@@ -3080,7 +3301,7 @@ impl Editor {
                 .as_ref()
                 .and_then(|_| self.watermark_preview.images.get(&page_size_key(geom)).cloned());
 
-            let bounds = view.bounds.clone();
+            let bounds = self.page_slots.get(index).cloned().unwrap_or_default();
             let (scroll, painted_scroll, painted_zoom) =
                 (self.pages_scroll.clone(), self.painted_scroll.clone(), self.painted_zoom.clone());
             let page = div()
@@ -3262,6 +3483,8 @@ impl Render for Editor {
             }
         }
         self.sync_watermark_preview(window, cx);
+        let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
+        self.page_slots.resize_with(page_count, Default::default);
         let field_count = self.items.len();
 
         div()
@@ -3434,7 +3657,7 @@ mod tests {
     }
 
     fn page_origin(editor: &Entity<Editor>, cx: &mut VisualTestContext, page: usize) -> Point<Pixels> {
-        editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().pages[page].bounds.get().origin)
+        editor.read_with(cx, |e, _| e.slot_bounds(page).expect("page was painted").origin)
     }
 
     #[gpui::test]
@@ -3510,7 +3733,7 @@ mod tests {
             (d.loaded.bytes.clone(), d.loaded.pages.clone(), e.items.clone(), e.metrics)
         });
         assert_eq!(items.len(), 2);
-        let out = crate::pdf::write(&bytes, &pages, &items, None, metrics).unwrap();
+        let out = crate::pdf::write(&bytes, &pages, &[0, 1], &items, None, metrics).unwrap();
         assert_eq!(crate::pdf::load(out).unwrap().pages.len(), 2);
     }
 
@@ -3617,7 +3840,7 @@ mod tests {
         cx.run_until_parked();
         editor.read_with(cx, |e, _| {
             assert_eq!(e.zoom_mode, ZoomMode::FitPage);
-            let page = e.doc.as_ref().unwrap().pages[0].bounds.get();
+            let page = e.slot_bounds(0).unwrap();
             assert!(page.size.height <= viewport.size.height, "page should fit: {page:?} in {viewport:?}");
         });
 
@@ -3750,7 +3973,7 @@ mod tests {
             let d = e.doc.as_ref().unwrap();
             (d.loaded.bytes.clone(), d.loaded.pages.clone(), e.items.clone(), e.metrics)
         });
-        let out = crate::pdf::write(&bytes, &pages, &items, None, metrics).unwrap();
+        let out = crate::pdf::write(&bytes, &pages, &[0, 1], &items, None, metrics).unwrap();
         let mut doc = lopdf::Document::load_mem(&out).unwrap();
         doc.decompress();
         let mut raw = Vec::new();
@@ -3799,6 +4022,77 @@ mod tests {
         assert!(watermark_text(&editor, cx).is_some());
         editor.update(cx, |e, cx| e.remove_watermark(cx));
         assert_eq!(watermark_text(&editor, cx), None);
+    }
+
+    #[gpui::test]
+    fn pages_can_be_deleted_and_reordered(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let order = |editor: &Entity<Editor>, cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().order.clone());
+        let pages_of = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.items.iter().map(|i| (i.page, i.x)).collect::<Vec<_>>())
+        };
+        // A checkmark on each page, told apart by x.
+        editor.update(cx, |e, cx| {
+            e.add_item(0, 10., 10., 16., 16., ItemKind::Check, cx);
+            e.add_item(1, 20., 20., 16., 16., ItemKind::Check, cx);
+            e.history.clear();
+        });
+
+        // Drag page 2 above page 1: its field moves with it. The view stays at the top,
+        // so the first position is still the current page — straight away, before
+        // the pages are painted in their new order.
+        editor.update(cx, |e, cx| {
+            e.move_page(1, 0, cx);
+            assert_eq!(e.current_page(), Some(0));
+        });
+        assert_eq!(order(&editor, cx), vec![1, 0]);
+        assert_eq!(pages_of(&editor, cx), vec![(1, 10.), (0, 20.)]);
+        // Dropping a page next to itself does nothing (and adds no undo step).
+        editor.update(cx, |e, cx| {
+            e.move_page(0, 0, cx);
+            e.move_page(0, 1, cx);
+            assert_eq!(e.history.len(), 1);
+        });
+
+        // The page shown first is now the rotated one, everywhere in the UI.
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let geom = e.page_geom(0).unwrap();
+            assert_eq!((geom.width, geom.height), (750., 580.));
+            let first = e.slot_bounds(0).unwrap();
+            assert_eq!(first.size.width / first.size.height, 750. / 580.);
+        });
+
+        // Save: the output has the new order, with each field on its page.
+        let save = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            let (bytes, pages, order, items, metrics) = editor.read_with(cx, |e, _| {
+                let d = e.doc.as_ref().unwrap();
+                (d.loaded.bytes.clone(), d.loaded.pages.clone(), d.order.clone(), e.items.clone(), e.metrics)
+            });
+            crate::pdf::load(crate::pdf::write(&bytes, &pages, &order, &items, None, metrics).unwrap()).unwrap()
+        };
+        let out = save(&editor, cx);
+        assert_eq!((out.pages[0].width, out.pages[1].width), (750., 612.));
+
+        // Delete the (new) first page: its field goes too; the rest renumber.
+        editor.update(cx, |e, cx| e.delete_page(0, cx));
+        assert_eq!(order(&editor, cx), vec![0]);
+        assert_eq!(pages_of(&editor, cx), vec![(0, 10.)]);
+        assert_eq!(save(&editor, cx).pages.len(), 1);
+        // The last page can't be deleted.
+        editor.update(cx, |e, cx| e.delete_page(0, cx));
+        assert_eq!(order(&editor, cx), vec![0]);
+
+        // Undo brings the page back with its field; redo deletes it again.
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(order(&editor, cx), vec![1, 0]);
+        assert_eq!(pages_of(&editor, cx), vec![(1, 10.), (0, 20.)]);
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(order(&editor, cx), vec![0]);
+
+        // Discard returns to the saved (original) order.
+        editor.update(cx, |e, cx| e.discard_changes(cx));
+        assert_eq!(order(&editor, cx), vec![0, 1]);
     }
 
     #[gpui::test]
@@ -3853,6 +4147,7 @@ mod tests {
                 SavedItem { page: 0, x: 20., y: 20., w: 90., h: 14., kind: SavedKind::Redact },
             ],
             watermark: Some(Watermark { text: "COPY".into(), ..Watermark::default() }),
+            order: Some(vec![1, 0]),
         }];
 
         editor.update_in(cx, |e, window, cx| {
@@ -3868,6 +4163,7 @@ mod tests {
             assert_eq!(e.items.len(), 3);
             assert!(e.items[2].is_redaction());
             assert_eq!(e.watermark.as_ref().map(|w| w.text.as_str()), Some("COPY"));
+            assert_eq!(e.doc.as_ref().unwrap().order, vec![1, 0]);
             assert!(!e.dirty, "a freshly reopened document has no unsaved changes");
             assert!(matches!(&e.items[0].kind, ItemKind::Text { text, .. } if text == "Restored"));
             assert_eq!(e.doc.as_ref().unwrap().last_output.as_deref(), Some(original.with_file_name("out.pdf").as_path()));
