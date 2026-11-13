@@ -134,7 +134,8 @@ fn detect_from(os: &str, exe: &Path, appimage: Option<PathBuf>, program_files: &
             }
         }
         "linux" => match appimage {
-            Some(path) if path.is_absolute() => Ok(Install::AppImage { path }),
+            // `has_root`, not `is_absolute`: the tests run this branch on Windows too.
+            Some(path) if path.has_root() => Ok(Install::AppImage { path }),
             _ if exe.starts_with("/usr") || exe.starts_with("/opt") => Err(NoUpdates::PackageManager),
             _ => Err(NoUpdates::Unknown),
         },
