@@ -3777,9 +3777,13 @@ mod tests {
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Editor>, &mut VisualTestContext) {
-        let dir = std::env::temp_dir().join("pdf_signer_ui_test");
+        // A file per test: tests run in parallel, and rewriting a shared file
+        // while another test reads it makes that test's open fail.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sample.pdf");
+        let path = dir.join(format!("sample-{n}.pdf"));
         std::fs::write(&path, crate::pdf::tests::sample_pdf()).unwrap();
 
         cx.update(bind_keys);
@@ -3846,7 +3850,9 @@ mod tests {
         editor.update(cx, |e, _| e.tool = Tool::Check);
         cx.simulate_click(origin + point(px(60.), px(60.)), Modifiers::none());
 
-        let sig_path = std::env::temp_dir().join("pdf_signer_ui_test/sig.png");
+        let sig_dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+        let sig_path = sig_dir.join("sig.png");
         let mut img = image::RgbaImage::from_pixel(300, 100, image::Rgba([255, 255, 255, 255]));
         for x in 20..280 {
             img.put_pixel(x, 50, image::Rgba([0, 0, 80, 255]));
