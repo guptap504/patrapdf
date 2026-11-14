@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build an AppImage from `target/release/pdf-signer` with linuxdeploy.
+# Build an AppImage from `target/release/patrapdf` with linuxdeploy.
 #
 #   cargo build --release && packaging/linux/appimage.sh dist
 set -euo pipefail
 out=${1:-dist}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
-id=io.github.guptap504.PdfSigner
+id=io.github.guptap504.PatraPDF
 tools="$root/target/appimage-tools"
 mkdir -p "$tools" "$out"
 out=$(cd "$out" && pwd)
@@ -34,9 +34,9 @@ cp "$root/packaging/linux/$id.metainfo.xml" "$appdir/usr/share/metainfo/$id.appd
 export APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 LINUXDEPLOY_OUTPUT_VERSION="$version"
 cd "$work"
 "$linuxdeploy" --appdir "$appdir" \
-  --executable "$root/target/release/pdf-signer" \
+  --executable "$root/target/release/patrapdf" \
   --desktop-file "$root/packaging/linux/$id.desktop" \
   "${icon_args[@]}" \
   --output appimage
-mv "$work"/PDF_Signer-*.AppImage "$out/PDF-Signer-$version-linux-x86_64.AppImage"
-echo "$out/PDF-Signer-$version-linux-x86_64.AppImage"
+mv "$work"/PatraPDF-*.AppImage "$out/PatraPDF-$version-linux-x86_64.AppImage"
+echo "$out/PatraPDF-$version-linux-x86_64.AppImage"

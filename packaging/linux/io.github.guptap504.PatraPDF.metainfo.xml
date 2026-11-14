@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.guptap504.PdfSigner</id>
-  <name>PDF Signer</name>
+  <id>io.github.guptap504.PatraPDF</id>
+  <name>PatraPDF</name>
   <summary>Fill in, sign, redact and watermark PDFs</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
@@ -10,25 +10,32 @@
   </developer>
   <description>
     <p>
-      PDF Signer fills in and signs PDF forms entirely on your computer. Nothing is uploaded.
+      PatraPDF fills in and signs PDF forms entirely on your computer. Nothing is uploaded.
     </p>
     <ul>
       <li>Type text, add dates and checkmarks anywhere on a page</li>
       <li>Place your signature from an image; the paper background is removed automatically</li>
       <li>Redact: black out content and remove it from the file for good</li>
       <li>Stamp a watermark across every page</li>
-      <li>Delete and reorder pages</li>
+      <li>Delete and reorder pages, and add pages from other PDFs</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.guptap504.PdfSigner.desktop</launchable>
-  <url type="homepage">https://github.com/guptap504/pdf-signer</url>
-  <url type="bugtracker">https://github.com/guptap504/pdf-signer/issues</url>
+  <launchable type="desktop-id">io.github.guptap504.PatraPDF.desktop</launchable>
+  <url type="homepage">https://github.com/guptap504/patrapdf</url>
+  <url type="bugtracker">https://github.com/guptap504/patrapdf/issues</url>
   <content_rating type="oars-1.1"/>
   <provides>
-    <binary>pdf-signer</binary>
+    <binary>patrapdf</binary>
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.4.0" date="2026-11-14">
+      <description>
+        <p>PDF Signer is now PatraPDF.</p>
+        <p>Add pages from another PDF: choose the file, then which of its pages.</p>
+        <p>A Help menu lists every keyboard shortcut, and both sidebars can be hidden.</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-11-14">
       <description>
         <p>Long documents scroll and zoom smoothly: only the pages on screen are drawn.</p>

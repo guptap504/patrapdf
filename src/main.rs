@@ -21,8 +21,8 @@ use futures::StreamExt;
 use gpui::{Application, Menu, MenuItem};
 
 use editor::{
-    About, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, SaveWithPassword, Undo, ZoomFitPage,
-    ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
+    About, AddPages, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, KeyboardShortcuts, Open, Paste, Quit, Redo, Save,
+    SaveWithPassword, ToggleLeftSidebar, ToggleRightSidebar, Undo, VisitWebsite, ZoomFitPage, ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
 };
 
 fn main() {
@@ -43,11 +43,11 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
             Menu {
-                name: "PDF Signer".into(),
-                items: [MenuItem::action("About PDF Signer", About)]
+                name: "PatraPDF".into(),
+                items: [MenuItem::action("About PatraPDF", About)]
                     .into_iter()
                     .chain(self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates)))
-                    .chain([MenuItem::separator(), MenuItem::action("Quit PDF Signer", Quit)])
+                    .chain([MenuItem::separator(), MenuItem::action("Quit PatraPDF", Quit)])
                     .collect(),
             },
             Menu {
@@ -59,6 +59,7 @@ fn main() {
                     MenuItem::action("Discard Changes…", DiscardChanges),
                     MenuItem::action("Close Document", CloseDocument),
                     MenuItem::separator(),
+                    MenuItem::action("Add Pages from PDF…", AddPages),
                     MenuItem::action("Add Signature Image…", AddSignature),
                 ],
             },
@@ -82,6 +83,17 @@ fn main() {
                     MenuItem::action("Actual Size", ZoomReset),
                     MenuItem::action("Fit Width", ZoomFitWidth),
                     MenuItem::action("Fit Page", ZoomFitPage),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
+                    MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+                ],
+            },
+            Menu {
+                name: "Help".into(),
+                items: vec![
+                    MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
+                    MenuItem::separator(),
+                    MenuItem::action("Visit Website", VisitWebsite),
                 ],
             },
         ]);

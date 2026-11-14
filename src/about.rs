@@ -5,7 +5,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// Reverse-DNS id: the macOS bundle id, the Linux desktop file / Wayland app id.
-pub const APP_ID: &str = "io.github.guptap504.PdfSigner";
+pub const APP_ID: &str = "io.github.guptap504.PatraPDF";
 
 /// The authors' names, without email addresses.
 pub fn author() -> String {

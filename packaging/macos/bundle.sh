@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wrap a release build in "PDF Signer.app" and a drag-to-Applications .dmg.
+# Wrap a release build in "PatraPDF.app" and a drag-to-Applications .dmg.
 #
 #   cargo build --release --target aarch64-apple-darwin
 #   packaging/macos/bundle.sh aarch64-apple-darwin dist
@@ -20,16 +20,16 @@ esac
 mkdir -p "$out"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-app="$stage/PDF Signer.app"
+app="$stage/PatraPDF.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$root/target/$target/release/pdf-signer" "$app/Contents/MacOS/pdf-signer"
+cp "$root/target/$target/release/patrapdf" "$app/Contents/MacOS/patrapdf"
 cp "$root/packaging/macos/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 sed "s/@VERSION@/$version/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 codesign --force --sign - --timestamp=none "$app"
 ln -s /Applications "$stage/Applications"
 
-dmg="$out/PDF-Signer-$version-macos-$arch.dmg"
+dmg="$out/PatraPDF-$version-macos-$arch.dmg"
 rm -f "$dmg"
-hdiutil create -quiet -volname "PDF Signer" -srcfolder "$stage" -fs HFS+ -format UDZO "$dmg"
+hdiutil create -quiet -volname "PatraPDF" -srcfolder "$stage" -fs HFS+ -format UDZO "$dmg"
 echo "$dmg"

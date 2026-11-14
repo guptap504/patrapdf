@@ -21,7 +21,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::forms::FieldValue;
-use crate::model::{Item, ItemKind, RedactFill, Signature, Watermark};
+use crate::model::{Item, ItemKind, PageImport, RedactFill, Signature, Watermark};
 use crate::{pdf, signatures};
 
 /// The oldest entries are dropped beyond this many.
@@ -51,6 +51,10 @@ pub struct RecentEntry {
     /// Values typed into the document's own form fields, by field name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, FieldValue)>,
+    /// Pages added from other PDFs, in the order they were added. They come
+    /// after the original's own pages, and `order` counts them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<PageImport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +170,7 @@ pub fn record(
     output: &Path,
     page_count: usize,
     order: Option<&[usize]>,
+    imports: &[PageImport],
     contents: Option<Contents>,
 ) -> Result<Vec<RecentEntry>> {
     let Contents { items, watermark, fields, thumbnail } = contents.unwrap_or_default();
@@ -232,6 +237,7 @@ pub fn record(
             watermark: watermark.cloned(),
             order: order.map(<[usize]>::to_vec),
             fields,
+            imports: imports.to_vec(),
         },
     );
     for dropped in entries.split_off(entries.len().min(MAX_ENTRIES)) {
@@ -359,7 +365,7 @@ mod tests {
             fields: vec![("name".into(), FieldValue::Text("Jo".into()))],
             thumbnail: Some(thumb),
         };
-        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), Some(contents)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), &[], Some(contents)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -387,7 +393,7 @@ mod tests {
 
         // Saving the same original again updates the entry instead of adding one.
         let contents = Contents { items: &restored, ..Contents::default() };
-        let entries = record(loaded, &original, &output, 2, None, Some(contents)).unwrap();
+        let entries = record(loaded, &original, &output, 2, None, &[], Some(contents)).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

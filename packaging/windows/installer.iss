@@ -9,23 +9,23 @@
 
 [Setup]
 AppId={{3B0499C5-99F9-483F-AA50-3CB6DB89FECD}
-AppName=PDF Signer
+AppName=PatraPDF
 AppVersion={#AppVersion}
-AppVerName=PDF Signer {#AppVersion}
+AppVerName=PatraPDF {#AppVersion}
 AppPublisher=Prashant Gupta
-AppPublisherURL=https://github.com/guptap504/pdf-signer
-AppSupportURL=https://github.com/guptap504/pdf-signer/issues
-AppUpdatesURL=https://github.com/guptap504/pdf-signer/releases
+AppPublisherURL=https://github.com/guptap504/patrapdf
+AppSupportURL=https://github.com/guptap504/patrapdf/issues
+AppUpdatesURL=https://github.com/guptap504/patrapdf/releases
 VersionInfoVersion={#AppVersion}
-DefaultDirName={autopf}\PDF Signer
-DefaultGroupName=PDF Signer
+DefaultDirName={autopf}\PatraPDF
+DefaultGroupName=PatraPDF
 DisableProgramGroupPage=yes
 LicenseFile=..\..\LICENSE
 OutputDir=..\..\dist
-OutputBaseFilename=PDF-Signer-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=PatraPDF-{#AppVersion}-windows-x64-setup
 SetupIconFile=app.ico
-UninstallDisplayIcon={app}\pdf-signer.exe
-UninstallDisplayName=PDF Signer
+UninstallDisplayIcon={app}\patrapdf.exe
+UninstallDisplayName=PatraPDF
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -40,28 +40,28 @@ ChangesAssociations=yes
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\..\target\release\pdf-signer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\target\release\patrapdf.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\PDF Signer"; Filename: "{app}\pdf-signer.exe"
-Name: "{autodesktop}\PDF Signer"; Filename: "{app}\pdf-signer.exe"; Tasks: desktopicon
+Name: "{autoprograms}\PatraPDF"; Filename: "{app}\patrapdf.exe"
+Name: "{autodesktop}\PatraPDF"; Filename: "{app}\patrapdf.exe"; Tasks: desktopicon
 
 [Registry]
-; Offer PDF Signer under "Open with" for PDFs (without taking over the default viewer).
-Root: HKA; Subkey: "Software\Classes\PdfSigner.pdf"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\PdfSigner.pdf\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf-signer.exe,0"
-Root: HKA; Subkey: "Software\Classes\PdfSigner.pdf\shell\open\command"; ValueType: string; ValueData: """{app}\pdf-signer.exe"" ""%1"""
-Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "PdfSigner.pdf"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\Applications\pdf-signer.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "PDF Signer"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Applications\pdf-signer.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""
-Root: HKA; Subkey: "Software\Classes\Applications\pdf-signer.exe\shell\open\command"; ValueType: string; ValueData: """{app}\pdf-signer.exe"" ""%1"""
+; Offer PatraPDF under "Open with" for PDFs (without taking over the default viewer).
+Root: HKA; Subkey: "Software\Classes\PatraPDF.pdf"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\PatraPDF.pdf\DefaultIcon"; ValueType: string; ValueData: "{app}\patrapdf.exe,0"
+Root: HKA; Subkey: "Software\Classes\PatraPDF.pdf\shell\open\command"; ValueType: string; ValueData: """{app}\patrapdf.exe"" ""%1"""
+Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "PatraPDF.pdf"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\Applications\patrapdf.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "PatraPDF"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\patrapdf.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\patrapdf.exe\shell\open\command"; ValueType: string; ValueData: """{app}\patrapdf.exe"" ""%1"""
 
 [Run]
-Filename: "{app}\pdf-signer.exe"; Description: "{cm:LaunchProgram,PDF Signer}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\patrapdf.exe"; Description: "{cm:LaunchProgram,PatraPDF}"; Flags: nowait postinstall skipifsilent
 ; The in-app updater runs this installer silently with /RELAUNCH: start the new version.
-Filename: "{app}\pdf-signer.exe"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
+Filename: "{app}\patrapdf.exe"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
 
 [Code]
 function ShouldRelaunch: Boolean;

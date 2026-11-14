@@ -15,6 +15,9 @@ pub struct Settings {
     pub date_format: String,
     /// Look for new versions about once a day (see `updater.rs`).
     pub check_for_updates: bool,
+    /// Whether the tools and signatures (left) and the page thumbnails (right) are shown.
+    pub show_left_sidebar: bool,
+    pub show_right_sidebar: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +25,8 @@ impl Default for Settings {
         Self {
             date_format: DATE_FORMATS[0].to_string(),
             check_for_updates: true,
+            show_left_sidebar: true,
+            show_right_sidebar: true,
         }
     }
 }

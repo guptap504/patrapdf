@@ -24,13 +24,13 @@ pub fn is_pdf(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
-/// Root of the app's data directory: `~/Library/Application Support/pdf-signer`
-/// on macOS, `%APPDATA%\pdf-signer` on Windows, `$XDG_DATA_HOME/pdf-signer`
-/// (`~/.local/share/pdf-signer`) on Linux.
-/// Set `PDF_SIGNER_DATA_DIR` to use a different directory (handy for development).
+/// Root of the app's data directory: `~/Library/Application Support/patrapdf`
+/// on macOS, `%APPDATA%\patrapdf` on Windows, `$XDG_DATA_HOME/patrapdf`
+/// (`~/.local/share/patrapdf`) on Linux.
+/// Set `PATRAPDF_DATA_DIR` to use a different directory (handy for development).
 #[cfg(not(test))]
 pub fn app_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PDF_SIGNER_DATA_DIR") {
+    if let Some(dir) = std::env::var_os("PATRAPDF_DATA_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME")
@@ -48,7 +48,7 @@ pub fn app_data_dir() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"))
     };
-    base.join("pdf-signer")
+    base.join("patrapdf")
 }
 
 /// Tests must never touch the user's real library or recents. Each test
@@ -57,7 +57,7 @@ pub fn app_data_dir() -> PathBuf {
 #[cfg(test)]
 pub fn app_data_dir() -> PathBuf {
     let thread = format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "");
-    std::env::temp_dir().join(format!("pdf-signer-test-{}-{thread}", std::process::id()))
+    std::env::temp_dir().join(format!("patrapdf-test-{}-{thread}", std::process::id()))
 }
 
 pub fn library_dir() -> PathBuf {

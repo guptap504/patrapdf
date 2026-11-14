@@ -51,6 +51,25 @@ impl LoadedPdf {
     pub fn save(&self, edits: &Edits) -> Result<Written> {
         apply(self.document()?, &self.pages, edits)
     }
+
+    /// This document with pages of others added after its own: for each of
+    /// `additions`, those pages (from 0) of that document, in that order. Its
+    /// own pages, and its form, stay exactly as they were, so what has been
+    /// placed on them or typed into them still applies.
+    pub fn with_pages(&self, additions: &[(&LoadedPdf, &[usize])]) -> Result<LoadedPdf> {
+        let mut doc = self.document()?;
+        let mut added = 0;
+        for (source, pages) in additions {
+            append_pages(&mut doc, &source.document()?, pages)?;
+            added += pages.len();
+        }
+        let mut merged = load_inner(save_document(&mut doc, None)?, None, true)?;
+        if merged.pages.len() != self.pages.len() + added || merged.form.len() != self.form.len() {
+            bail!("the pages could not be added to this PDF");
+        }
+        merged.password = self.password.clone();
+        Ok(merged)
+    }
 }
 
 /// A PDF that can't be opened without (the right) password.
@@ -89,6 +108,12 @@ pub fn load_with_password(bytes: Vec<u8>, password: Option<&str>) -> Result<Load
 /// the editor draws those itself (with the values being typed).
 pub fn open_for_editing(bytes: Vec<u8>, password: Option<&str>) -> Result<LoadedPdf> {
     load_inner(bytes, password, true)
+}
+
+/// Open a PDF to take pages from (see [`LoadedPdf::with_pages`]), decrypting
+/// it with `password` if it needs one.
+pub fn open_as_source(bytes: Vec<u8>, password: Option<&str>) -> Result<LoadedPdf> {
+    load_inner(bytes, password, false)
 }
 
 fn load_inner(bytes: Vec<u8>, password: Option<&str>, hide_fields: bool) -> Result<LoadedPdf> {
@@ -319,10 +344,10 @@ pub fn render_watermark(width: f32, height: f32, watermark: &Watermark, scale: f
 // Writing
 // ---------------------------------------------------------------------------
 
-const HELV: &str = "PdfSignerHelv";
-const HELV_BOLD: &str = "PdfSignerHelvBold";
-const WM_GS: &str = "PdfSignerWmGS";
-const PAGE_IMAGE: &str = "PdfSignerPage";
+const HELV: &str = "PatraPDFHelv";
+const HELV_BOLD: &str = "PatraPDFHelvBold";
+const WM_GS: &str = "PatraPDFWmGS";
+const PAGE_IMAGE: &str = "PatraPDFPage";
 /// Resolution of redacted pages, which are rebuilt as images: 3 × 72 = 216 dpi.
 const REDACT_SCALE: f32 = 3.0;
 
@@ -460,7 +485,7 @@ fn write_overlays(
                         Some(entry) => entry.clone(),
                         None => {
                             let id = add_image(doc, &sig.path)?;
-                            let entry = (id, format!("PdfSignerIm{}", images.len()));
+                            let entry = (id, format!("PatraPDFIm{}", images.len()));
                             images.insert(sig.path.clone(), entry.clone());
                             entry
                         }
@@ -714,6 +739,113 @@ fn arrange_pages(doc: &mut Document, order: &[usize]) -> Result<()> {
         doc.prune_objects();
     }
     Ok(())
+}
+
+/// Copy `pages` (from 0) of `source` to the end of `doc`, with everything
+/// they're drawn with: fonts, images, annotations.
+///
+/// What belongs to the source as a whole stays behind: its bookmarks, its
+/// tags, and its form. Form fields on the pages come along as they look, but
+/// aren't part of `doc`'s form, so they can't be filled in. Links to pages
+/// that weren't copied go nowhere.
+fn append_pages(doc: &mut Document, source: &Document, pages: &[usize]) -> Result<()> {
+    let source_pages: Vec<ObjectId> = source.get_pages().into_values().collect();
+    let mut selected = Vec::with_capacity(pages.len());
+    for &i in pages {
+        let id = *source_pages.get(i).ok_or_else(|| anyhow!("page {} does not exist", i + 1))?;
+        if selected.contains(&id) {
+            bail!("page {} appears twice", i + 1);
+        }
+        selected.push(id);
+    }
+    if selected.is_empty() {
+        bail!("no pages to add");
+    }
+    let catalog_id = doc.trailer.get(b"Root").and_then(Object::as_reference)?;
+    let root_id = doc.get_dictionary(catalog_id)?.get(b"Pages").and_then(Object::as_reference)?;
+    let page_count = doc.get_pages().len();
+
+    let mut copier = Copier { source, left_behind: source_pages.iter().copied().collect(), ids: HashMap::new(), queue: Vec::new() };
+    for &id in &selected {
+        copier.ids.insert(id, doc.new_object_id());
+        copier.queue.push(id);
+    }
+    while let Some(id) = copier.queue.pop() {
+        let Ok(object) = source.get_object(id) else { continue };
+        let mut object = object.clone();
+        let is_page = selected.contains(&id);
+        if let (true, Object::Dictionary(page)) = (is_page, &mut object) {
+            // The new page stands on its own under `doc`'s page tree.
+            for key in INHERITABLE {
+                if !page.has(key.as_bytes()) {
+                    if let Some(value) = inherited(source, id, key) {
+                        page.set(key, value);
+                    }
+                }
+            }
+            page.remove(b"StructParents");
+        }
+        copier.rewrite(&mut object, doc);
+        if let (true, Object::Dictionary(page)) = (is_page, &mut object) {
+            page.set("Parent", root_id);
+        }
+        doc.objects.insert(copier.ids[&id], object);
+    }
+
+    let new_kids = selected.iter().map(|id| Object::Reference(copier.ids[id]));
+    let kids = match doc.get_dictionary(root_id)?.get(b"Kids")? {
+        Object::Reference(id) => doc.get_object_mut(*id)?,
+        _ => doc.get_dictionary_mut(root_id)?.get_mut(b"Kids")?,
+    };
+    kids.as_array_mut()?.extend(new_kids);
+    doc.get_dictionary_mut(root_id)?.set("Count", (page_count + selected.len()) as i64);
+    if source.version > doc.version {
+        doc.version = source.version.clone();
+    }
+    Ok(())
+}
+
+/// Copies objects of one document into another (see [`append_pages`]).
+struct Copier<'a> {
+    source: &'a Document,
+    /// The source's pages: only those already in `ids` are copied.
+    left_behind: HashSet<ObjectId>,
+    /// The copy's id for each object copied, or about to be.
+    ids: HashMap<ObjectId, ObjectId>,
+    /// Objects still to copy.
+    queue: Vec<ObjectId>,
+}
+
+impl Copier<'_> {
+    /// Point every reference in `object` at the copy of what it refers to
+    /// (queueing that to be copied too), or at nothing if that stays behind.
+    fn rewrite(&mut self, object: &mut Object, doc: &mut Document) {
+        match object {
+            Object::Reference(id) => match self.copy_of(*id, doc) {
+                Some(new) => *id = new,
+                None => *object = Object::Null,
+            },
+            Object::Array(items) => items.iter_mut().for_each(|o| self.rewrite(o, doc)),
+            Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, o)| self.rewrite(o, doc)),
+            Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, o)| self.rewrite(o, doc)),
+            _ => {}
+        }
+    }
+
+    fn copy_of(&mut self, id: ObjectId, doc: &mut Document) -> Option<ObjectId> {
+        if let Some(&new) = self.ids.get(&id) {
+            return Some(new);
+        }
+        // Other pages, the page tree and the catalog would bring the whole file with them.
+        let kind = self.source.get_dictionary(id).ok().and_then(|d| d.get(b"Type").and_then(Object::as_name).ok());
+        if self.left_behind.contains(&id) || matches!(kind, Some(b"Page" | b"Pages" | b"Catalog")) || self.source.get_object(id).is_err() {
+            return None;
+        }
+        let new = doc.new_object_id();
+        self.ids.insert(id, new);
+        self.queue.push(id);
+        Some(new)
+    }
 }
 
 /// The value of `key` inherited from the page's ancestors, if any.
@@ -1409,10 +1541,10 @@ pub(crate) mod tests {
         assert_eq!(loaded.pages.len(), 2);
         assert_eq!((loaded.pages[1].width, loaded.pages[1].height), (750.0, 580.0));
 
-        let out_dir = std::env::var("PDF_SIGNER_TEST_OUT").ok().map(PathBuf::from);
+        let out_dir = std::env::var("PATRAPDF_TEST_OUT").ok().map(PathBuf::from);
 
         // A small red/transparent test "signature".
-        let sig_path = std::env::temp_dir().join("pdf_signer_test_sig.png");
+        let sig_path = std::env::temp_dir().join("patrapdf_test_sig.png");
         let mut sig = image::RgbaImage::new(200, 80);
         for (x, y, p) in sig.enumerate_pixels_mut() {
             let on = (y as i32 - 40 - ((x as f32 / 15.0).sin() * 20.0) as i32).abs() < 4;
@@ -1507,7 +1639,7 @@ pub(crate) mod tests {
             Item { id: 3, page: 1, x: 80., y: 120., w: 100., h: 16., kind: ItemKind::Text { text: "kept".into(), font_size: 12. } },
         ];
         let out = write(&bytes, &loaded.pages, &[0, 1], &items, Some(&Watermark::default()), TextMetrics::default()).unwrap();
-        if let Some(dir) = std::env::var_os("PDF_SIGNER_TEST_OUT").map(PathBuf::from) {
+        if let Some(dir) = std::env::var_os("PATRAPDF_TEST_OUT").map(PathBuf::from) {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("redacted.pdf"), &out).unwrap();
         }
@@ -1952,5 +2084,49 @@ pub(crate) mod tests {
         assert!(write(&bytes, &loaded.pages, &[], &[], None, TextMetrics::default()).is_err());
         assert!(write(&bytes, &loaded.pages, &[0, 0], &[], None, TextMetrics::default()).is_err());
         assert!(write(&bytes, &loaded.pages, &[2], &[], None, TextMetrics::default()).is_err());
+    }
+
+    #[test]
+    fn pages_of_another_pdf_can_be_added() {
+        let base = load(sample_pdf()).unwrap();
+        let other = load(sample_with_form_field()).unwrap();
+
+        // Its second page, then its first, after the document's own two.
+        let merged = base.with_pages(&[(&other, &[1, 0])]).unwrap();
+        assert_eq!(merged.pages.len(), 4);
+        assert_eq!(merged.pages[..2], base.pages[..]);
+        // The added pages are as they were: the rotation and crop box one of
+        // them inherited from the other file's page tree, and its font.
+        assert_eq!(merged.pages[2], other.pages[1]);
+        assert_eq!(merged.pages[3], other.pages[0]);
+        let page = render_page(&merged.pdf, 2, 1.0).unwrap();
+        assert!(page.bgra.chunks_exact(4).filter(|p| p[0] < 100).count() > 200);
+        // A field on an added page isn't one of this document's.
+        assert!(merged.form.is_empty());
+
+        // Saved like any other: reordered, with something placed on an added page.
+        let note = Item { id: 1, page: 0, x: 80., y: 120., w: 60., h: 16., kind: ItemKind::Text { text: "note".into(), font_size: 12. } };
+        let edits = Edits { order: &[3, 0, 1], items: &[note], ..Edits::default() };
+        let out = merged.save(&edits).unwrap().bytes;
+        assert_eq!(load(out.clone()).unwrap().pages.len(), 3);
+        assert!(page_content(&out, 1).contains("Page 1 - Name:"));
+        assert!(page_content(&out, 1).contains(&winansi_hex("note")));
+        assert!(page_content(&out, 2).contains("Page 1 - Name:"));
+        assert!(page_content(&out, 3).contains("Page 2 - Name:"));
+        assert!(all_text(&out).contains("secret-field-value"), "the added page keeps what its field shows");
+
+        // More can be added to the result, and from several files at once.
+        let again = merged.with_pages(&[(&base, &[0]), (&other, &[0, 1])]).unwrap();
+        assert_eq!(again.pages.len(), 7);
+        assert_eq!(again.pages[..4], merged.pages[..]);
+
+        // A protected document stays protected.
+        let mut protected = base.clone();
+        protected.password = Some("sesame".into());
+        assert_eq!(protected.with_pages(&[(&other, &[0])]).unwrap().password.as_deref(), Some("sesame"));
+
+        assert!(base.with_pages(&[(&other, &[2])]).is_err());
+        assert!(base.with_pages(&[(&other, &[0, 0])]).is_err());
+        assert!(base.with_pages(&[(&other, &[])]).is_err());
     }
 }

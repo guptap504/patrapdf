@@ -37,8 +37,8 @@ use crate::{about, signatures};
 /// Public half of the release-signing key (minisign, key id ACB329C9C59F44C0).
 /// The release workflow signs `SHA256SUMS.txt` with the secret half.
 const PUBLIC_KEY: &str = "RWTARJ/FySmzrKbcWQS1MDc3JSBXIFZ35/3IJLRtZAVfjR+80jlr58Zt";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/guptap504/pdf-signer/releases/latest";
-pub const RELEASES_PAGE: &str = "https://github.com/guptap504/pdf-signer/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/guptap504/patrapdf/releases/latest";
+pub const RELEASES_PAGE: &str = "https://github.com/guptap504/patrapdf/releases/latest";
 const SUMS: &str = "SHA256SUMS.txt";
 const SUMS_SIGNATURE: &str = "SHA256SUMS.txt.minisig";
 
@@ -59,7 +59,7 @@ const MAX_METADATA_BYTES: u64 = 1 << 20;
 /// A copy of the app that can replace itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Install {
-    /// `…/PDF Signer.app` on macOS.
+    /// `…/PatraPDF.app` on macOS.
     MacApp { bundle: PathBuf },
     /// Installed with the Windows installer (for this user, or for everyone).
     WindowsInstaller { all_users: bool },
@@ -84,15 +84,15 @@ impl NoUpdates {
         match self {
             NoUpdates::Development => "Development builds don't update themselves.",
             NoUpdates::PackageManager => "Updates for this copy come from your system's package manager.",
-            NoUpdates::NotInApplications => "Move PDF Signer to your Applications folder to get automatic updates.",
-            NoUpdates::Unknown => "This copy of PDF Signer can't update itself. Download new versions from GitHub.",
+            NoUpdates::NotInApplications => "Move PatraPDF to your Applications folder to get automatic updates.",
+            NoUpdates::Unknown => "This copy of PatraPDF can't update itself. Download new versions from GitHub.",
         }
     }
 }
 
 /// How the running app was installed.
 pub fn detect() -> Result<Install, NoUpdates> {
-    if cfg!(debug_assertions) && std::env::var_os("PDF_SIGNER_UPDATE_DEV").is_none() {
+    if cfg!(debug_assertions) && std::env::var_os("PATRAPDF_UPDATE_DEV").is_none() {
         return Err(NoUpdates::Development);
     }
     let Ok(exe) = std::env::current_exe() else { return Err(NoUpdates::Unknown) };
@@ -148,11 +148,11 @@ fn asset_name(install: &Install, version: &Version) -> String {
     match install {
         Install::MacApp { .. } => {
             let arch = if std::env::consts::ARCH == "aarch64" { "arm64" } else { "x86_64" };
-            format!("PDF-Signer-{version}-macos-{arch}.dmg")
+            format!("PatraPDF-{version}-macos-{arch}.dmg")
         }
-        Install::WindowsInstaller { .. } => format!("PDF-Signer-{version}-windows-x64-setup.exe"),
-        Install::WindowsPortable { .. } => format!("PDF-Signer-{version}-windows-x64-portable.zip"),
-        Install::AppImage { .. } => format!("PDF-Signer-{version}-linux-x86_64.AppImage"),
+        Install::WindowsInstaller { .. } => format!("PatraPDF-{version}-windows-x64-setup.exe"),
+        Install::WindowsPortable { .. } => format!("PatraPDF-{version}-windows-x64-portable.zip"),
+        Install::AppImage { .. } => format!("PatraPDF-{version}-linux-x86_64.AppImage"),
     }
 }
 
@@ -203,7 +203,7 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         // The OS trust store, so corporate proxies with their own CA keep working.
         .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
-        .user_agent(format!("pdf-signer/{} ({})", about::VERSION, std::env::consts::OS))
+        .user_agent(format!("patrapdf/{} ({})", about::VERSION, std::env::consts::OS))
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_recv_body(Some(Duration::from_secs(60)))
@@ -253,7 +253,7 @@ fn verify_sums(sums: &[u8], signature: &str, version: &Version, public_key: &str
     let signature = Signature::decode(signature).map_err(|_| anyhow!("the update's signature is malformed"))?;
     key.verify(sums, &signature, false)
         .map_err(|_| anyhow!("the update's signature doesn't match. It was not installed."))?;
-    // The trusted comment is covered by the signature: "pdf-signer v1.2.3".
+    // The trusted comment is covered by the signature: "patrapdf v1.2.3".
     let expected = format!("v{version}");
     ensure!(
         signature.trusted_comment().split_whitespace().any(|w| w == expected),
@@ -388,12 +388,12 @@ fn install_package(install: &Install, package: &Path, relaunch: bool) -> Result<
             Ok(())
         }
         Install::WindowsPortable { exe } => {
-            let new_exe = package.with_file_name("pdf-signer.new.exe");
+            let new_exe = package.with_file_name("patrapdf.new.exe");
             extract_exe(package, &new_exe)?;
-            self_replace::self_replace(&new_exe).context("couldn't replace pdf-signer.exe")?;
+            self_replace::self_replace(&new_exe).context("couldn't replace patrapdf.exe")?;
             let _ = fs::remove_file(&new_exe);
             if relaunch {
-                Command::new(exe).spawn().context("couldn't restart PDF Signer")?;
+                Command::new(exe).spawn().context("couldn't restart PatraPDF")?;
             }
             Ok(())
         }
@@ -516,11 +516,11 @@ fn relaunch_after_exit(program: &Path, clear_env: &[&str]) -> Result<()> {
 
 #[cfg(not(unix))]
 fn relaunch_after_exit(program: &Path, _: &[&str]) -> Result<()> {
-    Command::new(program).spawn().context("couldn't restart PDF Signer")?;
+    Command::new(program).spawn().context("couldn't restart PatraPDF")?;
     Ok(())
 }
 
-/// Pull `pdf-signer.exe` out of the portable zip.
+/// Pull `patrapdf.exe` out of the portable zip.
 fn extract_exe(zip_path: &Path, out: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(fs::File::open(zip_path)?).context("the update isn't a valid zip")?;
     let index = (0..archive.len())
@@ -529,11 +529,11 @@ fn extract_exe(zip_path: &Path, out: &Path) -> Result<()> {
                 .by_index(i)
                 .ok()
                 .and_then(|f| f.enclosed_name())
-                .is_some_and(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("pdf-signer.exe")))
+                .is_some_and(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("patrapdf.exe")))
         })
-        .ok_or_else(|| anyhow!("the update has no pdf-signer.exe"))?;
+        .ok_or_else(|| anyhow!("the update has no patrapdf.exe"))?;
     let entry = archive.by_index(index)?;
-    ensure!(entry.size() <= MAX_PACKAGE_BYTES, "pdf-signer.exe in the update is too large");
+    ensure!(entry.size() <= MAX_PACKAGE_BYTES, "patrapdf.exe in the update is too large");
     let mut file = fs::File::create(out)?;
     std::io::copy(&mut entry.take(MAX_PACKAGE_BYTES), &mut file)?;
     file.sync_all()?;
@@ -666,7 +666,7 @@ impl EventEmitter<Event> for Updater {}
 /// Create the app's updater and start the daily checks.
 pub fn init(enabled: bool, cx: &mut App) -> Entity<Updater> {
     // A release can be rehearsed against a local server; the signature check still applies.
-    let feed = std::env::var("PDF_SIGNER_UPDATE_URL").unwrap_or_else(|_| LATEST_RELEASE_URL.into());
+    let feed = std::env::var("PATRAPDF_UPDATE_URL").unwrap_or_else(|_| LATEST_RELEASE_URL.into());
     let updater = cx.new(|cx| Updater::new(detect(), enabled, feed, PUBLIC_KEY.into(), cx));
     cx.set_global(GlobalUpdater(updater.clone()));
     updater
@@ -947,17 +947,17 @@ pub(crate) mod tests {
     use std::rc::Rc;
 
     // A test key and fixtures made with minisign 0.12 (see the release workflow):
-    //   minisign -S -s test.key -m SHA256SUMS.txt -t "pdf-signer v9.9.9"
-    const TEST_KEY: &str = "RWSLsrqamTvcUKT7axCAKaoxQVE5I4ueA/WyNmMosdM1r2v9ha0zKHFy";
-    const TEST_SUMS: &str = "0000000000000000000000000000000000000000000000000000000000000000  PDF-Signer-9.9.9-macos-arm64.dmg\n989863546aacc57dd1966f0561da160423e86e8df0bea4f276072c9ca3991d99  PDF-Signer-9.9.9-linux-x86_64.AppImage\n";
+    //   minisign -S -s test.key -m SHA256SUMS.txt -t "patrapdf v9.9.9"
+    const TEST_KEY: &str = "RWQF6wjw1D9BGAxlSAJYc5+nga2aURBqrV6a8OHwKLS5rC2+aXrTQhDU";
+    const TEST_SUMS: &str = "0000000000000000000000000000000000000000000000000000000000000000  PatraPDF-9.9.9-macos-arm64.dmg\n37444e7f2e62969ea08184b0e3ad3dee965bf888a6380fe4087cf231322f1f9f  PatraPDF-9.9.9-linux-x86_64.AppImage\n";
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
-RUSLsrqamTvcUOXJRrXmLgfnZsmMxXl85zSSxnV5TUBkyvLXFOtZzzTBYjjtMOt32a7awlcp7p8fFsyiw1FuFpri5fvVWpE0WA0=
-trusted comment: pdf-signer v9.9.9
-GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJhGv3DA==
+RUQF6wjw1D9BGH0eSbTAUoQGIO3LRAr7JfMaqtjJjnvGZgNb5vUhjbVc7LYQqIPD9rytS/K3gnvNWgHyabpFfGO/byNigk1IXAk=
+trusted comment: patrapdf v9.9.9
+iGRB6/YzdNLb7YjqOANKbqyVKaED8jM0rwg3dd1X+97zdP4sIQNMBrSBF1jbliwtcAs54pQbrW0+k0cQV67OCQ==
 ";
 
     fn test_package() -> Vec<u8> {
-        b"PDF Signer test package\n".repeat(4000)
+        b"PatraPDF test package\n".repeat(4000)
     }
 
     fn v(s: &str) -> Version {
@@ -976,7 +976,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
             draft: false,
             prerelease: false,
             assets: vec![
-                asset("PDF-Signer-9.9.9-linux-x86_64.AppImage", package_size),
+                asset("PatraPDF-9.9.9-linux-x86_64.AppImage", package_size),
                 asset(SUMS, TEST_SUMS.len() as u64),
                 asset(SUMS_SIGNATURE, TEST_SIGNATURE.len() as u64),
             ],
@@ -1023,42 +1023,42 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         use Install::*;
         let p = PathBuf::from;
         assert_eq!(
-            detect_from("macos", &p("/Applications/PDF Signer.app/Contents/MacOS/pdf-signer"), None, &[]),
-            Ok(MacApp { bundle: p("/Applications/PDF Signer.app") })
+            detect_from("macos", &p("/Applications/PatraPDF.app/Contents/MacOS/patrapdf"), None, &[]),
+            Ok(MacApp { bundle: p("/Applications/PatraPDF.app") })
         );
         assert_eq!(
-            detect_from("macos", &p("/private/var/folders/x/AppTranslocation/ABC/d/PDF Signer.app/Contents/MacOS/pdf-signer"), None, &[]),
+            detect_from("macos", &p("/private/var/folders/x/AppTranslocation/ABC/d/PatraPDF.app/Contents/MacOS/patrapdf"), None, &[]),
             Err(NoUpdates::NotInApplications)
         );
         assert_eq!(
-            detect_from("macos", &p("/Volumes/PDF Signer/PDF Signer.app/Contents/MacOS/pdf-signer"), None, &[]),
+            detect_from("macos", &p("/Volumes/PatraPDF/PatraPDF.app/Contents/MacOS/patrapdf"), None, &[]),
             Err(NoUpdates::NotInApplications)
         );
-        assert_eq!(detect_from("macos", &p("/Users/me/code/target/release/pdf-signer"), None, &[]), Err(NoUpdates::Unknown));
+        assert_eq!(detect_from("macos", &p("/Users/me/code/target/release/patrapdf"), None, &[]), Err(NoUpdates::Unknown));
 
         assert_eq!(
-            detect_from("linux", &p("/tmp/.mount_PDFxyz/usr/bin/pdf-signer"), Some(p("/home/me/Apps/PDF-Signer.AppImage")), &[]),
-            Ok(AppImage { path: p("/home/me/Apps/PDF-Signer.AppImage") })
+            detect_from("linux", &p("/tmp/.mount_PDFxyz/usr/bin/patrapdf"), Some(p("/home/me/Apps/PatraPDF.AppImage")), &[]),
+            Ok(AppImage { path: p("/home/me/Apps/PatraPDF.AppImage") })
         );
-        assert_eq!(detect_from("linux", &p("/usr/bin/pdf-signer"), None, &[]), Err(NoUpdates::PackageManager));
-        assert_eq!(detect_from("linux", &p("/home/me/.cargo/bin/pdf-signer"), None, &[]), Err(NoUpdates::Unknown));
+        assert_eq!(detect_from("linux", &p("/usr/bin/patrapdf"), None, &[]), Err(NoUpdates::PackageManager));
+        assert_eq!(detect_from("linux", &p("/home/me/.cargo/bin/patrapdf"), None, &[]), Err(NoUpdates::Unknown));
 
         // Windows: the installer leaves an uninstaller next to the exe.
-        let dir = std::env::temp_dir().join(format!("pdf-signer-detect-{}", std::process::id()));
-        let installed = dir.join("Programs/PDF Signer");
+        let dir = std::env::temp_dir().join(format!("patrapdf-detect-{}", std::process::id()));
+        let installed = dir.join("Programs/PatraPDF");
         fs::create_dir_all(&installed).unwrap();
         fs::write(installed.join("unins000.exe"), b"").unwrap();
         assert_eq!(
-            detect_from("windows", &installed.join("pdf-signer.exe"), None, &[p("C:\\Program Files")]),
+            detect_from("windows", &installed.join("patrapdf.exe"), None, &[p("C:\\Program Files")]),
             Ok(WindowsInstaller { all_users: false })
         );
         assert_eq!(
-            detect_from("windows", &installed.join("pdf-signer.exe"), None, &[dir.join("Programs")]),
+            detect_from("windows", &installed.join("patrapdf.exe"), None, &[dir.join("Programs")]),
             Ok(WindowsInstaller { all_users: true })
         );
         assert_eq!(
-            detect_from("windows", &dir.join("pdf-signer.exe"), None, &[]),
-            Ok(WindowsPortable { exe: dir.join("pdf-signer.exe") })
+            detect_from("windows", &dir.join("patrapdf.exe"), None, &[]),
+            Ok(WindowsPortable { exe: dir.join("patrapdf.exe") })
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -1067,10 +1067,10 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
     fn package_names_match_the_release_workflow() {
         let version = v("1.2.3");
         let name = |install| asset_name(&install, &version);
-        assert!(name(Install::MacApp { bundle: "/A.app".into() }).starts_with("PDF-Signer-1.2.3-macos-"));
-        assert_eq!(name(Install::WindowsInstaller { all_users: false }), "PDF-Signer-1.2.3-windows-x64-setup.exe");
-        assert_eq!(name(Install::WindowsPortable { exe: "x".into() }), "PDF-Signer-1.2.3-windows-x64-portable.zip");
-        assert_eq!(name(Install::AppImage { path: "x".into() }), "PDF-Signer-1.2.3-linux-x86_64.AppImage");
+        assert!(name(Install::MacApp { bundle: "/A.app".into() }).starts_with("PatraPDF-1.2.3-macos-"));
+        assert_eq!(name(Install::WindowsInstaller { all_users: false }), "PatraPDF-1.2.3-windows-x64-setup.exe");
+        assert_eq!(name(Install::WindowsPortable { exe: "x".into() }), "PatraPDF-1.2.3-windows-x64-portable.zip");
+        assert_eq!(name(Install::AppImage { path: "x".into() }), "PatraPDF-1.2.3-linux-x86_64.AppImage");
     }
 
     #[test]
@@ -1102,7 +1102,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         let version = v("9.9.9");
         verify_sums(TEST_SUMS.as_bytes(), TEST_SIGNATURE, &version, TEST_KEY).unwrap();
         // Tampered checksums.
-        let tampered = TEST_SUMS.replace("9898", "9899");
+        let tampered = TEST_SUMS.replace("3744", "3745");
         assert!(verify_sums(tampered.as_bytes(), TEST_SIGNATURE, &version, TEST_KEY).is_err());
         // A genuine signature for another release can't be replayed.
         assert!(verify_sums(TEST_SUMS.as_bytes(), TEST_SIGNATURE, &v("9.9.10"), TEST_KEY).is_err());
@@ -1110,9 +1110,9 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         assert!(verify_sums(TEST_SUMS.as_bytes(), TEST_SIGNATURE, &version, PUBLIC_KEY).is_err());
         assert!(verify_sums(TEST_SUMS.as_bytes(), "garbage", &version, TEST_KEY).is_err());
 
-        let hash = checksum_for(TEST_SUMS, "PDF-Signer-9.9.9-linux-x86_64.AppImage").unwrap();
+        let hash = checksum_for(TEST_SUMS, "PatraPDF-9.9.9-linux-x86_64.AppImage").unwrap();
         assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(test_package())));
-        assert_eq!(checksum_for(TEST_SUMS, "PDF-Signer-9.9.9-linux-x86_64"), None);
+        assert_eq!(checksum_for(TEST_SUMS, "PatraPDF-9.9.9-linux-x86_64"), None);
         // `sha256sum -b` marks binary files with '*'.
         assert_eq!(checksum_for(&format!("{}  *a.zip\n", "ab".repeat(32)), "a.zip"), Some([0xab; 32]));
         assert_eq!(checksum_for("xyz  a.zip", "a.zip"), None);
@@ -1128,7 +1128,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
     }
 
     fn download(base: &str, size: u64) -> Result<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("pdf-signer-dl-{}-{size}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patrapdf-dl-{}-{size}", std::process::id()));
         let install = Install::AppImage { path: "/x".into() };
         let r = release("v9.9.9", base, size);
         let (progress, cancel) = (AtomicU64::new(0), AtomicBool::new(false));
@@ -1140,7 +1140,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         let package = test_package();
         let files = |pkg: Vec<u8>, sums: &str| {
             vec![
-                ("/PDF-Signer-9.9.9-linux-x86_64.AppImage".to_string(), pkg),
+                ("/PatraPDF-9.9.9-linux-x86_64.AppImage".to_string(), pkg),
                 (format!("/{SUMS}"), sums.as_bytes().to_vec()),
                 (format!("/{SUMS_SIGNATURE}"), TEST_SIGNATURE.as_bytes().to_vec()),
             ]
@@ -1159,7 +1159,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         assert!(format!("{err:#}").contains("checksum"), "{err:#}");
 
         // Checksums that don't match their signature: the package isn't even fetched.
-        let base = serve(|_| files(package.clone(), &TEST_SUMS.replace("9898", "9899")));
+        let base = serve(|_| files(package.clone(), &TEST_SUMS.replace("3744", "3745")));
         let err = download(&base, package.len() as u64).unwrap_err();
         assert!(format!("{err:#}").contains("signature"), "{err:#}");
 
@@ -1183,18 +1183,18 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
 
     #[test]
     fn portable_zip_yields_the_exe() {
-        let dir = std::env::temp_dir().join(format!("pdf-signer-zip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patrapdf-zip-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let zip_path = dir.join("portable.zip");
         let mut writer = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
         let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         writer.start_file("README.md", options).unwrap();
         writer.write_all(b"readme").unwrap();
-        writer.start_file("pdf-signer.exe", options).unwrap();
+        writer.start_file("patrapdf.exe", options).unwrap();
         writer.write_all(b"MZ new version").unwrap();
         writer.finish().unwrap();
 
-        let out = dir.join("pdf-signer.new.exe");
+        let out = dir.join("patrapdf.new.exe");
         extract_exe(&zip_path, &out).unwrap();
         assert_eq!(fs::read(&out).unwrap(), b"MZ new version");
         let _ = fs::remove_dir_all(dir);
@@ -1204,9 +1204,9 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
     #[test]
     fn appimage_is_replaced_in_place() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("pdf-signer-appimage-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patrapdf-appimage-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("PDF-Signer.AppImage");
+        let current = dir.join("PatraPDF.AppImage");
         let package = dir.join("download.AppImage");
         fs::write(&current, b"old").unwrap();
         fs::write(&package, b"new").unwrap();
@@ -1222,18 +1222,18 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_app_is_swapped_from_the_disk_image() {
-        let dir = std::env::temp_dir().join(format!("pdf-signer-macswap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patrapdf-macswap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let make_app = |root: &Path, marker: &str| {
-            let app = root.join("PDF Signer.app");
+            let app = root.join("PatraPDF.app");
             fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
-            fs::write(app.join("Contents/MacOS/pdf-signer"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
+            fs::write(app.join("Contents/MacOS/patrapdf"), format!("#!/bin/sh\necho {marker}\n")).unwrap();
             fs::write(
                 app.join("Contents/Info.plist"),
-                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>pdf-signer</string><key>CFBundleIdentifier</key><string>test.pdfsigner</string></dict></plist>",
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>patrapdf</string><key>CFBundleIdentifier</key><string>test.patrapdf</string></dict></plist>",
             )
             .unwrap();
-            run(Command::new("chmod").arg("+x").arg(app.join("Contents/MacOS/pdf-signer"))).unwrap();
+            run(Command::new("chmod").arg("+x").arg(app.join("Contents/MacOS/patrapdf"))).unwrap();
             run(Command::new("codesign").args(["--force", "--sign", "-"]).arg(&app)).unwrap();
             app
         };
@@ -1242,14 +1242,14 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
         let dmg = dir.join("downloads/update.dmg");
         fs::create_dir_all(dmg.parent().unwrap()).unwrap();
         run(Command::new("hdiutil")
-            .args(["create", "-quiet", "-fs", "HFS+", "-format", "UDZO", "-volname", "PDF Signer", "-srcfolder"])
+            .args(["create", "-quiet", "-fs", "HFS+", "-format", "UDZO", "-volname", "PatraPDF", "-srcfolder"])
             .arg(dir.join("image"))
             .arg(&dmg))
         .unwrap();
 
         let install = Install::MacApp { bundle: installed.clone() };
         install_package(&install, &dmg, false).unwrap();
-        let script = fs::read_to_string(installed.join("Contents/MacOS/pdf-signer")).unwrap();
+        let script = fs::read_to_string(installed.join("Contents/MacOS/patrapdf")).unwrap();
         assert!(script.contains("new"), "the bundle was replaced");
         assert!(sibling(&installed, "old").exists(), "the old bundle is kept until the next launch");
         assert!(!sibling(&installed, "update").exists());
@@ -1270,14 +1270,14 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
                 "html_url": format!("{base}/release"),
                 "body": "* Faster by @a in https://github.com/x/y/pull/1",
                 "assets": [
-                    {"name": "PDF-Signer-9.9.9-linux-x86_64.AppImage", "browser_download_url": format!("{base}/PDF-Signer-9.9.9-linux-x86_64.AppImage"), "size": package.len()},
+                    {"name": "PatraPDF-9.9.9-linux-x86_64.AppImage", "browser_download_url": format!("{base}/PatraPDF-9.9.9-linux-x86_64.AppImage"), "size": package.len()},
                     {"name": SUMS, "browser_download_url": format!("{base}/{SUMS}"), "size": TEST_SUMS.len()},
                     {"name": SUMS_SIGNATURE, "browser_download_url": format!("{base}/{SUMS_SIGNATURE}"), "size": TEST_SIGNATURE.len()},
                 ]
             });
             vec![
                 ("/latest".to_string(), release.to_string().into_bytes()),
-                ("/PDF-Signer-9.9.9-linux-x86_64.AppImage".to_string(), package.clone()),
+                ("/PatraPDF-9.9.9-linux-x86_64.AppImage".to_string(), package.clone()),
                 (format!("/{SUMS}"), TEST_SUMS.as_bytes().to_vec()),
                 (format!("/{SUMS_SIGNATURE}"), TEST_SIGNATURE.as_bytes().to_vec()),
             ]
@@ -1285,7 +1285,7 @@ GTk/nyGlcC9ppXOi6NGgXwujRXqwNjUchxULUrsDDl+UdcFsslKVYXjh1MLe2iH6FIKXCQap7ruObpaJ
 
         let events = Rc::new(RefCell::new(Vec::new()));
         let updater = cx.new(|cx| {
-            let install = Ok(Install::AppImage { path: "/nonexistent/PDF-Signer.AppImage".into() });
+            let install = Ok(Install::AppImage { path: "/nonexistent/PatraPDF.AppImage".into() });
             Updater::new(install, true, format!("{base}/latest"), TEST_KEY.into(), cx)
         });
         cx.update(|cx| {

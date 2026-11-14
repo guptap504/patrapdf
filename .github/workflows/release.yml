@@ -40,8 +40,8 @@ jobs:
               echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
               exit 1
             fi
-            if ! grep -q "<release version=\"$version\"" packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml; then
-              echo "::error::Add <release version=\"$version\" …/> to packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml"
+            if ! grep -q "<release version=\"$version\"" packaging/linux/io.github.guptap504.PatraPDF.metainfo.xml; then
+              echo "::error::Add <release version=\"$version\" …/> to packaging/linux/io.github.guptap504.PatraPDF.metainfo.xml"
               exit 1
             fi
           fi
@@ -101,9 +101,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist, staging | Out-Null
-          Copy-Item target/release/pdf-signer.exe, README.md staging/
+          Copy-Item target/release/patrapdf.exe, README.md staging/
           Copy-Item LICENSE staging/LICENSE.txt
-          Compress-Archive -Path staging/* -DestinationPath "dist/PDF-Signer-$env:VERSION-windows-x64-portable.zip"
+          Compress-Archive -Path staging/* -DestinationPath "dist/PatraPDF-$env:VERSION-windows-x64-portable.zip"
       - name: Installer
         run: |
           if ! command -v iscc >/dev/null && [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
@@ -149,7 +149,7 @@ jobs:
           dpkg-deb --contents dist/*.deb
           rpm -qpil dist/*.rpm
           rpm -qpR dist/*.rpm
-          desktop-file-validate packaging/linux/io.github.guptap504.PdfSigner.desktop
+          desktop-file-validate packaging/linux/io.github.guptap504.PatraPDF.desktop
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-x86_64
@@ -190,7 +190,7 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends minisign
           key="$RUNNER_TEMP/minisign.key"
           (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
-          minisign -S -s "$key" -m dist/SHA256SUMS.txt -t "pdf-signer v$VERSION"
+          minisign -S -s "$key" -m dist/SHA256SUMS.txt -t "patrapdf v$VERSION"
           rm -f "$key"
           # The signature must verify with the key the app ships with.
           public_key=$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/updater.rs)
@@ -204,6 +204,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "PDF Signer $VERSION" \
+            --title "PatraPDF $VERSION" \
             --generate-notes \
             --verify-tag

@@ -5,13 +5,13 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleName</key>
-    <string>PDF Signer</string>
+    <string>PatraPDF</string>
     <key>CFBundleDisplayName</key>
-    <string>PDF Signer</string>
+    <string>PatraPDF</string>
     <key>CFBundleIdentifier</key>
-    <string>io.github.guptap504.PdfSigner</string>
+    <string>io.github.guptap504.PatraPDF</string>
     <key>CFBundleExecutable</key>
-    <string>pdf-signer</string>
+    <string>patrapdf</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>

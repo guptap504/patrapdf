@@ -1,12 +1,12 @@
 [package]
-name = "pdf-signer"
-version = "0.3.1"
+name = "patrapdf"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fill in, sign, redact and watermark PDFs on your own computer."
 authors = ["Prashant Gupta <6059565+guptap504@users.noreply.github.com>"]
 license = "MIT"
-repository = "https://github.com/guptap504/pdf-signer"
+repository = "https://github.com/guptap504/patrapdf"
 readme = "README.md"
 keywords = ["pdf", "signature", "forms", "redaction", "gpui"]
 categories = ["gui", "text-processing"]
@@ -55,48 +55,48 @@ strip = true
 # ---------------------------------------------------------------------------
 
 [package.metadata.deb]
-name = "pdf-signer"
+name = "patrapdf"
 maintainer = "Prashant Gupta <6059565+guptap504@users.noreply.github.com>"
 copyright = "2026, Prashant Gupta"
 section = "graphics"
 priority = "optional"
 extended-description = """\
-PDF Signer fills in and signs PDF forms entirely offline: type text, add dates \
+PatraPDF fills in and signs PDF forms entirely offline: type text, add dates \
 and checkmarks, place signature images, black out (truly remove) sensitive \
-content, stamp a watermark, and delete or reorder pages."""
+content, stamp a watermark, and delete, reorder or add pages."""
 depends = "$auto"
 # Fonts metrically matching the PDF's Helvetica; GPU drivers for the Vulkan
 # renderer; the desktop portal for Open/Save dialogs.
 recommends = "fonts-liberation, mesa-vulkan-drivers, libvulkan1, xdg-desktop-portal"
 assets = [
-    ["target/release/pdf-signer", "usr/bin/", "755"],
-    ["packaging/linux/io.github.guptap504.PdfSigner.desktop", "usr/share/applications/", "644"],
-    ["packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml", "usr/share/metainfo/", "644"],
-    ["packaging/linux/icons/16.png", "usr/share/icons/hicolor/16x16/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/24.png", "usr/share/icons/hicolor/24x24/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/32.png", "usr/share/icons/hicolor/32x32/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/48.png", "usr/share/icons/hicolor/48x48/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/64.png", "usr/share/icons/hicolor/64x64/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/128.png", "usr/share/icons/hicolor/128x128/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/256.png", "usr/share/icons/hicolor/256x256/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["packaging/linux/icons/512.png", "usr/share/icons/hicolor/512x512/apps/io.github.guptap504.PdfSigner.png", "644"],
-    ["README.md", "usr/share/doc/pdf-signer/README.md", "644"],
+    ["target/release/patrapdf", "usr/bin/", "755"],
+    ["packaging/linux/io.github.guptap504.PatraPDF.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/io.github.guptap504.PatraPDF.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["packaging/linux/icons/16.png", "usr/share/icons/hicolor/16x16/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/24.png", "usr/share/icons/hicolor/24x24/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/32.png", "usr/share/icons/hicolor/32x32/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/48.png", "usr/share/icons/hicolor/48x48/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/64.png", "usr/share/icons/hicolor/64x64/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/128.png", "usr/share/icons/hicolor/128x128/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/256.png", "usr/share/icons/hicolor/256x256/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["packaging/linux/icons/512.png", "usr/share/icons/hicolor/512x512/apps/io.github.guptap504.PatraPDF.png", "644"],
+    ["README.md", "usr/share/doc/patrapdf/README.md", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/pdf-signer", dest = "/usr/bin/pdf-signer", mode = "755" },
-    { source = "packaging/linux/io.github.guptap504.PdfSigner.desktop", dest = "/usr/share/applications/io.github.guptap504.PdfSigner.desktop", mode = "644" },
-    { source = "packaging/linux/io.github.guptap504.PdfSigner.metainfo.xml", dest = "/usr/share/metainfo/io.github.guptap504.PdfSigner.metainfo.xml", mode = "644" },
-    { source = "packaging/linux/icons/16.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/24.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "packaging/linux/icons/512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.guptap504.PdfSigner.png", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/pdf-signer/README.md", mode = "644", doc = true },
+    { source = "target/release/patrapdf", dest = "/usr/bin/patrapdf", mode = "755" },
+    { source = "packaging/linux/io.github.guptap504.PatraPDF.desktop", dest = "/usr/share/applications/io.github.guptap504.PatraPDF.desktop", mode = "644" },
+    { source = "packaging/linux/io.github.guptap504.PatraPDF.metainfo.xml", dest = "/usr/share/metainfo/io.github.guptap504.PatraPDF.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/icons/16.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/24.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "packaging/linux/icons/512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.guptap504.PatraPDF.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/patrapdf/README.md", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.recommends]

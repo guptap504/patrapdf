@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=PDF Signer
+Name=PatraPDF
 GenericName=PDF Form Filler
 Comment=Fill in, sign, redact and watermark PDFs
-Exec=pdf-signer %f
-Icon=io.github.guptap504.PdfSigner
+Exec=patrapdf %f
+Icon=io.github.guptap504.PatraPDF
 Terminal=false
 Categories=Office;Graphics;Viewer;
 MimeType=application/pdf;
 Keywords=pdf;sign;signature;form;fill;redact;watermark;
-StartupWMClass=io.github.guptap504.PdfSigner
+StartupWMClass=io.github.guptap504.PatraPDF

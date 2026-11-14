@@ -42,6 +42,10 @@ icons! {
     "info" => r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8v.2"/>"#,
     "search" => r#"<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L20.5 20.5"/>"#,
     "lock" => r#"<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>"#,
+    "sidebar-left" => r#"<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M9.5 5v14"/>"#,
+    "sidebar-right" => r#"<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M14.5 5v14"/>"#,
+    "help" => r#"<circle cx="12" cy="12" r="8.5"/><path d="M9.6 9.6a2.5 2.5 0 1 1 3.6 2.3c-.8.4-1.2.9-1.2 1.8M12 16.6v.2"/>"#,
+    "link" => r#"<path d="M10.5 6.5H7A1.5 1.5 0 0 0 5.5 8v9A1.5 1.5 0 0 0 7 18.5h9a1.5 1.5 0 0 0 1.5-1.5v-3.5"/><path d="M14 5.5h4.5V10M18.5 5.5L11.5 12.5"/>"#,
     "text-larger" => r#"<path d="M3 18l4.5-11L12 18M4.6 14.5h5.8M15 13h6M18 10v6"/>"#,
 }
 

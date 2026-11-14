@@ -421,7 +421,7 @@ impl<'a> Embedder<'a> {
         self.fonts.push(EmbeddedFont {
             face,
             object: doc.new_object_id(),
-            name: format!("PdfSignerF{}", self.fonts.len()),
+            name: format!("PatraPDFF{}", self.fonts.len()),
             glyphs: GlyphRemapper::new(),
             widths: Vec::new(),
             text: BTreeMap::new(),

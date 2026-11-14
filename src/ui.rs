@@ -415,6 +415,22 @@ pub fn menu_item(
         .when_some(shortcut, |d, s| d.child(div().text_xs().text_color(text_tertiary()).child(keys(s))))
 }
 
+/// A menu row that does something rather than choosing an option: an icon where the check mark would be.
+pub fn menu_action(id: impl Into<ElementId>, icon_name: &str, label: &'static str) -> Stateful<Div> {
+    button_base(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(28.))
+        .px_2()
+        .rounded(px(5.))
+        .text_sm()
+        .cursor(CursorStyle::PointingHand)
+        .hover(|s| s.bg(hover_bg()))
+        .child(icon(icon_name, text_secondary()).size(px(14.)))
+        .child(label)
+}
+
 pub fn menu_separator() -> Div {
     div().h(px(1.)).mx_1().my_1().bg(border())
 }

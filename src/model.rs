@@ -24,7 +24,7 @@ pub const TEXT_FONT: &str = if cfg!(target_os = "macos") {
 pub const LINE_HEIGHT: f32 = 1.2;
 
 /// Geometry of one page as it is displayed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageGeom {
     /// Displayed width in points.
     pub width: f32,
@@ -109,6 +109,14 @@ impl Item {
             _ => None,
         }
     }
+}
+
+/// Pages added to a document from another PDF: that file, and which of its
+/// pages (from 0), in the order they were added.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PageImport {
+    pub path: PathBuf,
+    pub pages: Vec<usize>,
 }
 
 /// A text watermark stamped across every page.

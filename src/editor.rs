@@ -18,7 +18,7 @@ use gpui::{
     size,
 };
 
-use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, RedactFill, Signature, TEXT_FONT, TextMetrics};
+use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, PageImport, RedactFill, Signature, TEXT_FONT, TextMetrics};
 
 mod fields;
 mod input;
@@ -34,7 +34,7 @@ use crate::ui;
 use crate::updater::{self, Updater};
 
 actions!(
-    pdf_signer,
+    patrapdf,
     [
         Open,
         Save,
@@ -51,8 +51,13 @@ actions!(
         ZoomFitWidth,
         ZoomFitPage,
         AddSignature,
+        AddPages,
         CloseDocument,
         DiscardChanges,
+        ToggleLeftSidebar,
+        ToggleRightSidebar,
+        KeyboardShortcuts,
+        VisitWebsite,
         About,
         CheckForUpdates,
         Quit
@@ -93,6 +98,43 @@ const SIG_THUMB_W: f32 = SIDEBAR_W - 50.;
 const SIG_THUMB_H: f32 = 58.;
 /// Padding (in screen px) between an item's content and its selection border.
 const ITEM_PAD: f32 = 3.0;
+
+/// Every keyboard shortcut, as the Help menu lists them (written the macOS way; see `ui::keys`).
+const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "File",
+        &[
+            ("Open a PDF", "⌘O"),
+            ("Save a filled copy", "⌘S"),
+            ("Save with a password", "⌥⌘S"),
+            ("Add signature image", "⇧⌘S"),
+            ("All documents", "⌘W"),
+            ("Search recent documents", "⌘F"),
+        ],
+    ),
+    (
+        "Edit",
+        &[
+            ("Undo / Redo", "⌘Z  ⇧⌘Z"),
+            ("Cut / Copy / Paste field", "⌘X  ⌘C  ⌘V"),
+            ("Duplicate field", "⌘D"),
+            ("Delete field", "⌫"),
+            ("Nudge (Shift = 10pt)", "←↑→↓"),
+            ("Next / Previous form field", "Tab  ⇧Tab"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("Zoom in / out", "⌘+  ⌘−"),
+            ("Actual size", "⌘0"),
+            ("Fit width / page", "⌘1  ⌘2"),
+            ("Left sidebar", "⌘B"),
+            ("Right sidebar", "⌥⌘B"),
+            ("Help and shortcuts", "⌘/"),
+        ],
+    ),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
@@ -255,7 +297,11 @@ struct PageView {
 
 struct OpenDoc {
     path: PathBuf,
+    /// The file at `path`, followed by the pages added to it from other PDFs
+    /// (`imports`). "Original" pages and indices below are this document's.
     loaded: LoadedPdf,
+    /// Where the pages after the file's own came from, in the order they were added.
+    imports: Vec<PageImport>,
     /// One per page of the original file (rendered images etc.), by original index.
     pages: Vec<PageView>,
     /// The form widgets on each page of the original file (see `forms::widgets_by_page`).
@@ -283,6 +329,87 @@ impl OpenDoc {
     fn geoms(&self) -> impl Iterator<Item = &PageGeom> + '_ {
         self.order.iter().map(|&i| &self.loaded.pages[i])
     }
+
+    /// What has to be added to the file again to get the pages `order`
+    /// counts: the imports up to the last one with a page still in use.
+    fn imports_in_use(&self) -> Vec<PageImport> {
+        let own = self.loaded.pages.len() - self.imports.iter().map(|i| i.pages.len()).sum::<usize>();
+        let last = self.order.iter().copied().max().unwrap_or(0);
+        let mut first = own;
+        let in_use = |import: &&PageImport| {
+            let used = first <= last;
+            first += import.pages.len();
+            used
+        };
+        self.imports.iter().take_while(in_use).cloned().collect()
+    }
+}
+
+/// Asking which pages of another PDF to add to the document.
+struct ImportPrompt {
+    path: PathBuf,
+    source: LoadedPdf,
+    /// The pages as typed: "1-3, 5".
+    text: String,
+    /// `text` is still the suggestion (every page), which typing replaces.
+    untouched: bool,
+}
+
+/// A PDF that pages were added from can't be read again, on reopening the
+/// document they were added to.
+#[derive(Debug)]
+struct ImportGone(PathBuf);
+
+impl std::fmt::Display for ImportGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} can't be read any more", self.0.display())
+    }
+}
+
+impl std::error::Error for ImportGone {}
+
+/// `base` with the pages added to it again that a Recents entry remembers.
+fn with_imports(base: LoadedPdf, imports: &[PageImport]) -> anyhow::Result<LoadedPdf> {
+    if imports.is_empty() {
+        return Ok(base);
+    }
+    let gone = |import: &PageImport| anyhow::Error::new(ImportGone(import.path.clone()));
+    let mut sources = Vec::with_capacity(imports.len());
+    for import in imports {
+        let source = std::fs::read(&import.path).ok().and_then(|bytes| pdf::open_as_source(bytes, None).ok());
+        sources.push(source.ok_or_else(|| gone(import))?);
+    }
+    let additions: Vec<_> = sources.iter().zip(imports).map(|(source, import)| (source, import.pages.as_slice())).collect();
+    base.with_pages(&additions).map_err(|_| gone(&imports[0]))
+}
+
+/// The pages (from 0) that `text` names out of `count`: numbers and ranges
+/// like "1-3, 5", in the order given, each once. Or what's wrong with it.
+fn parse_page_ranges(text: &str, count: usize) -> Result<Vec<usize>, String> {
+    let page = |number: &str| match number.parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Ok(n - 1),
+        Ok(n) => Err(format!("There's no page {n}: it has {count} pages.")),
+        Err(_) => Err("Type page numbers and ranges, like 1-3, 5.".to_string()),
+    };
+    // "1 - 3" is a range too.
+    let text = text.replace(['–', '—'], "-").split('-').map(str::trim).collect::<Vec<_>>().join("-");
+    let mut pages = Vec::new();
+    for part in text.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()) {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (page(first)?, page(last)?),
+            None => (page(part)?, page(part)?),
+        };
+        let range: Vec<usize> = if first <= last { (first..=last).collect() } else { (last..=first).rev().collect() };
+        for p in range {
+            if !pages.contains(&p) {
+                pages.push(p);
+            }
+        }
+    }
+    if pages.is_empty() {
+        return Err("Type page numbers and ranges, like 1-3, 5.".to_string());
+    }
+    Ok(pages)
 }
 
 /// Asking for the password of a protected PDF, or for a new password for a
@@ -303,6 +430,9 @@ enum AfterOpen {
     Restore(String),
     /// Say that the saved copy was opened, as the original (this) has moved.
     NoteMoved(PathBuf),
+    /// Say that the saved copy was opened, as a PDF that pages were added
+    /// from (this) can't be read any more.
+    NoteImportGone(PathBuf),
 }
 
 #[derive(Clone, PartialEq)]
@@ -312,6 +442,8 @@ enum PasswordPurpose {
     /// Choosing the password for a saved copy; `first` is set once it's been
     /// typed, while it's typed again to confirm.
     NewPassword { first: Option<String> },
+    /// Reading the PDF at `path` to add pages from it.
+    Import,
 }
 
 /// Payload when dragging a page thumbnail to reorder pages.
@@ -403,6 +535,7 @@ pub struct Editor {
     /// Recently saved documents, shown in the gallery when no document is open.
     recents: Vec<RecentEntry>,
     password_prompt: Option<PasswordPrompt>,
+    import_prompt: Option<ImportPrompt>,
     next_id: u64,
     selected: Option<u64>,
     editing: Option<u64>,
@@ -420,6 +553,10 @@ pub struct Editor {
     zoom_mode: ZoomMode,
     zoom_menu_open: bool,
     date_menu_open: bool,
+    help_menu_open: bool,
+    /// Set when a sidebar was shown or hidden: the page view's new size is
+    /// only known after the next layout, so "fit" zoom has to be worked out again.
+    refit: bool,
     /// Set when a click outside closed a menu, so that same click can't reopen it.
     menu_dismissed: bool,
     settings: Settings,
@@ -506,6 +643,7 @@ impl Editor {
             watermark_preview: WatermarkPreview::default(),
             recents: recents::load(),
             password_prompt: None,
+            import_prompt: None,
             next_id: 1,
             selected: None,
             editing: None,
@@ -526,6 +664,8 @@ impl Editor {
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
             date_menu_open: false,
+            help_menu_open: false,
+            refit: false,
             menu_dismissed: false,
             settings: Settings::load(),
             pages_scroll: ScrollHandle::new(),
@@ -634,9 +774,17 @@ impl Editor {
         self.status = format!("Opening {}…", file_name(&path)).into();
         cx.notify();
         let tried_password = password.is_some();
+        // Reopened with its edits: the pages added from other PDFs are added again first.
+        let imports = match &then {
+            Some(AfterOpen::Restore(id)) => self.recents.iter().find(|e| e.id == *id).map(|e| e.imports.clone()),
+            _ => None,
+        };
         let read = cx.background_executor().spawn({
             let path = path.clone();
-            async move { pdf::open_for_editing(std::fs::read(&path)?, password.as_deref()) }
+            async move {
+                let loaded = pdf::open_for_editing(std::fs::read(&path)?, password.as_deref())?;
+                with_imports(loaded, &imports.unwrap_or_default())
+            }
         });
         // Replaces, and so abandons, a document that was still being opened.
         self.open_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -657,6 +805,24 @@ impl Editor {
     ) {
         let loaded = match loaded {
             Ok(l) => l,
+            Err(e) if e.downcast_ref::<ImportGone>().is_some() => {
+                self.password_prompt = None;
+                let source = e.downcast_ref::<ImportGone>().map(|gone| gone.0.clone()).unwrap_or_default();
+                let saved = match &then {
+                    Some(AfterOpen::Restore(id)) => self.recents.iter().find(|e| e.id == *id).map(|e| e.output.clone()),
+                    _ => None,
+                };
+                match saved.filter(|saved| saved.exists()) {
+                    Some(saved) => self.open_with_password(saved, None, Some(AfterOpen::NoteImportGone(source)), window, cx),
+                    None => self.show_error(
+                        &format!("Couldn't open {}", file_name(&path)),
+                        &format!("Pages were added to it from {}, which can't be read any more.", source.display()),
+                        window,
+                        cx,
+                    ),
+                }
+                return;
+            }
             Err(e) if e.downcast_ref::<pdf::PasswordError>().is_some() => {
                 self.status = format!("{} is password protected", file_name(&path)).into();
                 self.password_prompt = Some(PasswordPrompt {
@@ -708,13 +874,14 @@ impl Editor {
         self.fields = loaded.form.iter().map(|f| f.value.clone()).collect();
         self.recents_query.clear();
         self.recents_search_focused = false;
-        window.set_window_title(&format!("PDF Signer — {}", file_name(&path)));
+        window.set_window_title(&format!("PatraPDF — {}", file_name(&path)));
         let order = (0..loaded.pages.len()).collect::<Vec<_>>();
         self.doc = Some(OpenDoc {
             path,
             widgets: forms::widgets_by_page(&loaded.form, loaded.pages.len()),
             layouts: RefCell::default(),
             loaded,
+            imports: Vec::new(),
             pages,
             order,
             last_output: None,
@@ -744,6 +911,13 @@ impl Editor {
                 self.status = format!(
                     "The original ({}) has moved, so the saved copy was opened instead. Its fields are part of the page now.",
                     original.display()
+                )
+                .into();
+            }
+            Some(AfterOpen::NoteImportGone(source)) => {
+                self.status = format!(
+                    "{}, which pages were added from, can't be read any more, so the saved copy was opened instead. Its fields are part of the page now.",
+                    source.display()
                 )
                 .into();
             }
@@ -803,6 +977,7 @@ impl Editor {
         for image in preview.images.into_values() {
             cx.drop_image(image, Some(window));
         }
+        self.import_prompt = None;
         self.render_task = None;
         self.thumb_task = None;
     }
@@ -842,7 +1017,7 @@ impl Editor {
         self.dirty = false;
         self.tool = Tool::Select;
         self.status = "Ready".into();
-        window.set_window_title("PDF Signer");
+        window.set_window_title("PatraPDF");
         cx.notify();
     }
 
@@ -882,6 +1057,10 @@ impl Editor {
             PasswordPurpose::Open { then } => {
                 let (path, password, then) = (prompt.path.clone(), prompt.text.clone(), then.clone());
                 self.open_with_password(path, Some(password), then, window, cx);
+            }
+            PasswordPurpose::Import => {
+                let (path, password) = (prompt.path.clone(), prompt.text.clone());
+                self.read_pages_from(path, Some(password), window, cx);
             }
             PasswordPurpose::NewPassword { first } => {
                 let typed = std::mem::take(&mut prompt.text);
@@ -932,6 +1111,10 @@ impl Editor {
     /// Bring back the fields, watermark and page order saved with a recent entry
     /// (its original has just been opened).
     fn restore_recent(&mut self, entry: &RecentEntry, cx: &mut Context<Self>) {
+        if let Some(doc) = &mut self.doc {
+            // Added again while it was opened (see `open_with_password`).
+            doc.imports = entry.imports.clone();
+        }
         if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
             let n = doc.pages.len();
             let mut seen = vec![false; n];
@@ -1019,12 +1202,19 @@ impl Editor {
         cx.notify();
     }
 
-    /// Render the small page images for the thumbnail rail (once per document).
+    /// Render the small page images for the thumbnail rail: once per document,
+    /// and again for the pages added to it.
     fn render_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
         let path = doc.path.clone();
-        let pages: Vec<(usize, f32)> =
-            doc.loaded.pages.iter().map(|p| THUMB_RENDER_PX / p.width.max(1.)).enumerate().collect();
+        let pages: Vec<(usize, f32)> = doc
+            .loaded
+            .pages
+            .iter()
+            .map(|p| THUMB_RENDER_PX / p.width.max(1.))
+            .enumerate()
+            .filter(|(index, _)| doc.pages[*index].thumb.is_none())
+            .collect();
         let pdf = doc.loaded.pdf.clone();
         self.thumb_task = Some(cx.spawn_in(window, async move |this, cx| {
             let (mut rendered, _rendering) = render_in_background(pdf, pages, cx.background_executor());
@@ -1164,6 +1354,7 @@ impl Editor {
 
         let original = doc.path.clone();
         let loaded = doc.loaded.clone();
+        let imports = doc.imports_in_use();
         let order = doc.order.clone();
         let page_count = order.len();
         let items = self.items.clone();
@@ -1230,7 +1421,7 @@ impl Editor {
                         thumbnail,
                     });
                     let reordered = Some(saved.order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p));
-                    match recents::record(this.recents.clone(), &original, &path, page_count, reordered, contents) {
+                    match recents::record(this.recents.clone(), &original, &path, page_count, reordered, &imports, contents) {
                         Ok(entries) => this.recents = entries,
                         Err(e) => eprintln!("could not update recents: {e:#}"),
                     }
@@ -1595,7 +1786,7 @@ impl Editor {
             buttons.push(if auto { "Turn Off Automatic Updates" } else { "Turn On Automatic Updates" });
         }
         buttons.push("Visit Website");
-        let answer = window.prompt(PromptLevel::Info, "PDF Signer", Some(&detail), &buttons, cx);
+        let answer = window.prompt(PromptLevel::Info, "PatraPDF", Some(&detail), &buttons, cx);
         cx.spawn(async move |this, cx| {
             let Ok(choice) = answer.await else { return };
             let _ = this.update(cx, |this, cx| match buttons.get(choice).copied() {
@@ -1635,7 +1826,7 @@ impl Editor {
     ) {
         match event {
             updater::Event::UpToDate => {
-                let detail = format!("PDF Signer {} is the newest version.", crate::about::VERSION);
+                let detail = format!("PatraPDF {} is the newest version.", crate::about::VERSION);
                 let _ = window.prompt(PromptLevel::Info, "You're up to date", Some(&detail), &["OK"], cx);
             }
             updater::Event::Failed(message) => {
@@ -1668,10 +1859,10 @@ impl Editor {
         detail.push_str(if self.dirty {
             "Restarting now discards your unsaved changes. Choose Later to save them first; the update is installed when you quit."
         } else {
-            "PDF Signer restarts to finish. Choose Later to install it when you quit."
+            "PatraPDF restarts to finish. Choose Later to install it when you quit."
         });
         let restart = if self.dirty { "Discard Changes and Restart" } else { "Restart Now" };
-        let title = format!("PDF Signer {} is ready to install", release.version);
+        let title = format!("PatraPDF {} is ready to install", release.version);
         let answer = window.prompt(PromptLevel::Info, &title, Some(&detail), &[restart, "Later", "Skip This Version"], cx);
         cx.spawn_in(window, async move |this, cx| {
             let Ok(choice) = answer.await else { return };
@@ -1758,6 +1949,174 @@ impl Editor {
         }
         self.selected = None;
         self.status = format!("Deleted page {}. Press {} to bring it back.", page + 1, ui::keys("⌘Z")).into();
+        cx.notify();
+    }
+
+    /// Add pages from another PDF: choose the file, then which of its pages.
+    fn add_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.finish_editing(cx);
+        self.close_menus();
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Add Pages".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match picker.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
+                _ => return,
+            };
+            this.update_in(cx, |this, window, cx| this.read_pages_from(path, None, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Read the PDF to add pages from, in the background, then ask which
+    /// pages (or for its password first).
+    fn read_pages_from(&mut self, path: PathBuf, password: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
+        let target = doc.path.clone();
+        self.status = format!("Reading {}…", file_name(&path)).into();
+        cx.notify();
+        let tried_password = password.is_some();
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { pdf::open_as_source(std::fs::read(&path)?, password.as_deref()) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let source = read.await;
+            this.update_in(cx, |this, window, cx| {
+                // Unless the document was closed meanwhile.
+                if this.doc.as_ref().is_some_and(|d| d.path == target) {
+                    this.choose_pages_from(path, source, tried_password, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn choose_pages_from(
+        &mut self,
+        path: PathBuf,
+        source: anyhow::Result<LoadedPdf>,
+        tried_password: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = match source {
+            Ok(source) => source,
+            Err(e) if e.downcast_ref::<pdf::PasswordError>().is_some() => {
+                self.status = format!("{} is password protected", file_name(&path)).into();
+                self.password_prompt =
+                    Some(PasswordPrompt { path, text: String::new(), wrong: tried_password, purpose: PasswordPurpose::Import });
+                window.focus(&self.focus);
+                cx.notify();
+                return;
+            }
+            Err(e) => {
+                self.password_prompt = None;
+                self.show_error(&format!("Couldn't read {}", file_name(&path)), &e.to_string(), window, cx);
+                return;
+            }
+        };
+        self.password_prompt = None;
+        let count = source.pages.len();
+        if count == 1 {
+            // Nothing to choose.
+            self.import_pages(path, source, vec![0], window, cx);
+            return;
+        }
+        self.status = format!("{} has {count} pages", file_name(&path)).into();
+        self.import_prompt = Some(ImportPrompt { path, source, text: format!("1-{count}"), untouched: true });
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn submit_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // What's typed has to make sense first: the prompt says what's wrong with it.
+        let Some(pages) = self.import_prompt.as_ref().and_then(|p| parse_page_ranges(&p.text, p.source.pages.len()).ok()) else {
+            return;
+        };
+        if let Some(prompt) = self.import_prompt.take() {
+            self.import_pages(prompt.path, prompt.source, pages, window, cx);
+        }
+    }
+
+    fn cancel_import(&mut self, cx: &mut Context<Self>) {
+        self.import_prompt = None;
+        self.status = "No pages added".into();
+        cx.notify();
+    }
+
+    /// Add `pages` of `source` (the PDF at `path`) after the document's last
+    /// page. They're put together in the background.
+    fn import_pages(&mut self, path: PathBuf, source: LoadedPdf, pages: Vec<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
+        let (base, target, base_pages) = (doc.loaded.clone(), doc.path.clone(), doc.loaded.pages.len());
+        self.status = format!("Adding pages from {}…", file_name(&path)).into();
+        cx.notify();
+        let merge = cx.background_executor().spawn({
+            let pages = pages.clone();
+            async move { base.with_pages(&[(&source, &pages)]) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let merged = merge.await;
+            this.update_in(cx, |this, window, cx| {
+                // Unless the document was closed meanwhile.
+                let Some(doc) = this.doc.as_ref().filter(|d| d.path == target) else { return };
+                match merged {
+                    // Other pages were added in the meantime: these went onto the document as it was before.
+                    Ok(_) if doc.loaded.pages.len() != base_pages => {
+                        this.status = format!("Pages from {} weren't added. Add them again.", file_name(&path)).into();
+                        cx.notify();
+                    }
+                    Ok(merged) => this.pages_added(PageImport { path, pages }, merged, window, cx),
+                    Err(e) => this.show_error(&format!("Couldn't add pages from {}", file_name(&path)), &format!("{e:#}"), window, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show the pages just added: `merged` is the document with them after
+    /// its own. Undoable.
+    fn pages_added(&mut self, import: PageImport, merged: LoadedPdf, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.checkpoint();
+        let Some(doc) = &mut self.doc else { return };
+        let (first, count) = (doc.loaded.pages.len(), merged.pages.len());
+        doc.pages.extend((first..count).map(|_| PageView { image: None, thumb: None, rendered_scale: 0.0 }));
+        doc.widgets = forms::widgets_by_page(&merged.form, count);
+        doc.loaded = merged;
+        // The pages stay in the document from here on; undo only takes them out of `order`.
+        let position = doc.order.len();
+        doc.order.extend(first..count);
+        self.status = format!(
+            "Added {} from {} as page{} {}. Drag them in the list to move them.",
+            match count - first {
+                1 => "1 page".to_string(),
+                n => format!("{n} pages"),
+            },
+            file_name(&import.path),
+            if count - first == 1 { "" } else { "s" },
+            match count - first {
+                1 => format!("{}", position + 1),
+                n => format!("{}–{}", position + 1, position + n),
+            },
+        )
+        .into();
+        doc.imports.push(import);
+        self.selected = None;
+        self.ensure_rendered(window, cx);
+        self.render_thumbnails(window, cx);
+        self.scroll_to_page(position, cx);
+        self.thumbs_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -2238,13 +2597,45 @@ impl Editor {
     fn close_menus(&mut self) {
         self.zoom_menu_open = false;
         self.date_menu_open = false;
+        self.help_menu_open = false;
         self.watermark_menu_open = false;
         self.watermark_editing = false;
         self.choice_open = None;
     }
 
     fn any_menu_open(&self) -> bool {
-        self.zoom_menu_open || self.date_menu_open || self.watermark_menu_open || self.choice_open.is_some()
+        self.zoom_menu_open || self.date_menu_open || self.help_menu_open || self.watermark_menu_open || self.choice_open.is_some()
+    }
+
+    fn toggle_help_menu(&mut self, cx: &mut Context<Self>) {
+        let open = !self.help_menu_open;
+        self.close_menus();
+        self.help_menu_open = open;
+        cx.notify();
+    }
+
+    fn toggle_left_sidebar(&mut self, cx: &mut Context<Self>) {
+        // The date and watermark menus hang off the sidebar.
+        self.close_menus();
+        self.settings.show_left_sidebar = !self.settings.show_left_sidebar;
+        self.sidebars_changed(cx);
+    }
+
+    /// The page thumbnails, which are only there with a document open.
+    fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.settings.show_right_sidebar = !self.settings.show_right_sidebar;
+        self.sidebars_changed(cx);
+    }
+
+    fn sidebars_changed(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Couldn't save settings: {e:#}").into();
+        }
+        self.refit = true;
+        cx.notify();
     }
 
     fn item_mouse_down(&mut self, id: u64, mode: DragMode, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2395,6 +2786,33 @@ impl Editor {
             return;
         }
 
+        // So does the question of which pages to add: numbers and ranges only.
+        if let Some(prompt) = &mut self.import_prompt {
+            match ks.key.as_str() {
+                "escape" => self.cancel_import(cx),
+                "enter" => self.submit_import(window, cx),
+                "backspace" => {
+                    if std::mem::take(&mut prompt.untouched) {
+                        prompt.text.clear();
+                    } else {
+                        prompt.text.pop();
+                    }
+                }
+                _ if !shortcut => {
+                    let typed = ks.key_char.clone().filter(|c| c.chars().all(|c| c.is_ascii_digit() || " ,-–".contains(c)));
+                    let Some(typed) = typed else { return };
+                    if std::mem::take(&mut prompt.untouched) {
+                        prompt.text.clear();
+                    }
+                    prompt.text.push_str(&typed);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         if ks.key == "backspace" && self.input_target().is_some() {
             self.delete_backward(cx);
             cx.stop_propagation();
@@ -2529,15 +2947,16 @@ impl Editor {
     // Rendering
     // -----------------------------------------------------------------------
 
-    fn render_titlebar(&self, client_decorated: bool, maximized: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_titlebar(&self, client_decorated: bool, maximized: bool, window_h: Pixels, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let has_doc = self.doc.is_some();
+        let (left_shown, right_shown) = (self.settings.show_left_sidebar, self.settings.show_right_sidebar);
         let (title, subtitle) = match &self.doc {
             Some(doc) => {
                 let n = doc.page_count();
                 let pages = format!("{n} page{}", if n == 1 { "" } else { "s" });
                 (file_name(&doc.path), if self.dirty { format!("{pages} · Edited") } else { pages })
             }
-            None => ("PDF Signer".to_string(), "No document".to_string()),
+            None => ("PatraPDF".to_string(), "No document".to_string()),
         };
 
         div()
@@ -2586,6 +3005,11 @@ impl Editor {
                     .min_w_0()
                     .items_center()
                     .gap_2p5()
+                    .child(
+                        ui::icon_button("toggle-left-sidebar", "sidebar-left")
+                            .tooltip(ui::tooltip(if left_shown { "Hide left sidebar" } else { "Show left sidebar" }, Some("⌘B")))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_left_sidebar(cx))),
+                    )
                     .when(has_doc, |d| {
                         d.child(
                             ui::icon_button("home", "grid")
@@ -2733,8 +3157,32 @@ impl Editor {
                                 .tooltip(ui::tooltip("Save a filled copy", Some("⌘S")))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx))),
                         )
+                        .child(div().w(px(4.)))
+                    })
+                    // No document: the start screen (gallery or empty state) has its own open action.
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(
+                                ui::icon_button("help", "help")
+                                    .when(self.help_menu_open, |b| b.bg(ui::hover_bg()))
+                                    .when(!self.help_menu_open, |b| b.tooltip(ui::tooltip("Help and shortcuts", Some("⌘/"))))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if !std::mem::take(&mut this.menu_dismissed) {
+                                            this.toggle_help_menu(cx);
+                                        }
+                                    })),
+                            )
+                            .when(self.help_menu_open, |d| d.child(self.render_help_menu(window_h, cx))),
+                    )
+                    .when(has_doc, |d| {
+                        d.child(
+                            ui::icon_button("toggle-right-sidebar", "sidebar-right")
+                                .tooltip(ui::tooltip(if right_shown { "Hide right sidebar" } else { "Show right sidebar" }, Some("⌥⌘B")))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_right_sidebar(cx))),
+                        )
                     }),
-                // No document: the start screen (gallery or empty state) has its own open action.
             )
             .when(client_decorated, |d| {
                 let control = |id: &'static str, icon: &'static str| {
@@ -2791,6 +3239,49 @@ impl Editor {
                 .with_priority(1),
             )
             .into_any_element()
+    }
+
+    /// The Help menu: every keyboard shortcut, then the website and the About box.
+    fn render_help_menu(&self, window_h: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let mut shortcuts = div().id("help-shortcuts").flex().flex_col().pb_1().overflow_y_scroll();
+        for (group, rows) in SHORTCUTS {
+            shortcuts = shortcuts.child(ui::menu_caption(group));
+            for (label, keys) in *rows {
+                shortcuts = shortcuts.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .h(px(24.))
+                        .px_2()
+                        .text_xs()
+                        .text_color(ui::text_secondary())
+                        .child(*label)
+                        .child(ui::kbd(keys)),
+                );
+            }
+        }
+        let panel = ui::menu_panel()
+            .w(px(290.))
+            .child(div().px_2().pt_1p5().text_sm().font_weight(FontWeight::SEMIBOLD).child("Keyboard shortcuts"))
+            // Scrolls in a short window: the space under the title bar, less the rows around the list.
+            .child(shortcuts.max_h((window_h - px(190.)).max(px(120.))))
+            .child(ui::menu_separator())
+            .child(ui::menu_action("help-website", "link", "Visit website").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.close_menus();
+                cx.open_url(crate::about::REPOSITORY);
+                cx.notify();
+            })))
+            .child(ui::menu_action("help-about", "info", "About PatraPDF").on_click(cx.listener(
+                |this, _: &ClickEvent, window, cx| {
+                    this.close_menus();
+                    this.show_about(window, cx);
+                    cx.notify();
+                },
+            )));
+        self.floating_menu(panel, true, cx)
     }
 
     fn render_zoom_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3298,17 +3789,6 @@ impl Editor {
             .collect();
         let empty = cards.is_empty();
 
-        let shortcut = |label: &'static str, keys: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .text_xs()
-                .text_color(ui::text_secondary())
-                .child(label)
-                .child(ui::kbd(keys))
-        };
-
         div()
             .flex()
             .flex_col()
@@ -3417,30 +3897,6 @@ impl Editor {
                                 .child("Drag onto a page to sign"),
                         )
                     }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .gap_1p5()
-                    .px_4()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(ui::border())
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(ui::text_tertiary())
-                            .mb_0p5()
-                            .child("Shortcuts"),
-                    )
-                    .child(shortcut("Undo / Redo", "⌘Z  ⇧⌘Z"))
-                    .child(shortcut("Copy / Paste field", "⌘C  ⌘V"))
-                    .child(shortcut("Duplicate field", "⌘D"))
-                    .child(shortcut("Delete field", "⌫"))
-                    .child(shortcut("Nudge (Shift = 10pt)", "←↑→↓")),
             )
     }
 
@@ -4170,22 +4626,19 @@ impl Editor {
             thumbs.push(div().flex_none().h(px(height)).into_any_element());
         }
 
-        div()
+        let list = div()
             .id("thumb-rail")
             .flex()
             .flex_col()
-            .flex_none()
+            .flex_1()
+            .min_h_0()
             .items_center()
-            .w(px(THUMB_RAIL_W))
-            .h_full()
+            .w_full()
             .overflow_y_scroll()
             .track_scroll(&self.thumbs_scroll)
             .gap(px(THUMB_GAP))
-            .pt_4()
+            .pt_3()
             .pb_6()
-            .bg(ui::sidebar_bg())
-            .border_l_1()
-            .border_color(ui::border())
             .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<PageDrag>, _, cx| {
                 let target = e.bounds.contains(&e.event.position).then(|| this.page_gap_at(e.event.position.y));
                 if target != this.page_drop_target {
@@ -4199,16 +4652,124 @@ impl Editor {
                 }
                 cx.notify();
             }))
+            .children(thumbs);
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(THUMB_RAIL_W))
+            .h_full()
+            .bg(ui::sidebar_bg())
+            .border_l_1()
+            .border_color(ui::border())
             .child(
                 div()
-                    .w_full()
-                    .px_4()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Pages"),
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .pl_4()
+                    .pr_2()
+                    .pt_3()
+                    .pb_1()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Pages"))
+                    .child(
+                        ui::icon_button("add-pages", "plus")
+                            .tooltip(ui::tooltip("Add pages from another PDF", None))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_pages(window, cx))),
+                    ),
             )
-            .children(thumbs)
+            .child(list)
             .into_any_element()
+    }
+
+    /// The modal question of which pages of another PDF to add.
+    fn render_import_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let prompt = self.import_prompt.as_ref()?;
+        let count = prompt.source.pages.len();
+        let chosen = parse_page_ranges(&prompt.text, count);
+        let after = self.doc.as_ref().map_or(0, |d| d.page_count());
+        let note = match &chosen {
+            Ok(pages) => format!(
+                "{} of its {count} pages will be added after page {after}.",
+                if pages.len() == count { "All".to_string() } else { pages.len().to_string() }
+            ),
+            Err(problem) => problem.clone(),
+        };
+        let wrong = chosen.is_err() && !prompt.text.trim().is_empty();
+        let field = ui::text_field(if wrong { ui::danger() } else { ui::accent() })
+            .shadow(ui::ring())
+            .when(prompt.text.is_empty(), |d| d.child(div().text_color(ui::text_tertiary()).child("1-3, 5")))
+            // The suggestion looks selected: typing replaces it.
+            .when(!prompt.text.is_empty(), |d| {
+                d.child(div().rounded(px(2.)).when(prompt.untouched, |d| d.bg(ui::accent().opacity(0.25))).child(prompt.text.clone()))
+            })
+            .child(ui::caret(px(16.)));
+        let card = div()
+            .w(px(360.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .rounded_xl()
+            .bg(ui::surface())
+            .border_1()
+            .border_color(ui::border())
+            .shadow(ui::lifted_shadow())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui::icon("file", ui::accent()).size(px(18.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Add pages from “{}”", file_name(&prompt.path))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(ui::text_secondary())
+                    .child("Which pages? Type page numbers and ranges, like 1-3, 5."),
+            )
+            .child(field)
+            .child(div().text_xs().text_color(if wrong { ui::danger() } else { ui::text_tertiary() }).child(note))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        ui::secondary_button("import-cancel", "close", "Cancel")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_import(cx))),
+                    )
+                    .child(
+                        ui::primary_button("import-add", "plus", "Add Pages")
+                            .when(chosen.is_err(), |d| d.opacity(0.5))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit_import(window, cx))),
+                    ),
+            );
+        Some(
+            div()
+                .id("import-prompt")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x0000004d))
+                .font_family(".SystemUIFont")
+                .text_color(ui::text_primary())
+                .child(card)
+                .into_any_element(),
+        )
     }
 
     /// The modal password dialog for a protected PDF.
@@ -4225,6 +4786,14 @@ impl Editor {
                 "Password",
                 "That password isn't right. Try again.",
                 "Open",
+                "open",
+            ),
+            PasswordPurpose::Import => (
+                format!("“{name}” is password protected"),
+                "Enter its password to add pages from it.",
+                "Password",
+                "That password isn't right. Try again.",
+                "Continue",
                 "open",
             ),
             PasswordPurpose::NewPassword { first: None } => (
@@ -4556,6 +5125,11 @@ impl Render for Editor {
                 _ => {}
             }
         }
+        // A sidebar came or went: this frame lays the page view out at its new
+        // size, and the next one can fit the zoom to it.
+        if std::mem::take(&mut self.refit) {
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+        }
         self.sync_watermark_preview(window, cx);
         let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
         self.page_slots.resize_with(page_count, Default::default);
@@ -4584,11 +5158,16 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &ZoomFitWidth, window, cx| this.set_zoom_mode(ZoomMode::FitWidth, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitPage, window, cx| this.set_zoom_mode(ZoomMode::FitPage, window, cx)))
             .on_action(cx.listener(|this, _: &AddSignature, window, cx| this.add_signature_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &AddPages, window, cx| this.add_pages(window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, window, cx| this.set_zoom(this.zoom * 1.2, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.set_zoom(this.zoom / 1.2, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.set_zoom(1.0, window, cx)))
             .on_action(cx.listener(|this, _: &CloseDocument, window, cx| this.request_close(window, cx)))
             .on_action(cx.listener(|this, _: &DiscardChanges, window, cx| this.request_discard(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _, cx| this.toggle_left_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleRightSidebar, _, cx| this.toggle_right_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &KeyboardShortcuts, _, cx| this.toggle_help_menu(cx)))
+            .on_action(cx.listener(|_, _: &VisitWebsite, _, cx| cx.open_url(crate::about::REPOSITORY)))
             .on_action(cx.listener(|this, _: &About, window, cx| this.show_about(window, cx)))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             .on_key_down(cx.listener(Self::key_down))
@@ -4602,15 +5181,15 @@ impl Render for Editor {
                     cx.notify();
                 }
             }))
-            .child(self.render_titlebar(client_decorated, window.is_maximized(), cx))
+            .child(self.render_titlebar(client_decorated, window.is_maximized(), window.viewport_size().height, cx))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
+                    .when(self.settings.show_left_sidebar, |d| d.child(self.render_sidebar(cx)))
                     .child(self.render_pages(cx))
-                    .when(self.doc.is_some(), |d| d.child(self.render_thumbnail_rail(cx))),
+                    .when(self.doc.is_some() && self.settings.show_right_sidebar, |d| d.child(self.render_thumbnail_rail(cx))),
             )
             .child(
                 div()
@@ -4639,7 +5218,7 @@ impl Render for Editor {
                                 .text_color(ui::text_tertiary())
                                 .hover(|s| s.text_color(ui::text_primary()))
                                 .child(ui::icon("info", ui::text_tertiary()).size(px(12.)))
-                                .child(format!("PDF Signer {}", crate::about::VERSION))
+                                .child(format!("PatraPDF {}", crate::about::VERSION))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_about(window, cx))),
                         )
                     })
@@ -4652,6 +5231,7 @@ impl Render for Editor {
                     }),
             )
             .when(client_decorated && !window.is_maximized(), |d| d.children(resize_handles()))
+            .when_some(self.render_import_prompt(cx), |d, prompt| d.child(prompt))
             .when_some(self.render_password_prompt(cx), |d, prompt| d.child(prompt))
     }
 }
@@ -4755,6 +5335,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary--", ZoomOut, None),
         KeyBinding::new("secondary-0", ZoomReset, None),
         KeyBinding::new("secondary-shift-s", AddSignature, None),
+        KeyBinding::new("secondary-b", ToggleLeftSidebar, None),
+        KeyBinding::new("secondary-alt-b", ToggleRightSidebar, None),
+        KeyBinding::new("secondary-/", KeyboardShortcuts, None),
         KeyBinding::new("secondary-w", CloseDocument, None),
         KeyBinding::new("secondary-q", Quit, None),
     ]);
@@ -4766,7 +5349,7 @@ pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpu
         gpui::WindowOptions {
             window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("PDF Signer".into()),
+                title: Some("PatraPDF".into()),
                 // On macOS the toolbar doubles as the title bar, around the traffic lights.
                 appears_transparent: cfg!(target_os = "macos"),
                 traffic_light_position: cfg!(target_os = "macos").then(|| point(px(18.), px(19.))),
@@ -4798,7 +5381,7 @@ mod tests {
 
     /// Where this run's tests keep their files.
     fn test_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patrapdf_ui_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -5428,6 +6011,171 @@ mod tests {
         });
     }
 
+    #[test]
+    fn page_ranges_are_read_as_typed() {
+        assert_eq!(parse_page_ranges("1-3, 5", 6), Ok(vec![0, 1, 2, 4]));
+        assert_eq!(parse_page_ranges("1 - 2,4 6", 6), Ok(vec![0, 1, 3, 5]));
+        assert_eq!(parse_page_ranges("1–2", 6), Ok(vec![0, 1]));
+        // In the order given, each page once.
+        assert_eq!(parse_page_ranges("3-1", 6), Ok(vec![2, 1, 0]));
+        assert_eq!(parse_page_ranges("2, 1-3, 2", 6), Ok(vec![1, 0, 2]));
+        for wrong in ["", " , ", "0", "7", "2-9", "3-", "-3", "1-2-3", "x"] {
+            assert!(parse_page_ranges(wrong, 6).is_err(), "{wrong:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn pages_of_another_pdf_are_added_and_come_back_from_recents(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let original = editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().path.clone());
+        // Another copy of the sample: an upright page, then one on its side.
+        let other = original.with_file_name(format!("more-{}", file_name(&original)));
+        std::fs::write(&other, crate::pdf::tests::sample_pdf()).unwrap();
+        let order = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().order.clone());
+
+        // Choosing a PDF asks which of its pages, suggesting all of them.
+        editor.update_in(cx, |e, window, cx| e.read_pages_from(other.clone(), None, window, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let prompt = e.import_prompt.as_ref().expect("asks which pages");
+            assert_eq!((prompt.text.as_str(), prompt.untouched), ("1-2", true));
+        });
+        // Typing replaces the suggestion. Pages that aren't there can't be added.
+        cx.simulate_input("3");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert_eq!(e.import_prompt.as_ref().map(|p| p.text.as_str()), Some("3")));
+        assert_eq!(order(cx), [0, 1]);
+        cx.simulate_keystrokes("backspace");
+        cx.simulate_input("2, 1");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        // Its second page, then its first, after the document's own.
+        assert_eq!(order(cx), [0, 1, 2, 3]);
+        editor.read_with(cx, |e, _| {
+            assert!(e.import_prompt.is_none());
+            let doc = e.doc.as_ref().unwrap();
+            let sizes: Vec<_> = doc.geoms().map(|g| (g.width, g.height)).collect();
+            assert_eq!(sizes, [(612., 792.), (750., 580.), (750., 580.), (612., 792.)]);
+            assert!(doc.pages.iter().all(|p| p.thumb.is_some() && p.image.is_some()), "the new pages are drawn");
+            assert_eq!(doc.imports, [PageImport { path: other.clone(), pages: vec![1, 0] }]);
+            assert!(e.dirty);
+            assert_eq!(e.current_page(), Some(2), "the first new page is in view");
+        });
+
+        // Adding is undoable, and added pages are deleted and moved like any other.
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(order(cx), [0, 1]);
+        cx.simulate_keystrokes("secondary-shift-z");
+        assert_eq!(order(cx), [0, 1, 2, 3]);
+        editor.update(cx, |e, cx| {
+            e.delete_page(2, cx);
+            e.move_page(2, 0, cx);
+        });
+        assert_eq!(order(cx), [3, 0, 1]);
+
+        // Something on the added page, then save.
+        editor.update(cx, |e, cx| e.place_tool(Tool::Check, 0, 100., 100., cx));
+        let out = test_dir().join(format!("merged-{}", file_name(&original)));
+        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        let saved = pdf::load(std::fs::read(&out).unwrap()).unwrap();
+        let sizes: Vec<_> = saved.pages.iter().map(|g| (g.width, g.height)).collect();
+        assert_eq!(sizes, [(612., 792.), (612., 792.), (750., 580.)]);
+        let id = editor.read_with(cx, |e, _| {
+            assert!(!e.dirty);
+            let entry = &e.recents[0];
+            assert_eq!(entry.imports, [PageImport { path: other.clone(), pages: vec![1, 0] }]);
+            assert_eq!(entry.order.as_deref(), Some(&[3, 0, 1][..]));
+            entry.id.clone()
+        });
+
+        // Reopened from Recents, the pages are added again and everything is as it was.
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        editor.update_in(cx, |e, window, cx| e.open_recent(&id, window, cx));
+        cx.run_until_parked();
+        assert_eq!(order(cx), [3, 0, 1]);
+        editor.read_with(cx, |e, _| {
+            let doc = e.doc.as_ref().unwrap();
+            assert_eq!((doc.path.as_path(), doc.loaded.pages.len(), doc.imports.len()), (original.as_path(), 4, 1));
+            assert_eq!((e.items.len(), e.items[0].page, e.dirty), (1, 0, false));
+        });
+
+        // Once the other PDF is gone, the saved copy is opened instead.
+        std::fs::remove_file(&other).unwrap();
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        editor.update_in(cx, |e, window, cx| e.open_recent(&id, window, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let doc = e.doc.as_ref().unwrap();
+            assert_eq!((doc.path.as_path(), doc.page_count()), (out.as_path(), 3));
+            assert!(e.items.is_empty() && e.status.contains("can't be read any more"), "{}", e.status);
+        });
+
+        // A PDF with a single page is added without asking.
+        let single = test_dir().join(format!("single-{}", file_name(&original)));
+        let two = pdf::load(crate::pdf::tests::sample_pdf()).unwrap();
+        std::fs::write(&single, two.save(&pdf::Edits { order: &[1], ..Default::default() }).unwrap().bytes).unwrap();
+        editor.update_in(cx, |e, window, cx| e.read_pages_from(single, None, window, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(e.import_prompt.is_none()));
+        assert_eq!(order(cx), [0, 1, 2, 3]);
+    }
+
+    #[gpui::test]
+    fn sidebars_hide_and_show_and_help_opens(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let page_view = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| e.pages_scroll.bounds())
+        };
+        let both = page_view(cx);
+
+        // Hiding a sidebar gives its width to the pages.
+        cx.simulate_keystrokes("secondary-b");
+        let no_left = page_view(cx);
+        assert_eq!(no_left.left(), px(0.));
+        assert_eq!(no_left.size.width - both.size.width, px(SIDEBAR_W));
+        cx.simulate_keystrokes("secondary-alt-b");
+        let neither = page_view(cx);
+        assert_eq!(neither.size.width - no_left.size.width, px(THUMB_RAIL_W));
+        // The choice is kept for next time.
+        let saved = Settings::load();
+        assert!(!saved.show_left_sidebar && !saved.show_right_sidebar);
+
+        // A menu in the sidebar closes with it.
+        cx.simulate_keystrokes("secondary-b");
+        editor.update(cx, |e, _| e.date_menu_open = true);
+        cx.simulate_keystrokes("secondary-b");
+        editor.read_with(cx, |e, _| assert!(!e.date_menu_open && !e.settings.show_left_sidebar));
+
+        cx.simulate_keystrokes("secondary-b secondary-alt-b");
+        assert_eq!(page_view(cx), both);
+        let saved = Settings::load();
+        assert!(saved.show_left_sidebar && saved.show_right_sidebar);
+
+        // Help lists the shortcuts; Escape or a click elsewhere closes it.
+        cx.simulate_keystrokes("secondary-/");
+        editor.read_with(cx, |e, _| assert!(e.help_menu_open));
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |e, _| assert!(!e.help_menu_open));
+        cx.simulate_keystrokes("secondary-/");
+        cx.run_until_parked();
+        cx.simulate_click(both.center(), Modifiers::none());
+        editor.read_with(cx, |e, _| assert!(!e.help_menu_open));
+
+        // Every shortcut listed is one the app has, written in a way `ui::keys` understands.
+        for (label, keys) in SHORTCUTS.iter().flat_map(|(_, rows)| rows.iter()) {
+            assert!(!label.is_empty() && !ui::keys(keys).is_empty(), "{label}");
+        }
+    }
+
     #[gpui::test]
     fn fit_zoom_thumbnails_and_page_navigation(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
@@ -5761,6 +6509,7 @@ mod tests {
         use crate::recents::{SavedItem, SavedKind};
         let id = "test-entry".to_string();
         let entries = vec![RecentEntry {
+            imports: Vec::new(),
             id: id.clone(),
             original: original.clone(),
             output: original.with_file_name("out.pdf"),
