@@ -16,7 +16,11 @@ use gpui::{
     size,
 };
 
-use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, Signature, TEXT_FONT, TextMetrics};
+use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, RedactFill, Signature, TEXT_FONT, TextMetrics};
+
+mod fields;
+mod input;
+use crate::forms::{FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
 use crate::gestures;
@@ -30,6 +34,7 @@ actions!(
     [
         Open,
         Save,
+        SaveWithPassword,
         Undo,
         Redo,
         Copy,
@@ -138,6 +143,8 @@ struct Snapshot {
     items: Vec<Item>,
     watermark: Option<Watermark>,
     order: Vec<usize>,
+    /// Values of the document's form fields.
+    fields: Vec<FieldValue>,
 }
 
 /// The rendered watermark preview, one transparent image per page size.
@@ -217,6 +224,36 @@ impl OpenDoc {
     }
 }
 
+/// Asking for the password of a protected PDF, or for a new password for a
+/// copy of one.
+struct PasswordPrompt {
+    path: PathBuf,
+    text: String,
+    /// The last password tried was wrong (or, for a new password, the repeat
+    /// didn't match).
+    wrong: bool,
+    /// The recent document being reopened, restored once it's open.
+    recent: Option<String>,
+    purpose: PasswordPurpose,
+}
+
+#[derive(Clone, PartialEq)]
+enum PasswordPurpose {
+    /// Opening the document at `path`.
+    Open,
+    /// Choosing the password for a saved copy; `first` is set once it's been
+    /// typed, while it's typed again to confirm.
+    NewPassword { first: Option<String> },
+}
+
+/// What a saved copy of a password-protected document should be protected with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SaveProtection {
+    Keep,
+    Change,
+    Remove,
+}
+
 /// Payload when dragging a page thumbnail to reorder pages.
 #[derive(Clone)]
 struct PageDrag {
@@ -283,6 +320,18 @@ pub struct Editor {
     watermark: Option<Watermark>,
     saved_watermark: Option<Watermark>,
     saved_order: Vec<usize>,
+    /// Values of the document's own form fields (same order as `LoadedPdf::form`).
+    fields: Vec<FieldValue>,
+    saved_fields: Vec<FieldValue>,
+    /// The form field being typed into.
+    field_editing: Option<usize>,
+    /// The form field (a combo box) whose list of options is open.
+    choice_open: Option<usize>,
+    /// The colour of new redaction boxes: the one chosen last.
+    redact_fill: RedactFill,
+    /// The search in the Recents gallery, and whether it's being typed into.
+    recents_query: String,
+    recents_search_focused: bool,
     /// While dragging a page thumbnail: the gap it would be dropped into (0 = before page 1).
     page_drop_target: Option<usize>,
     /// The mouse went down on the (self-drawn) title bar; a drag now moves the window.
@@ -296,10 +345,13 @@ pub struct Editor {
     watermark_preview: WatermarkPreview,
     /// Recently saved documents, shown in the gallery when no document is open.
     recents: Vec<RecentEntry>,
+    password_prompt: Option<PasswordPrompt>,
     next_id: u64,
     selected: Option<u64>,
     editing: Option<u64>,
     typing_checkpointed: bool,
+    /// Text an input method is composing (a byte range of the text being typed into).
+    ime_marked: Option<std::ops::Range<usize>>,
     tool: Tool,
     zoom: f32,
     drag: Option<DragState>,
@@ -386,10 +438,19 @@ impl Editor {
             watermark_checkpointed: false,
             watermark_preview: WatermarkPreview::default(),
             recents: recents::load(),
+            password_prompt: None,
             next_id: 1,
             selected: None,
             editing: None,
             typing_checkpointed: false,
+            fields: Vec::new(),
+            saved_fields: Vec::new(),
+            field_editing: None,
+            choice_open: None,
+            redact_fill: RedactFill::Black,
+            recents_query: String::new(),
+            recents_search_focused: false,
+            ime_marked: None,
             tool: Tool::Select,
             zoom: 1.0,
             drag: None,
@@ -485,17 +546,38 @@ impl Editor {
         .detach();
     }
 
+    /// Open a PDF. Returns false if it couldn't be opened, or needs a password
+    /// first (then the password prompt is showing).
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.open_with_password(path, None, window, cx)
+    }
+
+    fn open_with_password(&mut self, path: PathBuf, password: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let loaded = std::fs::read(&path)
             .map_err(anyhow::Error::from)
-            .and_then(pdf::load);
+            .and_then(|bytes| pdf::open_for_editing(bytes, password.as_deref()));
         let loaded = match loaded {
             Ok(l) => l,
+            Err(e) if e.downcast_ref::<pdf::PasswordError>().is_some() => {
+                let recent = self.password_prompt.take().filter(|p| p.path == path).and_then(|p| p.recent);
+                self.password_prompt = Some(PasswordPrompt {
+                    path,
+                    text: String::new(),
+                    wrong: password.is_some(),
+                    recent,
+                    purpose: PasswordPurpose::Open,
+                });
+                window.focus(&self.focus);
+                cx.notify();
+                return false;
+            }
             Err(e) => {
+                self.password_prompt = None;
                 self.show_error(&format!("Couldn't open {}", file_name(&path)), &e.to_string(), window, cx);
                 return false;
             }
         };
+        self.password_prompt = None;
 
         self.release_document(window, cx);
 
@@ -509,7 +591,23 @@ impl Editor {
                 rendered_scale: 0.0,
             })
             .collect();
-        self.status = format!("Opened {} ({} pages)", file_name(&path), loaded.pages.len()).into();
+        let field_count = loaded.form.len();
+        self.status = format!(
+            "Opened {} ({} pages){}{}",
+            file_name(&path),
+            loaded.pages.len(),
+            match field_count {
+                0 => String::new(),
+                1 => " · 1 form field to fill in".into(),
+                n => format!(" · {n} form fields to fill in"),
+            },
+            if loaded.password.is_some() { " · password protected" } else { "" }
+        )
+        .into();
+        self.fields = loaded.form.iter().map(|f| f.value.clone()).collect();
+        self.saved_fields = self.fields.clone();
+        self.recents_query.clear();
+        self.recents_search_focused = false;
         window.set_window_title(&format!("PDF Signer — {}", file_name(&path)));
         let order = (0..loaded.pages.len()).collect::<Vec<_>>();
         self.saved_order = order.clone();
@@ -576,6 +674,8 @@ impl Editor {
 
     fn close_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.release_document(window, cx);
+        self.fields.clear();
+        self.saved_fields.clear();
         self.items.clear();
         self.saved_items.clear();
         self.watermark = None;
@@ -612,6 +712,7 @@ impl Editor {
         self.checkpoint();
         self.items = self.saved_items.clone();
         self.watermark = self.saved_watermark.clone();
+        self.fields = self.saved_fields.clone();
         if let Some(doc) = self.doc.as_mut().filter(|_| !self.saved_order.is_empty()) {
             doc.order = self.saved_order.clone();
         }
@@ -624,43 +725,53 @@ impl Editor {
         cx.notify();
     }
 
+    fn submit_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = &mut self.password_prompt else { return };
+        if prompt.text.is_empty() {
+            return;
+        }
+        if let PasswordPurpose::NewPassword { first } = &mut prompt.purpose {
+            let typed = std::mem::take(&mut prompt.text);
+            match first.take() {
+                // Now type it again.
+                None => {
+                    *first = Some(typed);
+                    prompt.wrong = false;
+                }
+                Some(first) if first == typed => {
+                    self.password_prompt = None;
+                    self.save_with_password(Some(first), window, cx);
+                }
+                // Didn't match: start over.
+                Some(_) => prompt.wrong = true,
+            }
+            cx.notify();
+            return;
+        }
+        let (path, password, recent) = (prompt.path.clone(), prompt.text.clone(), prompt.recent.clone());
+        if self.open_with_password(path, Some(password), window, cx) {
+            if let Some(entry) = recent.and_then(|id| self.recents.iter().find(|e| e.id == id).cloned()) {
+                self.restore_recent(&entry, cx);
+            }
+        }
+    }
+
+    fn cancel_password(&mut self, cx: &mut Context<Self>) {
+        self.password_prompt = None;
+        cx.notify();
+    }
+
     /// Reopen a document from the gallery with its fields still editable.
     fn open_recent(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.recents.iter().find(|e| e.id == id).cloned() else { return };
         if entry.original.exists() {
             if !self.open_path(entry.original.clone(), window, cx) {
+                if let Some(prompt) = self.password_prompt.as_mut().filter(|p| p.path == entry.original) {
+                    prompt.recent = Some(entry.id.clone());
+                }
                 return;
             }
-            if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
-                let n = doc.pages.len();
-                let mut seen = vec![false; n];
-                let valid = !order.is_empty() && order.iter().all(|&i| i < n && !std::mem::replace(&mut seen[i], true));
-                if valid {
-                    doc.order = order.clone();
-                    self.saved_order = order.clone();
-                }
-            }
-            let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
-            let mut next_id = self.next_id;
-            self.items = recents::restore_items(&entry, page_count, || {
-                next_id += 1;
-                next_id
-            });
-            self.next_id = next_id + 1;
-            self.saved_items = self.items.clone();
-            self.watermark = entry.watermark.clone();
-            self.saved_watermark = self.watermark.clone();
-            if let Some(doc) = &mut self.doc {
-                doc.last_output = Some(entry.output.clone());
-            }
-            let n = self.items.len();
-            self.status = format!(
-                "Reopened {} with {n} editable field{}",
-                file_name(&entry.original),
-                if n == 1 { "" } else { "s" }
-            )
-            .into();
-            cx.notify();
+            self.restore_recent(&entry, cx);
         } else if entry.output.exists() {
             if self.open_path(entry.output.clone(), window, cx) {
                 self.status = format!(
@@ -681,6 +792,102 @@ impl Editor {
                 cx,
             );
         }
+    }
+
+    /// Bring back the fields, watermark and page order saved with a recent entry
+    /// (its original has just been opened).
+    fn restore_recent(&mut self, entry: &RecentEntry, cx: &mut Context<Self>) {
+        {
+            if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
+                let n = doc.pages.len();
+                let mut seen = vec![false; n];
+                let valid = !order.is_empty() && order.iter().all(|&i| i < n && !std::mem::replace(&mut seen[i], true));
+                if valid {
+                    doc.order = order.clone();
+                    self.saved_order = order.clone();
+                }
+            }
+            let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
+            let mut next_id = self.next_id;
+            self.items = recents::restore_items(entry, page_count, || {
+                next_id += 1;
+                next_id
+            });
+            self.next_id = next_id + 1;
+            self.saved_items = self.items.clone();
+            self.watermark = entry.watermark.clone();
+            self.saved_watermark = self.watermark.clone();
+            if let Some(doc) = &mut self.doc {
+                doc.last_output = Some(entry.output.clone());
+            }
+            // Form values, matched by field name (the original may have changed since).
+            let form = self.form();
+            for (name, value) in &entry.fields {
+                let Some(i) = form.iter().position(|f| f.name == *name) else { continue };
+                let fits = match (&form[i].kind, value) {
+                    (FieldKind::CheckBox | FieldKind::Radio { .. }, FieldValue::On(on)) => {
+                        on.as_ref().is_none_or(|on| form[i].widgets.iter().any(|w| w.on_state.as_ref() == Some(on)))
+                    }
+                    (FieldKind::Text { .. } | FieldKind::Choice { .. }, FieldValue::Text(_)) => true,
+                    _ => false,
+                };
+                if fits {
+                    self.fields[i] = value.clone();
+                }
+            }
+            self.saved_fields = self.fields.clone();
+            let filled = self.fields.iter().zip(form.iter()).filter(|(v, f)| **v != f.value).count();
+            let n = self.items.len() + filled;
+            self.status = match n {
+                0 => format!("Reopened {}", file_name(&entry.original)),
+                n => format!("Reopened {} with {n} editable field{}", file_name(&entry.original), if n == 1 { "" } else { "s" }),
+            }
+            .into();
+            cx.notify();
+        }
+    }
+
+    /// Typing into the Recents search box (only while the gallery shows).
+    fn searching_recents(&self) -> bool {
+        self.recents_search_focused && self.doc.is_none() && !self.recents.is_empty()
+    }
+
+    fn start_recents_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.recents_search_focused = true;
+        self.ime_marked = None;
+        cx.notify();
+    }
+
+    /// The recent documents that match the search, most recent first.
+    fn shown_recents(&self) -> Vec<&RecentEntry> {
+        self.recents.iter().filter(|e| recents::matches(e, &self.recents_query)).collect()
+    }
+
+    fn clear_recents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Clear all recent documents?",
+            Some("They're only removed from this list. The PDFs themselves are kept."),
+            &["Clear Recents", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                match recents::clear(std::mem::take(&mut this.recents)) {
+                    Ok(entries) => this.recents = entries,
+                    Err(e) => this.status = format!("Couldn't update recents: {e:#}").into(),
+                }
+                this.recents_query.clear();
+                this.recents_search_focused = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn remove_recent(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -780,6 +987,63 @@ impl Editor {
             cx.notify();
             return;
         };
+        let Some(password) = doc.loaded.password.clone() else {
+            self.save_with_password(None, window, cx);
+            return;
+        };
+        // A protected document: ask how to protect the copy.
+        const CHOICES: [(&str, Option<SaveProtection>); 4] = [
+            ("Keep Password", Some(SaveProtection::Keep)),
+            ("Change Password…", Some(SaveProtection::Change)),
+            ("Remove Password", Some(SaveProtection::Remove)),
+            ("Cancel", None),
+        ];
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("“{}” is password protected", file_name(&doc.path)),
+            Some("Should the copy you save need the same password to open, a new one, or none?"),
+            &CHOICES.map(|(label, _)| label),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = answer.await else { return };
+            let Some(Some(choice)) = CHOICES.get(answer).map(|(_, c)| *c) else { return };
+            this.update_in(cx, |this, window, cx| this.save_protected(choice, password, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn save_protected(&mut self, choice: SaveProtection, password: String, window: &mut Window, cx: &mut Context<Self>) {
+        match choice {
+            SaveProtection::Keep => self.save_with_password(Some(password), window, cx),
+            SaveProtection::Remove => self.save_with_password(None, window, cx),
+            SaveProtection::Change => self.save_with_new_password(window, cx),
+        }
+    }
+
+    /// Ask for a password (typed twice), then save a copy that needs it to open.
+    fn save_with_new_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.close_menus();
+        let Some(doc) = &self.doc else {
+            self.status = "Nothing to save — open a PDF first.".into();
+            cx.notify();
+            return;
+        };
+        self.password_prompt = Some(PasswordPrompt {
+            path: doc.path.clone(),
+            text: String::new(),
+            wrong: false,
+            recent: None,
+            purpose: PasswordPurpose::NewPassword { first: None },
+        });
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Ask where to save, then save a copy, encrypted with `password` if set.
+    fn save_with_password(&mut self, password: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
         // Suggest the previous output if there is one, otherwise "<name>-signed.pdf" next to the original.
         let (dir, suggested) = match &doc.last_output {
             Some(out) => (
@@ -799,6 +1063,8 @@ impl Editor {
         let order = doc.order.clone();
         let page_count = order.len();
         let items = self.items.clone();
+        let form = doc.loaded.form.clone();
+        let values = self.fields.clone();
         let watermark = self.watermark.clone().filter(|w| !w.text.trim().is_empty());
         let redacted_pages = items
             .iter()
@@ -808,6 +1074,14 @@ impl Editor {
             .len();
         let metrics = self.metrics;
         let revision = self.revision;
+        // How the copy's protection differs from the original's, for the status line.
+        let protection_note = match (&doc.loaded.password, &password) {
+            (Some(_), None) => " without a password",
+            (Some(old), Some(new)) if old != new => " with the new password",
+            (None, Some(_)) => " with a password",
+            _ => "",
+        };
+        let protected = password.is_some();
 
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picker.await else { return };
@@ -815,16 +1089,36 @@ impl Editor {
             let saved_items = items.clone();
             let saved_watermark = watermark.clone();
             let saved_order = order.clone();
+            let saved_fields = values.clone();
+            // Remembered by name: the values that differ from the file's own.
+            let filled: Vec<(String, FieldValue)> = form
+                .iter()
+                .zip(&values)
+                .filter(|(f, v)| f.value != **v)
+                .map(|(f, v)| (f.name.clone(), v.clone()))
+                .collect();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let out = pdf::write(&bytes, &pages, &order, &items, watermark.as_ref(), metrics)?;
-                    std::fs::write(&target, &out)?;
-                    anyhow::Ok(recents::make_thumbnail(out))
+                    let edits = pdf::Edits {
+                        order: &order,
+                        items: &items,
+                        watermark: watermark.as_ref(),
+                        metrics,
+                        password: password.as_deref(),
+                        form: &form,
+                        values: &values,
+                    };
+                    let written = pdf::save(&bytes, &pages, &edits)?;
+                    std::fs::write(&target, &written.bytes)?;
+                    // No thumbnail of a protected document: it would be an unprotected
+                    // picture of its first page.
+                    let thumbnail = if protected { None } else { recents::make_thumbnail(written.bytes) };
+                    anyhow::Ok((thumbnail, written.missing))
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match result {
-                Ok(thumbnail) => {
+                Ok((thumbnail, missing)) => {
                     // Only clear "Edited" if nothing changed while the save was running.
                     if this.revision == revision && this.doc.as_ref().is_some_and(|d| d.path == original) {
                         this.dirty = false;
@@ -832,17 +1126,23 @@ impl Editor {
                     this.saved_items = saved_items.clone();
                     this.saved_watermark = saved_watermark.clone();
                     this.saved_order = saved_order.clone();
+                    if this.doc.as_ref().is_some_and(|d| d.path == original) {
+                        this.saved_fields = saved_fields.clone();
+                    }
                     if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
                         doc.last_output = Some(path.clone());
                     }
+                    // Recents are stored unencrypted, so for a protected document they
+                    // remember only where it is, not what was typed into it.
                     let recorded = recents::record(
                         this.recents.clone(),
                         &original,
                         &path,
                         page_count,
-                        &saved_items,
-                        saved_watermark.as_ref(),
+                        if protected { &[] } else { &saved_items },
+                        saved_watermark.as_ref().filter(|_| !protected),
                         Some(saved_order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p)),
+                        if protected { Vec::new() } else { filled.clone() },
                         thumbnail,
                     );
                     match recorded {
@@ -850,15 +1150,28 @@ impl Editor {
                         Err(e) => eprintln!("could not update recents: {e:#}"),
                     }
                     this.status = match redacted_pages {
-                        0 => format!("Saved {}", path.display()),
+                        0 => format!("Saved {}{protection_note}", path.display()),
                         n => format!(
-                            "Saved {} · {n} redacted page{} saved as image{} (their text is no longer selectable)",
+                            "Saved {}{protection_note} · {n} redacted page{} saved as image{} (their text is no longer selectable)",
                             path.display(),
                             if n == 1 { "" } else { "s" },
                             if n == 1 { "" } else { "s" },
                         ),
                     }
                     .into();
+                    if !missing.is_empty() {
+                        let chars: String = missing.iter().flat_map(|c| [*c, ' ']).collect();
+                        let _ = window.prompt(
+                            PromptLevel::Warning,
+                            "Some characters were left out",
+                            Some(&format!(
+                                "No font on this computer can draw these characters, so they aren't in the saved PDF: {}\n\nEverything else was saved.",
+                                chars.trim_end()
+                            )),
+                            &["OK"],
+                            cx,
+                        );
+                    }
                     cx.notify();
                 }
                 Err(e) => this.show_error("Couldn't save the PDF", &format!("{e:#}"), window, cx),
@@ -989,6 +1302,7 @@ impl Editor {
             items: self.items.clone(),
             watermark: self.watermark.clone(),
             order: self.doc.as_ref().map(|d| d.order.clone()).unwrap_or_default(),
+            fields: self.fields.clone(),
         }
     }
 
@@ -999,6 +1313,9 @@ impl Editor {
         self.watermark = snapshot.watermark;
         if let Some(doc) = self.doc.as_mut().filter(|_| !snapshot.order.is_empty()) {
             doc.order = snapshot.order;
+        }
+        if snapshot.fields.len() == self.fields.len() {
+            self.fields = snapshot.fields;
         }
         current
     }
@@ -1079,6 +1396,14 @@ impl Editor {
 
     /// ⌘V: paste text while typing, otherwise paste the copied field.
     fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = &mut self.password_prompt {
+            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                prompt.text.push_str(text.lines().next().unwrap_or_default());
+                prompt.wrong = false;
+                cx.notify();
+            }
+            return;
+        }
         if self.watermark_editing {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
                 let line = text.lines().next().unwrap_or_default().to_string();
@@ -1618,6 +1943,10 @@ impl Editor {
 
     /// Stop editing the current text box, dropping it if it's empty.
     fn finish_editing(&mut self, cx: &mut Context<Self>) {
+        self.ime_marked = None;
+        if self.field_editing.take().is_some() {
+            cx.notify();
+        }
         if let Some(id) = self.editing.take() {
             let empty = self
                 .items
@@ -1645,8 +1974,9 @@ impl Editor {
         f(text);
         // Rough size estimate (used for clamping to the page only).
         let lines = text.split('\n');
-        let longest = lines.clone().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
-        item.w = longest as f32 * *font_size * 0.55;
+        let em = |l: &str| l.chars().map(|c| if c >= '\u{2e80}' { 1.0 } else { 0.55 }).sum::<f32>();
+        let longest = lines.clone().map(em).fold(0.55, f32::max);
+        item.w = longest * *font_size;
         item.h = lines.count() as f32 * *font_size * LINE_HEIGHT;
         cx.notify();
     }
@@ -1667,6 +1997,19 @@ impl Editor {
             }
         }
         self.font_size = new_size;
+        cx.notify();
+    }
+
+    /// Colour the selected redaction box, and the ones drawn next.
+    fn set_redact_fill(&mut self, fill: RedactFill, cx: &mut Context<Self>) {
+        self.redact_fill = fill;
+        let Some(id) = self.selected else { return };
+        if self.items.iter().any(|i| i.id == id && matches!(i.kind, ItemKind::Redact { fill: f } if f != fill)) {
+            self.checkpoint();
+            if let Some(item) = self.item_mut(id) {
+                item.kind = ItemKind::Redact { fill };
+            }
+        }
         cx.notify();
     }
 
@@ -1693,7 +2036,7 @@ impl Editor {
             Tool::Redact => {
                 cx.stop_propagation();
                 self.tool = Tool::Select;
-                let id = self.add_item(page, x, y, 0., 0., ItemKind::Redact, cx);
+                let id = self.add_item(page, x, y, 0., 0., ItemKind::Redact { fill: self.redact_fill }, cx);
                 self.drag = Some(DragState {
                     id,
                     mode: DragMode::Draw,
@@ -1734,7 +2077,7 @@ impl Editor {
             }
             Tool::Redact => {
                 let (w, h) = DEFAULT_REDACTION;
-                self.add_item(page, x - w / 2., y - h / 2., w, h, ItemKind::Redact, cx);
+                self.add_item(page, x - w / 2., y - h / 2., w, h, ItemKind::Redact { fill: self.redact_fill }, cx);
             }
         }
     }
@@ -1752,14 +2095,18 @@ impl Editor {
     }
 
     fn close_menus(&mut self) {
+        if self.watermark_editing {
+            self.ime_marked = None;
+        }
         self.zoom_menu_open = false;
         self.date_menu_open = false;
         self.watermark_menu_open = false;
         self.watermark_editing = false;
+        self.choice_open = None;
     }
 
     fn any_menu_open(&self) -> bool {
-        self.zoom_menu_open || self.date_menu_open || self.watermark_menu_open
+        self.zoom_menu_open || self.date_menu_open || self.watermark_menu_open || self.choice_open.is_some()
     }
 
     fn item_mouse_down(&mut self, id: u64, mode: DragMode, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1885,9 +2232,97 @@ impl Editor {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let shortcut = ks.modifiers.platform || ks.modifiers.control;
+
+        // The password prompt takes all typing while it's open. Its text goes
+        // straight in (no input method), as in system password fields.
+        if let Some(prompt) = &mut self.password_prompt {
+            match ks.key.as_str() {
+                "escape" => self.password_prompt = None,
+                "enter" => self.submit_password(window, cx),
+                "backspace" => {
+                    prompt.text.pop();
+                }
+                _ if !shortcut => {
+                    let Some(ch) = ks.key_char.clone().filter(|c| !c.chars().any(char::is_control)) else { return };
+                    prompt.text.push_str(&ch);
+                    prompt.wrong = false;
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // The Recents gallery: typing anywhere searches it.
+        if self.doc.is_none() && !self.recents.is_empty() {
+            if self.searching_recents() {
+                match ks.key.as_str() {
+                    "escape" if self.recents_query.is_empty() => self.recents_search_focused = false,
+                    "escape" => self.recents_query.clear(),
+                    "backspace" => {
+                        self.recents_query.pop();
+                    }
+                    "enter" => {
+                        if let Some(id) = self.shown_recents().first().map(|e| e.id.clone()) {
+                            self.open_recent(&id, window, cx);
+                        }
+                    }
+                    "tab" => {}
+                    // Characters arrive through the input handler.
+                    _ => return,
+                }
+                self.ime_marked = None;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if shortcut && ks.key == "f" {
+                self.start_recents_search(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            let typed = ks.key_char.clone().filter(|c| !c.trim().is_empty() && !c.chars().any(char::is_control));
+            if let (false, Some(typed)) = (shortcut, typed) {
+                self.recents_query.push_str(&typed);
+                self.start_recents_search(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if let Some(index) = self.field_editing {
+            let multiline = self.form().get(index).is_some_and(|f| matches!(f.kind, FieldKind::Text { multiline: true, .. }));
+            match ks.key.as_str() {
+                "escape" => {
+                    self.finish_editing(cx);
+                    self.close_menus();
+                }
+                "backspace" => {
+                    if let Some(mut text) = self.field_input_text(index) {
+                        text.pop();
+                        self.type_into_field(index, text, cx);
+                    }
+                }
+                "enter" if multiline && !shortcut => {
+                    if let Some(text) = self.field_input_text(index) {
+                        self.type_into_field(index, text + "\n", cx);
+                    }
+                }
+                "enter" => {
+                    self.finish_editing(cx);
+                    self.close_menus();
+                }
+                "tab" => self.next_field(ks.modifiers.shift, window, cx),
+                // Typed characters arrive through the input handler (see `input.rs`).
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
 
         if self.editing.is_some() {
             match ks.key.as_str() {
@@ -1897,13 +2332,7 @@ impl Editor {
                 }),
                 "enter" => self.edit_text(cx, |t| t.push('\n')),
                 "tab" => {}
-                _ if !shortcut => {
-                    if let Some(ch) = ks.key_char.clone().filter(|c| !c.chars().any(char::is_control)) {
-                        self.edit_text(cx, |t| t.push_str(&ch));
-                    } else {
-                        return;
-                    }
-                }
+                // Typed characters arrive through the input handler (see `input.rs`).
                 _ => return,
             }
             cx.stop_propagation();
@@ -1920,10 +2349,6 @@ impl Editor {
                     t.pop();
                 }),
                 "tab" => {}
-                _ if !shortcut => {
-                    let Some(ch) = ks.key_char.clone().filter(|c| !c.chars().any(char::is_control)) else { return };
-                    self.edit_watermark_text(cx, |t| t.push_str(&ch));
-                }
                 _ => return,
             }
             cx.stop_propagation();
@@ -1932,6 +2357,11 @@ impl Editor {
         if ks.key == "escape" && self.any_menu_open() {
             self.close_menus();
             cx.notify();
+            return;
+        }
+        if ks.key == "tab" && self.selected.is_none() && !shortcut {
+            self.next_field(ks.modifiers.shift, window, cx);
+            cx.stop_propagation();
             return;
         }
         let Some(id) = self.selected else {
@@ -2312,6 +2742,7 @@ impl Editor {
         self.selected = None;
         self.watermark_editing = true;
         self.watermark_replace = true;
+        self.ime_marked = None;
         self.watermark_checkpointed = false;
         window.focus(&self.focus);
         cx.notify();
@@ -2424,7 +2855,8 @@ impl Editor {
                         .child(text.clone()),
                 )
             })
-            .when(editing && !selected_text, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(ui::accent())));
+            .when(editing && !selected_text, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(ui::accent())))
+            .when(editing, |d| d.relative().child(self.input_anchor(cx)));
 
         let mut panel = ui::menu_panel()
             .w(px(250.))
@@ -2555,7 +2987,22 @@ impl Editor {
             })
             .when(self.watermark_menu_open, |d| d.child(self.render_watermark_menu(cx)))
             .into_any_element();
-        Self::sidebar_section("Protect", vec![self.render_tool_row(Tool::Redact, cx), watermark_row])
+        let protected = self.doc.as_ref().is_some_and(|d| d.loaded.password.is_some());
+        let password_row = Self::sidebar_row(
+            "protect-password",
+            "lock",
+            "Password",
+            if protected { "Saving asks to keep, change or remove it" } else { "Save a copy that needs one" }.into(),
+            false,
+            has_doc,
+        )
+        .when(has_doc, |d| {
+            d.cursor(CursorStyle::PointingHand)
+                .tooltip(ui::tooltip("Save with a password", Some("⌥⌘S")))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_with_new_password(window, cx)))
+        })
+        .into_any_element();
+        Self::sidebar_section("Protect", vec![self.render_tool_row(Tool::Redact, cx), watermark_row, password_row])
     }
 
     /// The shared look of a sidebar row: icon tile, label and a one-line description.
@@ -2617,7 +3064,7 @@ impl Editor {
             let sublabel: SharedString = match tool {
                 Tool::Date => self.settings.today().into(),
                 Tool::Text => "Type anywhere on the page".into(),
-                Tool::Redact => "Black out & remove for good".into(),
+                Tool::Redact => "Cover & remove for good".into(),
                 _ => "Tick a box".into(),
             };
             let id = match tool {
@@ -2721,12 +3168,11 @@ impl Editor {
                         })
                     })
                     .child(
-                        ui::icon_button_tinted(("sig-remove", index), "trash", ui::danger())
+                        ui::floating_icon_button(("sig-remove", index), "trash", ui::danger())
                             .absolute()
                             .top(px(4.))
                             .right(px(4.))
                             .size(px(24.))
-                            .bg(ui::paper())
                             .opacity(0.)
                             .group_hover("sig-card", |s| s.opacity(1.))
                             .tooltip(ui::tooltip("Remove from library", None))
@@ -2894,9 +3340,26 @@ impl Editor {
             ItemKind::Text { text, font_size } => {
                 let fs = px(font_size * z);
                 let lh = px(font_size * LINE_HEIGHT * z);
-                let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
-                let last = lines.len() - 1;
                 let placeholder = editing && text.is_empty();
+                // Text an input method is still composing is shown underlined.
+                let marked = if editing { self.marked_range(text) } else { None };
+                let mut start = 0;
+                let lines: Vec<(String, String, String)> = text
+                    .split('\n')
+                    .map(|line| {
+                        let range = start..start + line.len();
+                        start = range.end + 1;
+                        match &marked {
+                            Some(m) if m.start >= range.start && m.end <= range.end && !m.is_empty() => {
+                                let (a, b) = (m.start - range.start, m.end - range.start);
+                                (line[..a].to_owned(), line[a..b].to_owned(), line[b..].to_owned())
+                            }
+                            _ => (line.to_owned(), String::new(), String::new()),
+                        }
+                    })
+                    .collect();
+                let last = lines.len() - 1;
+                let mut caret = Some(div().relative().w(px(1.5)).h(lh).bg(ui::accent()).child(self.input_anchor(cx)));
                 div()
                     .flex()
                     .flex_col()
@@ -2905,13 +3368,17 @@ impl Editor {
                     .line_height(lh)
                     .text_color(gpui::black())
                     .whitespace_nowrap()
-                    .children(lines.into_iter().enumerate().map(move |(i, line)| {
+                    .children(lines.into_iter().enumerate().map(|(i, (before, composing, after))| {
                         div()
                             .flex()
                             .h(lh)
                             .when(placeholder, |d| d.child(div().text_color(ui::text_tertiary()).child("Type here")))
-                            .when(!line.is_empty(), |d| d.child(line))
-                            .when(editing && i == last, |d| d.child(div().w(px(1.5)).h(lh).bg(ui::accent())))
+                            .when(!before.is_empty(), |d| d.child(before))
+                            .when(!composing.is_empty(), |d| {
+                                d.child(div().underline().text_decoration_color(ui::accent()).child(composing))
+                            })
+                            .when(!after.is_empty(), |d| d.child(after))
+                            .when(editing && i == last, |d| d.children(caret.take()))
                     }))
                     .into_any_element()
             }
@@ -2921,10 +3388,16 @@ impl Editor {
                 .object_fit(ObjectFit::Fill)
                 .into_any_element(),
             // Semi-transparent while selected, so you can see what you're covering.
-            ItemKind::Redact => div()
+            ItemKind::Redact { fill } => div()
                 .w(px(item.w * z))
                 .h(px(item.h * z))
-                .bg(gpui::black())
+                .bg(match fill {
+                    RedactFill::Black => gpui::black(),
+                    RedactFill::White => gpui::white(),
+                })
+                // A white box on a white page would be invisible; outline it here
+                // (only on screen, not in the saved file).
+                .when(*fill == RedactFill::White, |d| d.border_1().border_dashed().border_color(rgba(0x0000004d)))
                 .when(selected, |d| d.opacity(0.6))
                 .into_any_element(),
             ItemKind::Check => {
@@ -2953,6 +3426,10 @@ impl Editor {
         };
 
         let is_text = item.is_text();
+        let redact_fill = match item.kind {
+            ItemKind::Redact { fill } => Some(fill),
+            _ => None,
+        };
         let multi_page = self.doc.as_ref().is_some_and(|d| d.page_count() > 1);
         // Show the HUD above the field, or below it when there's no room on the page.
         let hud_above = item.y * z > 44.;
@@ -2973,6 +3450,34 @@ impl Editor {
             .whitespace_nowrap()
             .cursor(CursorStyle::Arrow)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when_some(redact_fill, |h, current| {
+                let swatch = |fill: RedactFill, name: &'static str, cx: &mut Context<Self>| {
+                    let active = current == fill;
+                    div()
+                        .id((name, id as usize))
+                        .size(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(rgba(0xffffff1f)))
+                        .child(
+                            div()
+                                .size(px(14.))
+                                .rounded(px(3.))
+                                .bg(if fill == RedactFill::Black { gpui::black() } else { gpui::white() })
+                                .border_1()
+                                .border_color(rgba(0xffffff8c))
+                                .when(active, |d| d.border_2().border_color(ui::accent())),
+                        )
+                        .tooltip(ui::tooltip(if fill == RedactFill::Black { "Black" } else { "White" }, None))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_redact_fill(fill, cx)))
+                };
+                h.child(swatch(RedactFill::Black, "redact-black", cx))
+                    .child(swatch(RedactFill::White, "redact-white", cx))
+                    .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgba(0xffffff26)))
+            })
             .when(is_text, |h| {
                 h.child(
                     ui::hud_button(("smaller", id as usize), "text-smaller")
@@ -3132,8 +3637,9 @@ impl Editor {
         const THUMB_BOX_H: f32 = 236.;
         const THUMB_PAD: f32 = 16.;
 
-        let cards: Vec<_> = self
-            .recents
+        let shown = self.shown_recents();
+        let searching = !self.recents_query.trim().is_empty();
+        let cards: Vec<_> = shown
             .iter()
             .map(|entry| {
                 let open_id = entry.id.clone();
@@ -3173,7 +3679,6 @@ impl Editor {
                     .shadow(ui::card_shadow())
                     .cursor(CursorStyle::PointingHand)
                     .hover(|s| s.border_color(ui::accent().opacity(0.5)).shadow(ui::lifted_shadow()))
-                    .tooltip(ui::tooltip(entry.original.display().to_string(), None))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_recent(&open_id, window, cx)))
                     .child(
                         div()
@@ -3197,10 +3702,12 @@ impl Editor {
                                     .group_hover("recent-card", |s| s.opacity(1.))
                                     .when(output_exists, |d| {
                                         d.child(
-                                            ui::icon_button(SharedString::from(format!("reveal-{}", entry.id)), "reveal")
-                                                .size(px(28.))
-                                                .bg(ui::surface())
-                                                .shadow(ui::card_shadow())
+                                            ui::floating_icon_button(
+                                                SharedString::from(format!("reveal-{}", entry.id)),
+                                                "reveal",
+                                                ui::text_primary(),
+                                            )
+                                            .size(px(28.))
                                                 .tooltip(ui::tooltip("Show saved PDF in Finder", None))
                                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                                 .on_click(move |_, _, cx| {
@@ -3210,14 +3717,12 @@ impl Editor {
                                         )
                                     })
                                     .child(
-                                        ui::icon_button_tinted(
+                                        ui::floating_icon_button(
                                             SharedString::from(format!("forget-{}", entry.id)),
                                             "close",
                                             ui::danger(),
                                         )
                                         .size(px(28.))
-                                        .bg(ui::surface())
-                                        .shadow(ui::card_shadow())
                                         .tooltip(ui::tooltip("Remove from Recents (files are kept)", None))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -3302,6 +3807,16 @@ impl Editor {
             .flex_1()
             .h_full()
             .overflow_y_scroll()
+            // Clicking anywhere else leaves the search box (keeping the search).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.recents_search_focused {
+                        this.recents_search_focused = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .bg(ui::canvas_bg())
             .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(ui::accent_soft()))
             .child(
@@ -3335,10 +3850,93 @@ impl Editor {
                                             .text_color(ui::text_secondary())
                                             .child("Reopen a document to keep editing. The fields you placed stay editable."),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(self.render_recents_search(cx))
+                                    .child(
+                                        ui::icon_button("recents-clear", "trash")
+                                            .size(px(32.))
+                                            .tooltip(ui::tooltip("Clear Recents…", None))
+                                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.clear_recents(window, cx))),
+                                    ),
                             ),
                     )
-                    .child(div().flex().flex_wrap().gap_5().child(open_tile).children(cards)),
+                    .when(searching && cards.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .py_10()
+                                .text_center()
+                                .text_sm()
+                                .text_color(ui::text_secondary())
+                                .child(format!("No recent documents match “{}”", self.recents_query.trim())),
+                        )
+                    })
+                    .child(div().flex().flex_wrap().gap_5().when(!searching, |d| d.child(open_tile)).children(cards)),
             )
+            .into_any_element()
+    }
+
+    /// The search box above the Recents gallery.
+    fn render_recents_search(&self, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.searching_recents();
+        let query = self.recents_query.clone();
+        let caret = focused.then(|| div().relative().flex_none().w(px(1.5)).h(px(15.)).bg(ui::accent()).child(self.input_anchor(cx)));
+        div()
+            .id("recents-search")
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .w(px(260.))
+            .h(px(32.))
+            .px_2()
+            .rounded_md()
+            .bg(ui::surface())
+            .border_1()
+            .border_color(if focused { ui::accent() } else { ui::border() })
+            .when(focused, |d| d.shadow(ui::ring()))
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.start_recents_search(window, cx);
+                }),
+            )
+            .child(ui::icon("search", ui::text_tertiary()).size(px(15.)).flex_none())
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_sm()
+                    .text_color(ui::text_primary())
+                    .when(!query.is_empty(), |d| d.child(query.clone()))
+                    .children(caret)
+                    .when(query.is_empty(), |d| {
+                        d.child(div().text_color(ui::text_tertiary()).child(SharedString::from(format!("Search · {}", ui::keys("⌘F")))))
+                    }),
+            )
+            .when(!query.is_empty(), |d| {
+                d.child(
+                    ui::icon_button("recents-search-clear", "close")
+                        .size(px(22.))
+                        .flex_none()
+                        .tooltip(ui::tooltip("Clear search", None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.recents_query.clear();
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -3501,6 +4099,122 @@ impl Editor {
             .into_any_element()
     }
 
+    /// The modal password dialog for a protected PDF.
+    fn render_password_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let prompt = self.password_prompt.as_ref()?;
+        let dots: String = "•".repeat(prompt.text.chars().count());
+        let name = file_name(&prompt.path);
+        let had_password = self.doc.as_ref().is_some_and(|d| d.loaded.password.is_some());
+        let (title, detail, placeholder, error, action) = match &prompt.purpose {
+            PasswordPurpose::Open => (
+                format!("“{name}” is password protected"),
+                "Enter its password to open it. When you save a copy, you can keep, change or remove the password.",
+                "Password",
+                "That password isn't right. Try again.",
+                "Open",
+            ),
+            PasswordPurpose::NewPassword { first: None } => (
+                format!("{} for the copy of “{name}”", if had_password { "New password" } else { "Password" }),
+                if had_password {
+                    "The copy you save will need this password to open. The original keeps its own."
+                } else {
+                    "The copy you save will need this password to open. The original stays as it is."
+                },
+                "Password",
+                "The passwords didn't match. Enter the password again.",
+                "Next",
+            ),
+            PasswordPurpose::NewPassword { first: Some(_) } => (
+                format!("{} for the copy of “{name}”", if had_password { "New password" } else { "Password" }),
+                "Type the password again to make sure.",
+                "Repeat the password",
+                "",
+                "Save",
+            ),
+        };
+        let field = div()
+            .flex()
+            .items_center()
+            .h(px(30.))
+            .px_2()
+            .rounded_md()
+            .bg(ui::surface())
+            .border_1()
+            .border_color(if prompt.wrong { ui::danger() } else { ui::accent() })
+            .shadow(ui::ring())
+            .text_sm()
+            .when(prompt.text.is_empty(), |d| d.child(div().text_color(ui::text_tertiary()).child(placeholder)))
+            .when(!prompt.text.is_empty(), |d| d.child(dots))
+            .child(div().w(px(1.5)).h(px(16.)).bg(ui::accent()));
+        let card = div()
+            .w(px(360.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .rounded_xl()
+            .bg(ui::surface())
+            .border_1()
+            .border_color(ui::border())
+            .shadow(ui::lifted_shadow())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui::icon("lock", ui::accent()).size(px(18.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(ui::text_secondary())
+                    .child(detail),
+            )
+            .child(field)
+            .when(prompt.wrong, |d| {
+                d.child(div().text_xs().text_color(ui::danger()).child(error))
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        ui::secondary_button("password-cancel", "close", "Cancel")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_password(cx))),
+                    )
+                    .child(
+                        ui::primary_button("password-open", if action == "Open" { "open" } else { "lock" }, action)
+                            .when(prompt.text.is_empty(), |d| d.opacity(0.5))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit_password(window, cx))),
+                    ),
+            );
+        Some(
+            div()
+                .id("password-prompt")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x0000004d))
+                .font_family(".SystemUIFont")
+                .text_color(ui::text_primary())
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
     fn render_pages(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let Some(doc) = &self.doc else {
             return if self.recents.is_empty() {
@@ -3527,6 +4241,7 @@ impl Editor {
             let mut on_page: Vec<&Item> = self.items.iter().filter(|i| i.page == index).collect();
             on_page.sort_by_key(|i| i.is_redaction());
             let items: Vec<_> = on_page.into_iter().map(|item| self.render_item(item, cx)).collect();
+            let widgets = self.render_widgets(source, cx);
             let watermark_image = self
                 .watermark
                 .as_ref()
@@ -3582,6 +4297,8 @@ impl Editor {
                 .when_some(watermark_image, |d, image| {
                     d.child(img(image).absolute().size_full().object_fit(ObjectFit::Fill))
                 })
+                // The document's own fields, then the items placed on top.
+                .children(widgets)
                 .children(items);
 
             page_elements.push(
@@ -3605,7 +4322,7 @@ impl Editor {
             Tool::Text => Some(("text", "Click on the page to add a text box")),
             Tool::Date => Some(("calendar", "Click on the page to add today's date")),
             Tool::Check => Some(("check", "Click on the page to add a checkmark")),
-            Tool::Redact => Some(("redact", "Drag over anything to black it out. It's removed from the file when you save")),
+            Tool::Redact => Some(("redact", "Drag over anything to cover it in black or white. It's removed from the file when you save")),
         };
 
         // ⌘/Ctrl + wheel zooms around the pointer. Listening in the capture phase
@@ -3731,6 +4448,7 @@ impl Render for Editor {
             .font_family(".SystemUIFont")
             .on_action(cx.listener(|this, _: &Open, window, cx| this.request_open(None, window, cx)))
             .on_action(cx.listener(|this, _: &Save, window, cx| this.save(window, cx)))
+            .on_action(cx.listener(|this, _: &SaveWithPassword, window, cx| this.save_with_new_password(window, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo(cx)))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
@@ -3808,6 +4526,7 @@ impl Render for Editor {
                     }),
             )
             .when(client_decorated && !window.is_maximized(), |d| d.children(resize_handles()))
+            .when_some(self.render_password_prompt(cx), |d, prompt| d.child(prompt))
     }
 }
 
@@ -3881,6 +4600,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-o", Open, None),
         KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-alt-s", SaveWithPassword, None),
         KeyBinding::new("secondary-z", Undo, None),
         KeyBinding::new("secondary-shift-z", Redo, None),
         KeyBinding::new("secondary-c", Copy, None),
@@ -3933,7 +4653,7 @@ pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{EntityInputHandler as _, Modifiers, TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Editor>, &mut VisualTestContext) {
         // A file per test: tests run in parallel, and rewriting a shared file
@@ -3999,6 +4719,322 @@ mod tests {
         // Undo the move, then undo the creation.
         cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert!((e.items[0].x - x).abs() < 0.01));
+    }
+
+    #[gpui::test]
+    fn typing_through_an_input_method(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+        editor.update(cx, |e, _| e.tool = Tool::Text);
+        cx.simulate_click(origin + point(px(100.), px(150.)), Modifiers::none());
+        cx.simulate_input("Ωμέγα");
+        cx.simulate_keystrokes("space");
+        // A Japanese input method composes the reading, then commits the kanji.
+        editor.update_in(cx, |e, window, cx| {
+            e.replace_and_mark_text_in_range(None, "に", None, window, cx);
+            e.replace_and_mark_text_in_range(None, "にほん", None, window, cx);
+            assert_eq!(e.marked_text_range(window, cx), Some(6..9));
+            e.replace_text_in_range(None, "日本", window, cx);
+            assert_eq!(e.marked_text_range(window, cx), None);
+        });
+        cx.simulate_keystrokes("backspace");
+        editor.read_with(cx, |e, _| match &e.items[0].kind {
+            ItemKind::Text { text, .. } => assert_eq!(text, "Ωμέγα 日"),
+            _ => panic!("expected text"),
+        });
+    }
+
+    #[gpui::test]
+    fn filling_in_the_documents_own_form(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let path = dir.join("form.pdf");
+        std::fs::write(&path, crate::pdf::tests::sample_form()).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1.0, window, cx));
+        cx.run_until_parked();
+        let origin = page_origin(&editor, cx, 0);
+        let index = |editor: &Entity<Editor>, cx: &mut VisualTestContext, name: &str| {
+            editor.read_with(cx, |e, _| e.form().iter().position(|f| f.name == name).unwrap())
+        };
+        let value = |editor: &Entity<Editor>, cx: &mut VisualTestContext, name: &str| {
+            let i = index(editor, cx, name);
+            editor.read_with(cx, |e, _| e.fields[i].clone())
+        };
+        let text = |s: &str| FieldValue::Text(s.into());
+        editor.read_with(cx, |e, _| assert!(e.status.contains("7 form fields")));
+
+        // Click into the name field and type; Tab goes on to the notes.
+        cx.simulate_click(origin + point(px(150.), px(182.)), Modifiers::none());
+        cx.simulate_input("Jane");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("line one");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("two");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(value(&editor, cx, "name"), text("Jane"));
+        assert_eq!(value(&editor, cx, "notes"), text("line one\ntwo"));
+
+        // Tick the box, pick the other radio button, choose from the combo box.
+        cx.simulate_click(origin + point(px(107.), px(384.)), Modifiers::none());
+        cx.simulate_click(origin + point(px(146.), px(426.)), Modifiers::none());
+        assert_eq!(value(&editor, cx, "agree"), FieldValue::On(Some("Yes".into())));
+        assert_eq!(value(&editor, cx, "size"), FieldValue::On(Some("L".into())));
+        // A selected radio button that can't be turned off stays on.
+        cx.simulate_click(origin + point(px(146.), px(426.)), Modifiers::none());
+        assert_eq!(value(&editor, cx, "size"), FieldValue::On(Some("L".into())));
+        cx.simulate_click(origin + point(px(150.), px(483.)), Modifiers::none());
+        let country = index(&editor, cx, "country");
+        editor.update(cx, |e, cx| {
+            assert_eq!(e.choice_open, Some(country), "the list of options opens");
+            e.choose_option(country, "US".into(), cx);
+        });
+        assert_eq!(value(&editor, cx, "country"), text("US"));
+
+        // Undo takes back one change at a time; typing counts as one.
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(value(&editor, cx, "country"), text("FR"));
+        cx.simulate_keystrokes("secondary-z secondary-z");
+        assert_eq!(value(&editor, cx, "agree"), FieldValue::On(None));
+        assert_eq!(value(&editor, cx, "notes"), text("line one\ntwo"));
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(value(&editor, cx, "notes"), text(""));
+        assert_eq!(value(&editor, cx, "name"), text("Jane"));
+        cx.simulate_keystrokes("secondary-shift-z");
+
+        // Saving puts the values into the form.
+        let (bytes, pages, form, values) = editor.read_with(cx, |e, _| {
+            let d = e.doc.as_ref().unwrap();
+            (d.loaded.bytes.clone(), d.loaded.pages.clone(), d.loaded.form.clone(), e.fields.clone())
+        });
+        let edits = crate::pdf::Edits { order: &[0, 1], form: &form, values: &values, ..Default::default() };
+        let out = crate::pdf::save(&bytes, &pages, &edits).unwrap().bytes;
+        let saved = crate::pdf::load(out).unwrap();
+        let saved: Vec<_> = saved.form.iter().map(|f| (f.name.as_str(), f.value.clone())).collect();
+        assert_eq!(saved[0], ("name", text("Jane")));
+        assert_eq!(saved[1], ("notes", text("line one\ntwo")));
+
+        // Reopening from Recents brings the values back, by field name; ones
+        // that no longer fit the field are skipped.
+        let original = editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().path.clone());
+        let entry = RecentEntry {
+            id: "form-entry".into(),
+            original: original.clone(),
+            output: original.with_file_name("form-out.pdf"),
+            saved_at: 0,
+            page_count: 2,
+            thumbnail: None,
+            thumb_width: 0,
+            thumb_height: 0,
+            items: Vec::new(),
+            watermark: None,
+            order: None,
+            fields: vec![
+                ("name".into(), text("Restored")),
+                ("size".into(), FieldValue::On(Some("L".into()))),
+                ("agree".into(), FieldValue::On(Some("Bogus".into()))),
+                ("gone".into(), text("x")),
+            ],
+        };
+        editor.update_in(cx, |e, window, cx| {
+            e.close_document(window, cx);
+            assert!(e.open_path(original, window, cx));
+            e.restore_recent(&entry, cx);
+            assert!(!e.dirty);
+        });
+        assert_eq!(value(&editor, cx, "name"), text("Restored"));
+        assert_eq!(value(&editor, cx, "size"), FieldValue::On(Some("L".into())));
+        assert_eq!(value(&editor, cx, "agree"), FieldValue::On(None));
+        editor.read_with(cx, |e, _| assert!(e.status.contains("2 editable fields"), "{}", e.status));
+    }
+
+    #[gpui::test]
+    fn recents_can_be_searched_and_cleared(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let entry = |name: &str| RecentEntry {
+            id: name.into(),
+            original: PathBuf::from(format!("/docs/{name}")),
+            output: PathBuf::from(format!("/docs/out/{name}")),
+            saved_at: 0,
+            page_count: 1,
+            thumbnail: None,
+            thumb_width: 0,
+            thumb_height: 0,
+            items: Vec::new(),
+            watermark: None,
+            order: None,
+            fields: Vec::new(),
+        };
+        editor.update_in(cx, |e, window, cx| {
+            e.close_document(window, cx);
+            e.recents = ["Lease 2024.pdf", "tax-return.pdf", "lease-renewal.pdf"].map(entry).to_vec();
+        });
+        cx.run_until_parked();
+        let shown = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.shown_recents().iter().map(|e| e.id.clone()).collect::<Vec<_>>())
+        };
+
+        // Typing anywhere in the gallery searches it; every word has to match.
+        cx.simulate_keystrokes("l e a s e");
+        editor.read_with(cx, |e, _| assert!(e.searching_recents()));
+        assert_eq!(shown(&editor, cx), ["Lease 2024.pdf", "lease-renewal.pdf"]);
+        cx.simulate_input(" ren");
+        assert_eq!(shown(&editor, cx), ["lease-renewal.pdf"]);
+        cx.simulate_keystrokes("backspace backspace backspace backspace");
+        assert_eq!(shown(&editor, cx).len(), 2);
+        cx.simulate_input("zzz");
+        assert!(shown(&editor, cx).is_empty());
+        // Escape clears the search, then leaves the box.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(shown(&editor, cx).len(), 3);
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |e, _| assert!(!e.searching_recents()));
+        cx.simulate_keystrokes("secondary-f");
+        editor.read_with(cx, |e, _| assert!(e.searching_recents()));
+
+        // Removing one, then clearing the rest (after asking).
+        editor.update(cx, |e, cx| e.remove_recent("tax-return.pdf", cx));
+        assert_eq!(shown(&editor, cx).len(), 2);
+        editor.update_in(cx, |e, window, cx| e.clear_recents(window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(shown(&editor, cx).len(), 2);
+        editor.update_in(cx, |e, window, cx| e.clear_recents(window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Clear Recents");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(e.recents.is_empty()));
+        assert!(crate::recents::load().is_empty());
+    }
+
+    #[gpui::test]
+    fn protected_pdfs_ask_for_their_password(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let path = dir.join("protected.pdf");
+        std::fs::write(&path, crate::pdf::tests::encrypted(&crate::pdf::tests::sample_pdf(), "sesame", "owner")).unwrap();
+
+        editor.update_in(cx, |e, window, cx| e.request_open(Some(path.clone()), window, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert!(e.password_prompt.is_some(), "asks for the password");
+            assert_ne!(e.doc.as_ref().unwrap().path, path, "the open document stays open meanwhile");
+        });
+
+        cx.simulate_input("nope");
+        cx.simulate_keystrokes("enter");
+        editor.read_with(cx, |e, _| {
+            let prompt = e.password_prompt.as_ref().expect("still asking");
+            assert!(prompt.wrong);
+            assert!(prompt.text.is_empty());
+        });
+
+        cx.simulate_input("sesame");
+        cx.simulate_keystrokes("enter");
+        editor.read_with(cx, |e, _| {
+            assert!(e.password_prompt.is_none());
+            let doc = e.doc.as_ref().unwrap();
+            assert_eq!(doc.path, path);
+            assert_eq!(doc.loaded.password.as_deref(), Some("sesame"));
+        });
+    }
+
+    #[gpui::test]
+    fn saving_a_protected_pdf_asks_how_to_protect_the_copy(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let path = dir.join("protected-save.pdf");
+        std::fs::write(&path, crate::pdf::tests::encrypted(&crate::pdf::tests::sample_pdf(), "sesame", "owner")).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.simulate_input("sesame");
+        cx.simulate_keystrokes("enter");
+        let opens = |out: &Path, password: Option<&str>| {
+            crate::pdf::load_with_password(std::fs::read(out).unwrap(), password).map(|_| ()).map_err(|e| e.to_string())
+        };
+        let save_as = |cx: &mut VisualTestContext, out: PathBuf| {
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_new_path());
+            cx.simulate_new_path_selection(move |_| Some(out));
+            cx.run_until_parked();
+        };
+
+        // A new password, typed twice. A repeat that doesn't match starts over.
+        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Change Password…");
+        cx.run_until_parked();
+        cx.simulate_input("new-1");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("typo");
+        cx.simulate_keystrokes("enter");
+        editor.read_with(cx, |e, _| {
+            let prompt = e.password_prompt.as_ref().expect("still asking");
+            assert!(prompt.wrong);
+            assert!(prompt.purpose == PasswordPurpose::NewPassword { first: None });
+        });
+        cx.simulate_input("new-1");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("new-1");
+        cx.simulate_keystrokes("enter");
+        let changed = dir.join("protected-new-password.pdf");
+        save_as(cx, changed.clone());
+        assert_eq!(opens(&changed, None).unwrap_err(), "this PDF is password protected");
+        assert!(opens(&changed, Some("sesame")).is_err());
+        assert_eq!(opens(&changed, Some("new-1")), Ok(()));
+        let thumbnail = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.recents[0].thumbnail.as_ref().is_some_and(|t| t.exists()))
+        };
+        editor.read_with(cx, |e, _| assert!(e.status.contains("with the new password"), "{}", e.status));
+        assert!(!thumbnail(&editor, cx), "no picture of a protected document");
+
+        // No password at all.
+        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Remove Password");
+        let open = dir.join("protected-removed.pdf");
+        save_as(cx, open.clone());
+        assert_eq!(opens(&open, None), Ok(()));
+        editor.read_with(cx, |e, _| assert!(e.status.contains("without a password"), "{}", e.status));
+        assert!(thumbnail(&editor, cx), "a copy without a password gets its thumbnail");
+
+        // The same password as the original.
+        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Keep Password");
+        let kept = dir.join("protected-kept.pdf");
+        save_as(cx, kept.clone());
+        assert_eq!(opens(&kept, Some("sesame")), Ok(()));
+        assert!(!thumbnail(&editor, cx));
+    }
+
+    #[gpui::test]
+    fn a_password_can_be_added_when_saving(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let out = dir.join("now-protected.pdf");
+        cx.simulate_keystrokes("secondary-alt-s");
+        cx.simulate_input("p4ss");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("p4ss");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(crate::pdf::load(bytes.clone()).is_err());
+        assert!(crate::pdf::load_with_password(bytes, Some("p4ss")).is_ok());
+        editor.read_with(cx, |e, _| {
+            assert!(e.status.contains("with a password"), "{}", e.status);
+            assert!(e.recents[0].thumbnail.is_none());
+            assert!(e.doc.as_ref().unwrap().loaded.password.is_none(), "the open document itself is unchanged");
+        });
     }
 
     #[gpui::test]
@@ -4258,6 +5294,27 @@ mod tests {
         cx.simulate_keystrokes("secondary-z");
         editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
 
+        // Boxes can be white instead of black; new ones take the last colour chosen.
+        let fill = |editor: &Entity<Editor>, cx: &mut VisualTestContext, i: usize| {
+            editor.read_with(cx, |e, _| match e.items[i].kind {
+                ItemKind::Redact { fill } => fill,
+                _ => panic!("expected a redaction"),
+            })
+        };
+        assert_eq!(fill(&editor, cx, 0), RedactFill::Black);
+        let first = editor.read_with(cx, |e, _| e.items[0].id);
+        editor.update(cx, |e, cx| {
+            e.selected = Some(first);
+            e.set_redact_fill(RedactFill::White, cx);
+        });
+        assert_eq!(fill(&editor, cx, 0), RedactFill::White);
+        editor.update(cx, |e, _| e.tool = Tool::Redact);
+        cx.simulate_click(origin + point(px(200.), px(400.)), Modifiers::none());
+        assert_eq!(fill(&editor, cx, 1), RedactFill::White);
+        cx.simulate_keystrokes("secondary-z secondary-z");
+        editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
+        assert_eq!(fill(&editor, cx, 0), RedactFill::Black, "changing the colour is undoable");
+
         // Redactions resize freely (no fixed aspect ratio).
         let id = editor.read_with(cx, |e, _| e.items[0].id);
         let corner = origin + point(px(360.), px(150.));
@@ -4445,10 +5502,11 @@ mod tests {
             items: vec![
                 SavedItem { page: 0, x: 40., y: 60., w: 50., h: 14., kind: SavedKind::Text { text: "Restored".into(), font_size: 14. } },
                 SavedItem { page: 1, x: 70., y: 80., w: 16., h: 16., kind: SavedKind::Check },
-                SavedItem { page: 0, x: 20., y: 20., w: 90., h: 14., kind: SavedKind::Redact },
+                SavedItem { page: 0, x: 20., y: 20., w: 90., h: 14., kind: SavedKind::Redact { fill: RedactFill::White } },
             ],
             watermark: Some(Watermark { text: "COPY".into(), ..Watermark::default() }),
             order: Some(vec![1, 0]),
+            fields: Vec::new(),
         }];
 
         editor.update_in(cx, |e, window, cx| {

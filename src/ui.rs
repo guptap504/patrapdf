@@ -89,6 +89,14 @@ pub fn hover_bg() -> Hsla {
 pub fn pressed_bg() -> Hsla {
     pick(0x00000017, 0xffffff24)
 }
+/// `surface` under the pointer, and pressed. Opaque, unlike `hover_bg`, for
+/// controls that float over other content.
+pub fn surface_hover() -> Hsla {
+    pick(0xf0f0f3ff, 0x3a3a41ff)
+}
+pub fn surface_pressed() -> Hsla {
+    pick(0xe4e4e9ff, 0x46464dff)
+}
 /// Floating dark HUDs (tooltips, field toolbar, tool hint).
 pub fn hud_bg() -> Hsla {
     pick(0x1f1f23ff, 0x3a3a41ff)
@@ -207,6 +215,20 @@ pub fn icon_button(id: impl Into<ElementId>, icon_name: &str) -> Stateful<Div> {
 
 /// Like [`icon_button`], with a custom icon colour on hover (e.g. red for delete).
 pub fn icon_button_tinted(id: impl Into<ElementId>, icon_name: &str, hover_color: Hsla) -> Stateful<Div> {
+    icon_button_on(id, icon_name, hover_color, hover_bg(), pressed_bg())
+}
+
+/// An icon button floating over other content (e.g. on a thumbnail). Its
+/// background stays opaque on hover, so it never fades into what's behind it.
+pub fn floating_icon_button(id: impl Into<ElementId>, icon_name: &str, hover_color: Hsla) -> Stateful<Div> {
+    icon_button_on(id, icon_name, hover_color, surface_hover(), surface_pressed())
+        .bg(surface())
+        .border_1()
+        .border_color(border())
+        .shadow(card_shadow())
+}
+
+fn icon_button_on(id: impl Into<ElementId>, icon_name: &str, hover_color: Hsla, hover: Hsla, pressed: Hsla) -> Stateful<Div> {
     button_base(id)
         .flex()
         .flex_none()
@@ -216,8 +238,8 @@ pub fn icon_button_tinted(id: impl Into<ElementId>, icon_name: &str, hover_color
         .rounded_md()
         .group("icon-btn")
         .cursor(CursorStyle::PointingHand)
-        .hover(|s| s.bg(hover_bg()))
-        .active(|s| s.bg(pressed_bg()))
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
         .child(icon(icon_name, text_secondary()).group_hover("icon-btn", move |s| s.text_color(hover_color)))
 }
 

@@ -40,6 +40,8 @@ icons! {
     "window-maximize" => r#"<rect x="6.5" y="6.5" width="11" height="11" rx="1"/>"#,
     "window-restore" => r#"<rect x="6" y="9" width="9" height="9" rx="1"/><path d="M9 9V7a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-2"/>"#,
     "info" => r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8v.2"/>"#,
+    "search" => r#"<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L20.5 20.5"/>"#,
+    "lock" => r#"<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>"#,
     "text-larger" => r#"<path d="M3 18l4.5-11L12 18M4.6 14.5h5.8M15 13h6M18 10v6"/>"#,
 }
 

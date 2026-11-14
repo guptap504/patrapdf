@@ -4,6 +4,8 @@
 mod about;
 mod assets;
 mod editor;
+mod fonts;
+mod forms;
 mod gestures;
 mod model;
 mod pdf;
@@ -19,7 +21,7 @@ use futures::StreamExt;
 use gpui::{Application, Menu, MenuItem};
 
 use editor::{
-    About, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, Undo, ZoomFitPage,
+    About, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, Open, Paste, Quit, Redo, Save, SaveWithPassword, Undo, ZoomFitPage,
     ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
 };
 
@@ -53,6 +55,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Open…", Open),
                     MenuItem::action("Save As…", Save),
+                    MenuItem::action("Save with Password…", SaveWithPassword),
                     MenuItem::action("Discard Changes…", DiscardChanges),
                     MenuItem::action("Close Document", CloseDocument),
                     MenuItem::separator(),

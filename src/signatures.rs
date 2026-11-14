@@ -51,10 +51,13 @@ pub fn app_data_dir() -> PathBuf {
     base.join("pdf-signer")
 }
 
-/// Tests must never touch the user's real library or recents.
+/// Tests must never touch the user's real library or recents. Each test
+/// (thread) gets its own, so tests running in parallel can't see each
+/// other's recents.
 #[cfg(test)]
 pub fn app_data_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("pdf-signer-test-{}", std::process::id()))
+    let thread = format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "");
+    std::env::temp_dir().join(format!("pdf-signer-test-{}-{thread}", std::process::id()))
 }
 
 pub fn library_dir() -> PathBuf {

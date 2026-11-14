@@ -2,7 +2,18 @@
 
 # PDF Signer
 
-A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in PDFs: place text boxes, dates, checkmarks and signature images anywhere on a page, redact, watermark, delete and reorder pages, then save a flattened copy. Everything happens on your computer; nothing is uploaded.
+A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in and signing PDFs. Everything happens on your computer; nothing is uploaded.
+
+## Features
+
+- **Fill in forms.** Type into a PDF's own form fields, tick its check boxes and pick from its lists. The saved copy is still a fillable form.
+- **Add to any page.** Place text boxes, dates, checkmarks and signature images anywhere, and keep a library of signatures.
+- **Redact.** Cover anything with a black or white box; what's underneath is removed from the saved file.
+- **Watermark** every page, and **delete or reorder** pages.
+- **Passwords.** Protected PDFs open with their password. A saved copy can keep it, change it or drop it, and any PDF can be saved with a password (AES-256).
+- **Any language.** Text in scripts other than Latin (Chinese, Japanese, Korean, Arabic, Hebrew, Hindi, Thai and more) is written with a font from your computer, and input methods work for typing it.
+- **Recents.** Saved documents appear in a searchable gallery and reopen with everything you placed still editable.
+- **Automatic updates** on macOS, Windows and the AppImage, verified against the project's signing key.
 
 ## Install
 
@@ -18,10 +29,9 @@ On Debian/Ubuntu, install the system libraries first with `packaging/linux/insta
 
 ## Not yet supported
 
-- Digital signatures.
-- Filling AcroForm fields natively. Text is overlaid on top of the fields instead.
-- Password-protected PDFs, beyond those with an empty user password.
-- Non-Latin text. Output uses the standard Helvetica font with WinAnsi encoding.
+- Digital signatures, and signature, password, file-picker and button form fields.
+- XFA forms. Their AcroForm fields are filled in where the file has them.
+- Emoji and other characters that only colour fonts can draw. Saving reports them.
 
 ## License
 

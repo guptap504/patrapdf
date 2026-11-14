@@ -20,10 +20,12 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Item, ItemKind, Signature, Watermark};
+use crate::forms::FieldValue;
+use crate::model::{Item, ItemKind, RedactFill, Signature, Watermark};
 use crate::{pdf, signatures};
 
-const MAX_ENTRIES: usize = 40;
+/// The oldest entries are dropped beyond this many.
+const MAX_ENTRIES: usize = 100;
 /// Thumbnail width in pixels (displayed at roughly half that on Retina screens).
 const THUMB_WIDTH_PX: f32 = 360.;
 
@@ -46,6 +48,9 @@ pub struct RecentEntry {
     /// `None` when unchanged.
     #[serde(default)]
     pub order: Option<Vec<usize>>,
+    /// Values typed into the document's own form fields, by field name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, FieldValue)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,7 +69,11 @@ pub enum SavedKind {
     Text { text: String, font_size: f32 },
     Image { path: PathBuf },
     Check,
-    Redact,
+    Redact {
+        /// Absent in entries saved before there was a choice (they were black).
+        #[serde(default)]
+        fill: RedactFill,
+    },
 }
 
 /// A rendered first-page thumbnail, ready to be written to disk.
@@ -142,6 +151,7 @@ fn store_asset(source: &Path) -> Result<PathBuf> {
 
 /// Record (or update) the entry for `original` after a successful save.
 /// Returns the updated list, most recent first.
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     mut entries: Vec<RecentEntry>,
     original: &Path,
@@ -150,6 +160,7 @@ pub fn record(
     items: &[Item],
     watermark: Option<&Watermark>,
     order: Option<&[usize]>,
+    fields: Vec<(String, FieldValue)>,
     thumbnail: Option<Thumbnail>,
 ) -> Result<Vec<RecentEntry>> {
     let id = hash_hex(original);
@@ -167,7 +178,7 @@ pub fn record(
                     path: store_asset(&sig.path).ok()?,
                 },
                 ItemKind::Check => SavedKind::Check,
-                ItemKind::Redact => SavedKind::Redact,
+                ItemKind::Redact { fill } => SavedKind::Redact { fill: *fill },
             };
             Some(SavedItem {
                 page: item.page,
@@ -212,6 +223,7 @@ pub fn record(
             items: saved_items,
             watermark: watermark.cloned(),
             order: order.map(<[usize]>::to_vec),
+            fields,
         },
     );
     for dropped in entries.split_off(entries.len().min(MAX_ENTRIES)) {
@@ -234,6 +246,23 @@ pub fn remove(mut entries: Vec<RecentEntry>, id: &str) -> Result<Vec<RecentEntry
     Ok(entries)
 }
 
+/// Empty the gallery (the PDFs themselves are untouched).
+pub fn clear(entries: Vec<RecentEntry>) -> Result<Vec<RecentEntry>> {
+    for entry in &entries {
+        remove_file_quietly(entry.thumbnail.as_deref());
+    }
+    write_index(&[])?;
+    collect_garbage(&[]);
+    Ok(Vec::new())
+}
+
+/// Whether an entry matches a search: every word of `query` appears in the
+/// original's or the saved copy's path (ignoring case).
+pub fn matches(entry: &RecentEntry, query: &str) -> bool {
+    let haystack = format!("{}\n{}", entry.original.display(), entry.output.display()).to_lowercase();
+    query.to_lowercase().split_whitespace().all(|word| haystack.contains(word))
+}
+
 /// Turn a saved entry back into editor items. Images whose stored copy has
 /// gone missing, or items on pages that no longer exist, are skipped.
 pub fn restore_items(entry: &RecentEntry, page_count: usize, mut next_id: impl FnMut() -> u64) -> Vec<Item> {
@@ -252,7 +281,7 @@ pub fn restore_items(entry: &RecentEntry, page_count: usize, mut next_id: impl F
                     ItemKind::Image { sig }
                 }
                 SavedKind::Check => ItemKind::Check,
-                SavedKind::Redact => ItemKind::Redact,
+                SavedKind::Redact { fill } => ItemKind::Redact { fill: *fill },
             };
             Some(Item {
                 id: next_id(),
@@ -310,13 +339,13 @@ mod tests {
             Item { id: 1, page: 0, x: 10., y: 20., w: 50., h: 14., kind: ItemKind::Text { text: "Hi".into(), font_size: 12. } },
             Item { id: 2, page: 1, x: 30., y: 40., w: 80., h: 40., kind: ItemKind::Image { sig } },
             Item { id: 3, page: 5, x: 1., y: 1., w: 9., h: 9., kind: ItemKind::Check },
-            Item { id: 4, page: 0, x: 5., y: 5., w: 90., h: 12., kind: ItemKind::Redact },
+            Item { id: 4, page: 0, x: 5., y: 5., w: 90., h: 12., kind: ItemKind::Redact { fill: RedactFill::White } },
         ];
         let watermark = Watermark { text: "COPY".into(), ..Watermark::default() };
         let thumb = make_thumbnail(pdf::tests::sample_pdf()).expect("thumbnail");
         assert!(thumb.width > 0 && thumb.height > thumb.width);
 
-        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(&[1, 0]), Some(thumb)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(&[1, 0]), vec![("name".into(), FieldValue::Text("Jo".into()))], Some(thumb)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -333,13 +362,17 @@ mod tests {
         assert_eq!(restored.len(), 3);
         assert!(matches!(&restored[0].kind, ItemKind::Text { text, .. } if text == "Hi"));
         assert!(matches!(&restored[1].kind, ItemKind::Image { .. }));
-        assert!(restored[2].is_redaction());
+        assert!(matches!(restored[2].kind, ItemKind::Redact { fill: RedactFill::White }));
+        // Entries from before redactions had a colour are black.
+        let old: SavedKind = serde_json::from_str(r#"{"type":"redact"}"#).unwrap();
+        assert!(matches!(old, SavedKind::Redact { fill: RedactFill::Black }));
         assert_eq!(restored[1].id, 102);
         assert_eq!(loaded[0].watermark.as_ref(), Some(&watermark));
         assert_eq!(loaded[0].order.as_deref(), Some(&[1, 0][..]));
+        assert_eq!(loaded[0].fields, [("name".to_string(), FieldValue::Text("Jo".into()))]);
 
         // Saving the same original again updates the entry instead of adding one.
-        let entries = record(loaded, &original, &output, 2, &restored, None, None, None).unwrap();
+        let entries = record(loaded, &original, &output, 2, &restored, None, None, Vec::new(), None).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

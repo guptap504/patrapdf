@@ -55,7 +55,27 @@ pub enum ItemKind {
     Image { sig: Arc<Signature> },
     Check,
     /// A redaction box. On save, everything under it is removed from the file.
-    Redact,
+    Redact { fill: RedactFill },
+}
+
+/// The colour a redaction box covers things with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactFill {
+    #[default]
+    Black,
+    /// For blanking out on white paper without a visible box.
+    White,
+}
+
+impl RedactFill {
+    /// The colour's value in 8-bit RGB.
+    pub fn level(self) -> u8 {
+        match self {
+            RedactFill::Black => 0,
+            RedactFill::White => 255,
+        }
+    }
 }
 
 /// An overlay placed on a page.
@@ -78,7 +98,7 @@ impl Item {
     }
 
     pub fn is_redaction(&self) -> bool {
-        matches!(self.kind, ItemKind::Redact)
+        matches!(self.kind, ItemKind::Redact { .. })
     }
 }
 

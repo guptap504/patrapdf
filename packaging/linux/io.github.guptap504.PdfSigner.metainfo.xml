@@ -29,6 +29,14 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.3.0" date="2026-11-14">
+      <description>
+        <p>Fill in a PDF's own form fields; the saved copy stays fillable.</p>
+        <p>Open password-protected PDFs, and save copies with a new password, the same one, or none.</p>
+        <p>Text in non-Latin scripts, written with fonts from your computer.</p>
+        <p>White redaction boxes, and a searchable Recents gallery.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-13">
       <description>
         <p>Automatic updates: new versions are downloaded in the background, verified against the project's signing key, and installed on restart.</p>
