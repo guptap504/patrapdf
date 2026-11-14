@@ -135,6 +135,17 @@ pub fn lifted_shadow() -> Vec<BoxShadow> {
     ]
 }
 
+/// The box of a one-line text field, 30px tall and outlined in `border` (the
+/// accent colour while it's being typed into).
+pub fn text_field(border: Hsla) -> Div {
+    div().flex().items_center().h(px(30.)).px_2().rounded_md().border_1().border_color(border).bg(surface()).text_sm()
+}
+
+/// The caret of a text box being typed into.
+pub fn caret(height: gpui::Pixels) -> Div {
+    div().w(px(1.5)).h(height).bg(accent())
+}
+
 /// A 3px accent ring drawn with a shadow, so it doesn't affect layout.
 pub fn ring() -> Vec<BoxShadow> {
     let mut shadows = page_shadow();

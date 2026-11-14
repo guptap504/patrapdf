@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use hayro::kurbo::{Affine, Point};
+use hayro::kurbo::{Affine, Point, Rect};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +99,62 @@ pub struct Widget {
     pub symbol: Symbol,
 }
 
+impl FieldKind {
+    /// Check boxes and radio buttons: switched on or off rather than given text.
+    pub fn is_button(&self) -> bool {
+        matches!(self, FieldKind::CheckBox | FieldKind::Radio { .. })
+    }
+
+    /// Whether the field is filled in by typing.
+    pub fn takes_typing(&self) -> bool {
+        matches!(self, FieldKind::Text { .. } | FieldKind::Choice { editable: true, .. })
+    }
+}
+
+impl Widget {
+    /// Whether `value` selects this check box or radio button.
+    pub fn is_on(&self, value: &FieldValue) -> bool {
+        matches!(value, FieldValue::On(Some(on)) if self.on_state.as_ref() == Some(on))
+    }
+
+    /// The square a check box or radio button's mark is drawn in, for the
+    /// widget shown `w` by `h`: its offset from a corner, and its side.
+    pub fn mark_box(&self, w: f32, h: f32) -> ((f32, f32), f32) {
+        let side = (w.min(h) - 2. * (self.border_width + 1.)).max(1.);
+        (((w - side) / 2., (h - side) / 2.), side)
+    }
+}
+
+/// For each of a document's `page_count` pages, the widgets on it, as (field
+/// index, widget index).
+pub fn widgets_by_page(form: &[Field], page_count: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut pages = vec![Vec::new(); page_count];
+    for (index, field) in form.iter().enumerate() {
+        for (widget_index, widget) in field.widgets.iter().enumerate() {
+            if let Some(page) = pages.get_mut(widget.page) {
+                page.push((index, widget_index));
+            }
+        }
+    }
+    pages
+}
+
+/// The fields whose value differs from the one in the file, with that value.
+pub fn changed<'a>(form: &'a [Field], values: &'a [FieldValue]) -> impl Iterator<Item = (&'a Field, &'a FieldValue)> {
+    form.iter().zip(values).filter(|(field, value)| field.value != **value)
+}
+
 impl Field {
+    /// Whether `value` is one the field can hold.
+    pub fn can_hold(&self, value: &FieldValue) -> bool {
+        match value {
+            FieldValue::Text(_) => !self.kind.is_button(),
+            FieldValue::On(on) => {
+                self.kind.is_button() && on.as_ref().is_none_or(|on| self.widgets.iter().any(|w| w.on_state.as_ref() == Some(on)))
+            }
+        }
+    }
+
     /// The text shown for the field's value (an option's label rather than its value).
     pub fn display_text(&self, value: &FieldValue) -> String {
         match (value, &self.kind) {
@@ -123,6 +178,9 @@ impl Field {
         }
     }
 }
+
+/// Width of a mark's stroked lines, as a fraction of its square's side.
+pub const MARK_STROKE: f32 = 0.12;
 
 /// The shape of a check box or radio button mark, in a unit square (y up).
 pub enum Mark {
@@ -159,7 +217,7 @@ const FF_COMBO: i64 = 1 << 17;
 const FF_EDIT: i64 = 1 << 18;
 const FF_FILE_SELECT: i64 = 1 << 20;
 const FF_COMB: i64 = 1 << 24;
-const ANNOT_HIDDEN: i64 = 1 << 1;
+pub const ANNOT_HIDDEN: i64 = 1 << 1;
 const ANNOT_NO_VIEW: i64 = 1 << 5;
 
 /// Field attributes that kids inherit from their parents.
@@ -178,33 +236,23 @@ struct Inherited {
 /// The fields of a document that can be filled in. Read-only fields,
 /// buttons, signature fields and password fields are left alone.
 pub fn read(doc: &Document, pages: &[PageGeom]) -> Vec<Field> {
-    let Some(form) = doc
-        .catalog()
-        .ok()
-        .and_then(|c| c.get(b"AcroForm").ok())
-        .and_then(|f| resolve_dict(doc, f))
-    else {
+    let Some(form) = doc.catalog().ok().and_then(|c| doc.get_dict_in_dict(c, b"AcroForm").ok()) else {
         return Vec::new();
     };
     // Widgets are placed on a page by being in its /Annots.
     let mut page_of: HashMap<ObjectId, usize> = HashMap::new();
     for (index, (_, page_id)) in doc.get_pages().into_iter().enumerate() {
-        let annots = doc.get_dictionary(page_id).ok().and_then(|p| p.get(b"Annots").ok());
-        if let Some(Object::Array(annots)) = annots.and_then(|a| resolve(doc, a)) {
-            for annot in annots {
-                if let Ok(id) = annot.as_reference() {
-                    page_of.entry(id).or_insert(index);
-                }
-            }
+        for id in crate::pdf::page_annotations(doc, page_id) {
+            page_of.entry(id).or_insert(index);
         }
     }
     let defaults = Inherited {
         da: form.get(b"DA").ok().and_then(|o| text(doc, o)),
-        q: form.get(b"Q").ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_i64().ok()),
+        q: int(doc, form, b"Q"),
         ..Inherited::default()
     };
     let mut fields = Vec::new();
-    if let Ok(Object::Array(roots)) = form.get(b"Fields").map(|o| resolve(doc, o).unwrap_or(Object::Null)) {
+    if let Ok(Object::Array(roots)) = form.get_deref(b"Fields", doc) {
         for root in roots {
             if let Ok(id) = root.as_reference() {
                 walk(doc, id, &defaults, pages, &page_of, &mut fields, 0);
@@ -234,23 +282,23 @@ fn walk(
     if let Ok(ft) = dict.get(b"FT").and_then(Object::as_name) {
         attrs.ft = Some(ft.to_vec());
     }
-    if let Some(ff) = dict.get(b"Ff").ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_i64().ok()) {
+    if let Some(ff) = int(doc, dict, b"Ff") {
         attrs.ff = ff;
     }
     if let Ok(v) = dict.get(b"V") {
-        attrs.v = resolve(doc, v);
+        attrs.v = resolve(doc, v).cloned();
     }
     if let Some(da) = dict.get(b"DA").ok().and_then(|o| text(doc, o)) {
         attrs.da = Some(da);
     }
-    if let Some(q) = dict.get(b"Q").ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_i64().ok()) {
+    if let Some(q) = int(doc, dict, b"Q") {
         attrs.q = Some(q);
     }
-    if let Some(n) = dict.get(b"MaxLen").ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_i64().ok()) {
+    if let Some(n) = int(doc, dict, b"MaxLen") {
         attrs.max_len = Some(n);
     }
     if let Ok(opt) = dict.get(b"Opt") {
-        attrs.opt = resolve(doc, opt);
+        attrs.opt = resolve(doc, opt).cloned();
     }
 
     // Kids with names are fields of their own; kids without are this field's widgets.
@@ -302,7 +350,7 @@ fn make_field(
         },
         _ => return None,
     };
-    let button = matches!(kind, FieldKind::CheckBox | FieldKind::Radio { .. });
+    let button = kind.is_button();
     let widgets: Vec<Widget> = widget_ids
         .iter()
         .filter_map(|&wid| make_widget(doc, wid, attrs, button, pages, page_of))
@@ -315,10 +363,7 @@ fn make_field(
             Some(Object::Name(n)) if n.as_slice() != b"Off" => Some(String::from_utf8_lossy(n).into_owned()),
             Some(_) => None,
             // No value: whichever widget is shown "on".
-            None => widget_ids.iter().find_map(|&w| {
-                let state = doc.get_dictionary(w).ok()?.get(b"AS").ok()?.as_name().ok()?;
-                (state != b"Off").then(|| String::from_utf8_lossy(state).into_owned())
-            }),
+            None => widget_ids.iter().find_map(|&w| shown_state(doc.get_dictionary(w).ok()?)),
         };
         FieldValue::On(on)
     } else {
@@ -348,7 +393,7 @@ fn make_widget(
     page_of: &HashMap<ObjectId, usize>,
 ) -> Option<Widget> {
     let dict = doc.get_dictionary(id).ok()?;
-    let flags = dict.get(b"F").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+    let flags = int(doc, dict, b"F").unwrap_or(0);
     if flags & (ANNOT_HIDDEN | ANNOT_NO_VIEW) != 0 {
         return None;
     }
@@ -362,42 +407,30 @@ fn make_widget(
     }
     // The rect in view space.
     let to_view = Affine::new(geom.view_to_user).inverse();
-    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| to_view * Point::new(x as f64, y as f64));
-    let (vx0, vx1) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
-    let (vy0, vy1) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+    let view = to_view.transform_rect_bbox(Rect::new(x0 as f64, y0 as f64, x1 as f64, y1 as f64));
 
-    let mk = dict.get(b"MK").ok().and_then(|o| resolve_dict(doc, o));
-    let rotation = mk
-        .as_ref()
-        .and_then(|mk| mk.get(b"R").ok().and_then(|o| o.as_i64().ok()))
-        .map(|r| (r.rem_euclid(360) / 90 * 90) as u16)
-        .unwrap_or(0);
+    let mk = doc.get_dict_in_dict(dict, b"MK").ok();
+    let rotation = mk.and_then(|mk| int(doc, mk, b"R")).map(|r| (r.rem_euclid(360) / 90 * 90) as u16).unwrap_or(0);
     let (w, h) = (x1 - x0, y1 - y0);
     let size = if rotation % 180 == 90 { (h, w) } else { (w, h) };
     // The content's x axis, turned by R, as it points on screen.
     let r = (rotation as f64).to_radians();
     let axis = to_view * Point::new(r.cos(), r.sin()) - to_view * Point::ZERO;
     let upright = axis.x > 0. && axis.y.abs() < axis.x * 1e-3;
-    let color = |key: &[u8]| mk.as_ref().and_then(|mk| mk.get(key).ok()).and_then(|o| rgb(&numbers(doc, o)));
+    let color = |key: &[u8]| mk.and_then(|mk| mk.get(key).ok()).and_then(|o| rgb(&numbers(doc, o)));
     let border = color(b"BC");
-    let border_width = dict
-        .get(b"BS")
+    let border_width = doc
+        .get_dict_in_dict(dict, b"BS")
         .ok()
-        .and_then(|o| resolve_dict(doc, o))
-        .and_then(|bs| bs.get(b"W").ok().map(|w| numbers(doc, w)))
-        .and_then(|w| w.first().copied())
+        .and_then(|bs| bs.get_deref(b"W", doc).ok()?.as_float().ok())
         .unwrap_or(1.);
     let da = dict.get(b"DA").ok().and_then(|o| text(doc, o)).or_else(|| attrs.da.clone()).unwrap_or_default();
     let (font_size, text_color) = parse_da(&da);
-    let q = dict.get(b"Q").ok().and_then(|o| o.as_i64().ok()).or(attrs.q).unwrap_or(0);
+    let q = int(doc, dict, b"Q").or(attrs.q).unwrap_or(0);
 
-    let on_state = button.then(|| on_state(doc, dict)).flatten();
-    let caption = mk
-        .as_ref()
-        .and_then(|mk| mk.get(b"CA").ok())
-        .and_then(|o| o.as_str().ok().map(<[u8]>::to_vec));
+    let caption = mk.and_then(|mk| mk.get(b"CA").ok()).and_then(|o| o.as_str().ok());
     let radio = attrs.ff & FF_RADIO != 0;
-    let symbol = match caption.as_deref().and_then(|c| c.first()) {
+    let symbol = match caption.and_then(|c| c.first()) {
         Some(b'4') => Symbol::Check,
         Some(b'l') => Symbol::Circle,
         Some(b'8') => Symbol::Cross,
@@ -409,11 +442,11 @@ fn make_widget(
     Some(Widget {
         id,
         page,
-        rect: [vx0 as f32, vy0 as f32, (vx1 - vx0) as f32, (vy1 - vy0) as f32],
+        rect: [view.x0 as f32, view.y0 as f32, view.width() as f32, view.height() as f32],
         size,
         rotation,
         upright,
-        on_state: if button { Some(on_state.unwrap_or_else(|| "Yes".into())) } else { None },
+        on_state: button.then(|| on_state(doc, dict).unwrap_or_else(|| "Yes".into())),
         font_size,
         align: match q {
             1 => Align::Center,
@@ -430,16 +463,22 @@ fn make_widget(
 
 /// The name of a button widget's "on" appearance.
 fn on_state(doc: &Document, widget: &Dictionary) -> Option<String> {
-    let normal = widget
-        .get(b"AP")
-        .ok()
-        .and_then(|ap| resolve_dict(doc, ap))
-        .and_then(|ap| ap.get(b"N").ok().and_then(|n| resolve_dict(doc, n)));
-    if let Some(normal) = normal {
+    if let Some(normal) = normal_appearances(doc, widget) {
         if let Some((name, _)) = normal.iter().find(|(name, _)| name.as_slice() != b"Off") {
             return Some(String::from_utf8_lossy(name).into_owned());
         }
     }
+    shown_state(widget)
+}
+
+/// A button widget's normal appearances, by state name.
+pub(crate) fn normal_appearances<'a>(doc: &'a Document, widget: &'a Dictionary) -> Option<&'a Dictionary> {
+    let appearances = doc.get_dict_in_dict(widget, b"AP").ok()?;
+    doc.get_dict_in_dict(appearances, b"N").ok()
+}
+
+/// The state a button widget is showing, unless that is "Off".
+fn shown_state(widget: &Dictionary) -> Option<String> {
     let state = widget.get(b"AS").ok()?.as_name().ok()?;
     (state != b"Off").then(|| String::from_utf8_lossy(state).into_owned())
 }
@@ -453,7 +492,7 @@ fn options(doc: &Document, opt: Option<&Object>) -> Vec<ChoiceOption> {
                 value: text(doc, &pair[0])?,
                 label: text(doc, &pair[1])?,
             }),
-            other => text(doc, &other).map(|t| ChoiceOption { value: t.clone(), label: t }),
+            other => text(doc, other).map(|t| ChoiceOption { value: t.clone(), label: t }),
         })
         .collect()
 }
@@ -466,19 +505,16 @@ fn parse_da(da: &str) -> (f32, [f32; 3]) {
     for (i, &token) in tokens.iter().enumerate() {
         match token {
             "Tf" if i >= 1 => size = num(i - 1).unwrap_or(0.),
-            "g" if i >= 1 => {
-                if let Some(g) = num(i - 1) {
-                    color = [g; 3];
-                }
-            }
-            "rg" if i >= 3 => {
-                if let (Some(r), Some(g), Some(b)) = (num(i - 3), num(i - 2), num(i - 1)) {
-                    color = [r, g, b];
-                }
-            }
-            "k" if i >= 4 => {
-                if let (Some(c), Some(m), Some(y), Some(k)) = (num(i - 4), num(i - 3), num(i - 2), num(i - 1)) {
-                    color = [(1. - c) * (1. - k), (1. - m) * (1. - k), (1. - y) * (1. - k)];
+            // A colour: the operator's 1 (gray), 3 (RGB) or 4 (CMYK) operands come before it.
+            "g" | "rg" | "k" => {
+                let n = match token {
+                    "g" => 1,
+                    "rg" => 3,
+                    _ => 4,
+                };
+                let operands: Option<Vec<f32>> = (i >= n).then(|| (i - n..i).map(num).collect()).flatten();
+                if let Some(c) = operands.as_deref().and_then(rgb) {
+                    color = c;
                 }
             }
             _ => {}
@@ -497,38 +533,27 @@ fn rgb(c: &[f32]) -> Option<[f32; 3]> {
     }
 }
 
-fn resolve(doc: &Document, obj: &Object) -> Option<Object> {
-    match obj {
-        Object::Reference(id) => doc.get_object(*id).ok().cloned(),
-        other => Some(other.clone()),
-    }
+/// `obj`, or the object it refers to.
+fn resolve<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Object> {
+    doc.dereference(obj).ok().map(|(_, o)| o)
 }
 
-fn resolve_dict(doc: &Document, obj: &Object) -> Option<Dictionary> {
-    match resolve(doc, obj)? {
-        Object::Dictionary(d) => Some(d),
-        _ => None,
-    }
+/// The whole number at `key`.
+fn int(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<i64> {
+    dict.get_deref(key, doc).and_then(Object::as_i64).ok()
 }
 
 fn text(doc: &Document, obj: &Object) -> Option<String> {
     match resolve(doc, obj)? {
-        s @ Object::String(..) => lopdf::decode_text_string(&s).ok(),
-        Object::Name(n) => Some(String::from_utf8_lossy(&n).into_owned()),
+        s @ Object::String(..) => lopdf::decode_text_string(s).ok(),
+        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
         _ => None,
     }
 }
 
 fn numbers(doc: &Document, obj: &Object) -> Vec<f32> {
     match resolve(doc, obj) {
-        Some(Object::Array(items)) => items
-            .iter()
-            .filter_map(|o| match resolve(doc, o)? {
-                Object::Integer(i) => Some(i as f32),
-                Object::Real(r) => Some(r),
-                _ => None,
-            })
-            .collect(),
+        Some(Object::Array(items)) => items.iter().filter_map(|o| resolve(doc, o)?.as_float().ok()).collect(),
         _ => Vec::new(),
     }
 }

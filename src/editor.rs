@@ -1,16 +1,18 @@
 //! The main editor window: toolbar, signature library sidebar and page view.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use futures::channel::oneshot;
+use futures::StreamExt as _;
+use futures::channel::{mpsc, oneshot};
 
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Task, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
     size,
@@ -20,7 +22,9 @@ use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, RedactFill,
 
 mod fields;
 mod input;
-use crate::forms::{FieldKind, FieldValue};
+use input::InputTarget;
+use crate::fonts::FontBook;
+use crate::forms::{self, FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
 use crate::gestures;
@@ -65,6 +69,21 @@ const DEFAULT_CHECK_SIZE: f32 = 14.0;
 const SIDEBAR_W: f32 = 248.;
 /// Padding around the page column (`px_8` / `py_8`).
 const PAGES_PAD: f32 = 32.;
+/// The height of the number under a page or a thumbnail, and the space above
+/// it. These and the gaps are fixed, so that where a page or thumbnail is
+/// follows from the sizes of those before it (see `pages_content_bounds` and
+/// `thumb_tops`) without having drawn them.
+const LABEL_H: f32 = 16.;
+const PAGE_LABEL_GAP: f32 = 8.;
+const THUMB_LABEL_GAP: f32 = 6.;
+/// The space between one page's number and the next page; between thumbnails.
+const PAGE_GAP: f32 = 24.;
+const THUMB_GAP: f32 = 20.;
+/// From the bottom of one page to the top of the next.
+const PAGE_SPACING: f32 = PAGE_LABEL_GAP + LABEL_H + PAGE_GAP;
+/// Pages and thumbnails are drawn when they are within this many viewport
+/// heights of the viewport; the rest only take up their space.
+const DRAWN_MARGIN: f32 = 1.;
 const THUMB_RAIL_W: f32 = 148.;
 /// Thumbnail display width (points) and render width (pixels, 2× for Retina).
 const THUMB_W: f32 = 100.;
@@ -138,7 +157,7 @@ const WATERMARK_MAX_CHARS: usize = 40;
 const DEFAULT_REDACTION: (f32, f32) = (140., 18.);
 
 /// Everything undo/redo and "discard" restore.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Snapshot {
     items: Vec<Item>,
     watermark: Option<Watermark>,
@@ -154,6 +173,42 @@ struct WatermarkPreview {
     /// The watermark and scale last requested (rendering or rendered).
     requested: Option<(Watermark, f32)>,
     task: Option<Task<()>>,
+}
+
+/// The colour a redaction box is shown in.
+fn redact_color(fill: RedactFill) -> gpui::Hsla {
+    match fill {
+        RedactFill::Black => gpui::black(),
+        RedactFill::White => gpui::white(),
+    }
+}
+
+/// Width of `text` at `size`, for laying it out on screen: as the writer will
+/// draw it, or a rough estimate while the installed fonts that it needs are
+/// still being found (see `Editor::load_fonts`).
+fn text_width(text: &str, size: f32) -> f32 {
+    pdf::measure_text_now(text, size)
+        .unwrap_or_else(|| text.chars().map(|c| if c >= '\u{2e80}' { 1.0 } else { 0.55 }).sum::<f32>() * size)
+}
+
+/// The size of a text item: the box around its lines.
+fn text_item_size(text: &str, font_size: f32) -> (f32, f32) {
+    let lines = text.split('\n');
+    let longest = lines.clone().map(|line| text_width(line, font_size)).fold(0.55 * font_size, f32::max);
+    (longest, lines.count() as f32 * font_size * LINE_HEIGHT)
+}
+
+/// How long what `Editor::file_exists` found is trusted.
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The size of a page's picture in the thumbnail rail.
+fn thumb_size(geom: &PageGeom) -> (f32, f32) {
+    let aspect = geom.width / geom.height.max(1.);
+    if aspect >= 1. || THUMB_W / aspect <= 1.5 * THUMB_W {
+        (THUMB_W, THUMB_W / aspect)
+    } else {
+        (1.5 * THUMB_W * aspect, 1.5 * THUMB_W)
+    }
 }
 
 fn page_size_key(geom: &PageGeom) -> (u32, u32) {
@@ -183,12 +238,18 @@ struct DragState {
     moved: bool,
 }
 
+/// The first thumbnail of the rail as it was painted.
+#[derive(Clone, Copy)]
+struct PaintedThumb {
+    /// Its top edge (window coordinates), and the rail's scroll offset then.
+    top: Pixels,
+    scroll: Pixels,
+}
+
 struct PageView {
     image: Option<Arc<RenderImage>>,
     /// Small render for the page thumbnail rail.
     thumb: Option<Arc<RenderImage>>,
-    /// Where the thumbnail was last painted (for drag-to-reorder).
-    thumb_bounds: Rc<Cell<Bounds<Pixels>>>,
     rendered_scale: f32,
 }
 
@@ -197,6 +258,10 @@ struct OpenDoc {
     loaded: LoadedPdf,
     /// One per page of the original file (rendered images etc.), by original index.
     pages: Vec<PageView>,
+    /// The form widgets on each page of the original file (see `forms::widgets_by_page`).
+    widgets: Vec<Vec<(usize, usize)>>,
+    /// The text of form fields as laid out in their widgets (see `Editor::field_layout`).
+    layouts: RefCell<HashMap<(usize, usize), fields::CachedLayout>>,
     /// The document's pages as shown and saved: `order[i]` is the original index of
     /// page `i`. Deleting or moving pages only changes this list. Item page numbers
     /// and everything else in the UI use positions in this list.
@@ -214,10 +279,6 @@ impl OpenDoc {
         self.loaded.pages.get(*self.order.get(page)?)
     }
 
-    fn view(&self, page: usize) -> Option<&PageView> {
-        self.pages.get(*self.order.get(page)?)
-    }
-
     /// The displayed pages, in order.
     fn geoms(&self) -> impl Iterator<Item = &PageGeom> + '_ {
         self.order.iter().map(|&i| &self.loaded.pages[i])
@@ -232,26 +293,25 @@ struct PasswordPrompt {
     /// The last password tried was wrong (or, for a new password, the repeat
     /// didn't match).
     wrong: bool,
-    /// The recent document being reopened, restored once it's open.
-    recent: Option<String>,
     purpose: PasswordPurpose,
+}
+
+/// What to do once a document reopened from Recents is open.
+#[derive(Clone, PartialEq)]
+enum AfterOpen {
+    /// Bring back the edits remembered in this Recents entry.
+    Restore(String),
+    /// Say that the saved copy was opened, as the original (this) has moved.
+    NoteMoved(PathBuf),
 }
 
 #[derive(Clone, PartialEq)]
 enum PasswordPurpose {
-    /// Opening the document at `path`.
-    Open,
+    /// Opening the document at `path`, and what to do once it's open.
+    Open { then: Option<AfterOpen> },
     /// Choosing the password for a saved copy; `first` is set once it's been
     /// typed, while it's typed again to confirm.
     NewPassword { first: Option<String> },
-}
-
-/// What a saved copy of a password-protected document should be protected with.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SaveProtection {
-    Keep,
-    Change,
-    Remove,
 }
 
 /// Payload when dragging a page thumbnail to reorder pages.
@@ -315,14 +375,11 @@ pub struct Editor {
     doc: Option<OpenDoc>,
     signatures: Vec<Arc<Signature>>,
     items: Vec<Item>,
-    /// The fields as of the last open/save; "Discard changes" reverts to this.
-    saved_items: Vec<Item>,
     watermark: Option<Watermark>,
-    saved_watermark: Option<Watermark>,
-    saved_order: Vec<usize>,
     /// Values of the document's own form fields (same order as `LoadedPdf::form`).
     fields: Vec<FieldValue>,
-    saved_fields: Vec<FieldValue>,
+    /// Everything as of the last open/save; "Discard changes" reverts to this.
+    saved: Snapshot,
     /// The form field being typed into.
     field_editing: Option<usize>,
     /// The form field (a combo box) whose list of options is open.
@@ -351,7 +408,7 @@ pub struct Editor {
     editing: Option<u64>,
     typing_checkpointed: bool,
     /// Text an input method is composing (a byte range of the text being typed into).
-    ime_marked: Option<std::ops::Range<usize>>,
+    ime_marked: Option<(InputTarget, std::ops::Range<usize>)>,
     tool: Tool,
     zoom: f32,
     drag: Option<DragState>,
@@ -375,6 +432,11 @@ pub struct Editor {
     /// The page list's scroll offset when page bounds were last captured. Lets us
     /// correct those (stale) bounds when the list has scrolled since the last paint.
     painted_scroll: Rc<Cell<Point<Pixels>>>,
+    /// Scroll state of the thumbnail rail.
+    thumbs_scroll: ScrollHandle,
+    /// The first thumbnail as last painted, which the others are placed from
+    /// (see `thumb_tops`).
+    painted_thumb: Rc<Cell<Option<PaintedThumb>>>,
     /// The zoom the pages were last painted at.
     painted_zoom: Rc<Cell<f32>>,
     pan: Option<PanState>,
@@ -385,7 +447,14 @@ pub struct Editor {
     /// Bumped on every edit, so a finished save knows whether edits happened meanwhile.
     revision: u64,
     font_size: f32,
+    /// Which of the files shown in Recents exist, and when that was looked up
+    /// (see `file_exists`).
+    seen_files: RefCell<(Instant, HashMap<PathBuf, bool>)>,
     render_task: Option<Task<()>>,
+    /// The document being read and parsed, to be shown when that's done.
+    open_task: Option<Task<()>>,
+    /// The installed fonts being found (see `load_fonts`).
+    fonts_task: Option<Task<()>>,
     thumb_task: Option<Task<()>>,
     _appearance_observer: Subscription,
     /// The app's updater (absent in tests), and our subscriptions to it.
@@ -426,10 +495,8 @@ impl Editor {
             doc: None,
             signatures: signatures::load_library(),
             items: Vec::new(),
-            saved_items: Vec::new(),
             watermark: None,
-            saved_watermark: None,
-            saved_order: Vec::new(),
+            saved: Snapshot::default(),
             page_drop_target: None,
             titlebar_pressed: false,
             watermark_menu_open: false,
@@ -444,7 +511,6 @@ impl Editor {
             editing: None,
             typing_checkpointed: false,
             fields: Vec::new(),
-            saved_fields: Vec::new(),
             field_editing: None,
             choice_open: None,
             redact_fill: RedactFill::Black,
@@ -465,12 +531,13 @@ impl Editor {
             pages_scroll: ScrollHandle::new(),
             page_slots: Vec::new(),
             painted_scroll: Rc::new(Cell::new(Point::default())),
+            thumbs_scroll: ScrollHandle::new(),
+            painted_thumb: Rc::default(),
             painted_zoom: Rc::new(Cell::new(0.)),
             pan: None,
             _pinch_task: {
                 let mut pinches = gestures::subscribe();
                 cx.spawn_in(window, async move |this, cx| {
-                    use futures::StreamExt as _;
                     while let Some(pinch) = pinches.next().await {
                         let anchor = point(px(pinch.position.0), px(pinch.position.1));
                         let alive = this.update_in(cx, |this, window, cx| this.zoom_by(pinch.factor, Some(anchor), window, cx));
@@ -485,7 +552,10 @@ impl Editor {
             dirty: false,
             revision: 0,
             font_size: DEFAULT_FONT_SIZE,
+            seen_files: RefCell::new((Instant::now(), HashMap::new())),
             render_task: None,
+            open_task: None,
+            fonts_task: None,
             thumb_task: None,
             _appearance_observer: appearance_observer,
             updater: updater.clone(),
@@ -546,35 +616,63 @@ impl Editor {
         .detach();
     }
 
-    /// Open a PDF. Returns false if it couldn't be opened, or needs a password
-    /// first (then the password prompt is showing).
-    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.open_with_password(path, None, window, cx)
+    /// Open a PDF: it is read in the background, and shown when that's done
+    /// (or its password is asked for first).
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with_password(path, None, None, window, cx)
     }
 
-    fn open_with_password(&mut self, path: PathBuf, password: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let loaded = std::fs::read(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| pdf::open_for_editing(bytes, password.as_deref()));
+    /// Open a PDF, with the password typed for it if it has been asked for.
+    fn open_with_password(
+        &mut self,
+        path: PathBuf,
+        password: Option<String>,
+        then: Option<AfterOpen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = format!("Opening {}…", file_name(&path)).into();
+        cx.notify();
+        let tried_password = password.is_some();
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { pdf::open_for_editing(std::fs::read(&path)?, password.as_deref()) }
+        });
+        // Replaces, and so abandons, a document that was still being opened.
+        self.open_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let loaded = read.await;
+            this.update_in(cx, |this, window, cx| this.finish_opening(path, loaded, tried_password, then, window, cx)).ok();
+        }));
+    }
+
+    /// Show a document that has been read, or say why it couldn't be.
+    fn finish_opening(
+        &mut self,
+        path: PathBuf,
+        loaded: anyhow::Result<LoadedPdf>,
+        tried_password: bool,
+        then: Option<AfterOpen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let loaded = match loaded {
             Ok(l) => l,
             Err(e) if e.downcast_ref::<pdf::PasswordError>().is_some() => {
-                let recent = self.password_prompt.take().filter(|p| p.path == path).and_then(|p| p.recent);
+                self.status = format!("{} is password protected", file_name(&path)).into();
                 self.password_prompt = Some(PasswordPrompt {
                     path,
                     text: String::new(),
-                    wrong: password.is_some(),
-                    recent,
-                    purpose: PasswordPurpose::Open,
+                    wrong: tried_password,
+                    purpose: PasswordPurpose::Open { then },
                 });
                 window.focus(&self.focus);
                 cx.notify();
-                return false;
+                return;
             }
             Err(e) => {
                 self.password_prompt = None;
                 self.show_error(&format!("Couldn't open {}", file_name(&path)), &e.to_string(), window, cx);
-                return false;
+                return;
             }
         };
         self.password_prompt = None;
@@ -587,11 +685,14 @@ impl Editor {
             .map(|_| PageView {
                 image: None,
                 thumb: None,
-                thumb_bounds: Rc::new(Cell::new(Bounds::default())),
                 rendered_scale: 0.0,
             })
             .collect();
         let field_count = loaded.form.len();
+        // Fields may hold text in any script, which is measured with the installed fonts.
+        if field_count > 0 {
+            self.load_fonts(cx);
+        }
         self.status = format!(
             "Opened {} ({} pages){}{}",
             file_name(&path),
@@ -605,23 +706,22 @@ impl Editor {
         )
         .into();
         self.fields = loaded.form.iter().map(|f| f.value.clone()).collect();
-        self.saved_fields = self.fields.clone();
         self.recents_query.clear();
         self.recents_search_focused = false;
         window.set_window_title(&format!("PDF Signer — {}", file_name(&path)));
         let order = (0..loaded.pages.len()).collect::<Vec<_>>();
-        self.saved_order = order.clone();
         self.doc = Some(OpenDoc {
             path,
+            widgets: forms::widgets_by_page(&loaded.form, loaded.pages.len()),
+            layouts: RefCell::default(),
             loaded,
             pages,
             order,
             last_output: None,
         });
         self.items.clear();
-        self.saved_items.clear();
         self.watermark = None;
-        self.saved_watermark = None;
+        self.saved = self.snapshot();
         self.history.clear();
         self.future.clear();
         self.close_menus();
@@ -634,7 +734,60 @@ impl Editor {
         self.ensure_rendered(window, cx);
         self.render_thumbnails(window, cx);
         cx.notify();
-        true
+        match then {
+            Some(AfterOpen::Restore(id)) => {
+                if let Some(entry) = self.recents.iter().find(|e| e.id == id).cloned() {
+                    self.restore_recent(&entry, cx);
+                }
+            }
+            Some(AfterOpen::NoteMoved(original)) => {
+                self.status = format!(
+                    "The original ({}) has moved, so the saved copy was opened instead. Its fields are part of the page now.",
+                    original.display()
+                )
+                .into();
+            }
+            None => {}
+        }
+    }
+
+    /// Whether a file shown in Recents is there. Every card asks on every
+    /// frame, so the answers are kept for a moment instead of being read
+    /// from the disk each time.
+    fn file_exists(&self, path: &Path) -> bool {
+        let mut seen = self.seen_files.borrow_mut();
+        if seen.0.elapsed() > FILE_CHECK_INTERVAL {
+            *seen = (Instant::now(), HashMap::new());
+        }
+        if let Some(&exists) = seen.1.get(path) {
+            return exists;
+        }
+        let exists = path.exists();
+        seen.1.insert(path.to_path_buf(), exists);
+        exists
+    }
+
+    /// Find the installed fonts in the background, then draw again. Until
+    /// then, text that needs them is laid out by estimate (see `text_width`).
+    fn load_fonts(&mut self, cx: &mut Context<Self>) {
+        if self.fonts_task.is_some() || FontBook::loaded().is_some() {
+            return;
+        }
+        let fonts = cx.background_executor().spawn(async {
+            FontBook::system();
+        });
+        self.fonts_task = Some(cx.spawn(async move |this, cx| {
+            fonts.await;
+            this.update(cx, |this, cx| {
+                for item in &mut this.items {
+                    if let ItemKind::Text { text, font_size } = &item.kind {
+                        (item.w, item.h) = text_item_size(text, *font_size);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Drop the open document and free its page bitmaps.
@@ -674,12 +827,12 @@ impl Editor {
 
     fn close_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.release_document(window, cx);
+        // Recents is shown again: look at its files afresh.
+        self.seen_files.borrow_mut().1.clear();
         self.fields.clear();
-        self.saved_fields.clear();
         self.items.clear();
-        self.saved_items.clear();
         self.watermark = None;
-        self.saved_watermark = None;
+        self.saved = Snapshot::default();
         self.history.clear();
         self.future.clear();
         self.close_menus();
@@ -710,12 +863,7 @@ impl Editor {
             return;
         }
         self.checkpoint();
-        self.items = self.saved_items.clone();
-        self.watermark = self.saved_watermark.clone();
-        self.fields = self.saved_fields.clone();
-        if let Some(doc) = self.doc.as_mut().filter(|_| !self.saved_order.is_empty()) {
-            doc.order = self.saved_order.clone();
-        }
+        self.restore(self.saved.clone());
         self.close_menus();
         self.selected = None;
         self.editing = None;
@@ -730,28 +878,27 @@ impl Editor {
         if prompt.text.is_empty() {
             return;
         }
-        if let PasswordPurpose::NewPassword { first } = &mut prompt.purpose {
-            let typed = std::mem::take(&mut prompt.text);
-            match first.take() {
-                // Now type it again.
-                None => {
-                    *first = Some(typed);
-                    prompt.wrong = false;
-                }
-                Some(first) if first == typed => {
-                    self.password_prompt = None;
-                    self.save_with_password(Some(first), window, cx);
-                }
-                // Didn't match: start over.
-                Some(_) => prompt.wrong = true,
+        match &mut prompt.purpose {
+            PasswordPurpose::Open { then } => {
+                let (path, password, then) = (prompt.path.clone(), prompt.text.clone(), then.clone());
+                self.open_with_password(path, Some(password), then, window, cx);
             }
-            cx.notify();
-            return;
-        }
-        let (path, password, recent) = (prompt.path.clone(), prompt.text.clone(), prompt.recent.clone());
-        if self.open_with_password(path, Some(password), window, cx) {
-            if let Some(entry) = recent.and_then(|id| self.recents.iter().find(|e| e.id == id).cloned()) {
-                self.restore_recent(&entry, cx);
+            PasswordPurpose::NewPassword { first } => {
+                let typed = std::mem::take(&mut prompt.text);
+                match first.take() {
+                    // Now type it again.
+                    None => {
+                        *first = Some(typed);
+                        prompt.wrong = false;
+                    }
+                    Some(first) if first == typed => {
+                        self.password_prompt = None;
+                        self.save_with_password(Some(first), window, cx);
+                    }
+                    // Didn't match: start over.
+                    Some(_) => prompt.wrong = true,
+                }
+                cx.notify();
             }
         }
     }
@@ -765,21 +912,9 @@ impl Editor {
     fn open_recent(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.recents.iter().find(|e| e.id == id).cloned() else { return };
         if entry.original.exists() {
-            if !self.open_path(entry.original.clone(), window, cx) {
-                if let Some(prompt) = self.password_prompt.as_mut().filter(|p| p.path == entry.original) {
-                    prompt.recent = Some(entry.id.clone());
-                }
-                return;
-            }
-            self.restore_recent(&entry, cx);
+            self.open_with_password(entry.original, None, Some(AfterOpen::Restore(entry.id)), window, cx);
         } else if entry.output.exists() {
-            if self.open_path(entry.output.clone(), window, cx) {
-                self.status = format!(
-                    "The original ({}) has moved, so the saved copy was opened instead. Its fields are part of the page now.",
-                    entry.original.display()
-                )
-                .into();
-            }
+            self.open_with_password(entry.output, None, Some(AfterOpen::NoteMoved(entry.original)), window, cx);
         } else {
             self.show_error(
                 "Couldn't find this document",
@@ -797,54 +932,40 @@ impl Editor {
     /// Bring back the fields, watermark and page order saved with a recent entry
     /// (its original has just been opened).
     fn restore_recent(&mut self, entry: &RecentEntry, cx: &mut Context<Self>) {
-        {
-            if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
-                let n = doc.pages.len();
-                let mut seen = vec![false; n];
-                let valid = !order.is_empty() && order.iter().all(|&i| i < n && !std::mem::replace(&mut seen[i], true));
-                if valid {
-                    doc.order = order.clone();
-                    self.saved_order = order.clone();
-                }
+        if let (Some(doc), Some(order)) = (self.doc.as_mut(), entry.order.as_ref()) {
+            let n = doc.pages.len();
+            let mut seen = vec![false; n];
+            let valid = !order.is_empty() && order.iter().all(|&i| i < n && !std::mem::replace(&mut seen[i], true));
+            if valid {
+                doc.order = order.clone();
             }
-            let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
-            let mut next_id = self.next_id;
-            self.items = recents::restore_items(entry, page_count, || {
-                next_id += 1;
-                next_id
-            });
-            self.next_id = next_id + 1;
-            self.saved_items = self.items.clone();
-            self.watermark = entry.watermark.clone();
-            self.saved_watermark = self.watermark.clone();
-            if let Some(doc) = &mut self.doc {
-                doc.last_output = Some(entry.output.clone());
-            }
-            // Form values, matched by field name (the original may have changed since).
-            let form = self.form();
-            for (name, value) in &entry.fields {
-                let Some(i) = form.iter().position(|f| f.name == *name) else { continue };
-                let fits = match (&form[i].kind, value) {
-                    (FieldKind::CheckBox | FieldKind::Radio { .. }, FieldValue::On(on)) => {
-                        on.as_ref().is_none_or(|on| form[i].widgets.iter().any(|w| w.on_state.as_ref() == Some(on)))
-                    }
-                    (FieldKind::Text { .. } | FieldKind::Choice { .. }, FieldValue::Text(_)) => true,
-                    _ => false,
-                };
-                if fits {
-                    self.fields[i] = value.clone();
-                }
-            }
-            self.saved_fields = self.fields.clone();
-            let filled = self.fields.iter().zip(form.iter()).filter(|(v, f)| **v != f.value).count();
-            let n = self.items.len() + filled;
-            self.status = match n {
-                0 => format!("Reopened {}", file_name(&entry.original)),
-                n => format!("Reopened {} with {n} editable field{}", file_name(&entry.original), if n == 1 { "" } else { "s" }),
-            }
-            .into();
-            cx.notify();
         }
+        let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
+        let mut next_id = self.next_id;
+        self.items = recents::restore_items(entry, page_count, || {
+            next_id += 1;
+            next_id
+        });
+        self.next_id = next_id + 1;
+        self.watermark = entry.watermark.clone();
+        if let Some(doc) = &mut self.doc {
+            doc.last_output = Some(entry.output.clone());
+        }
+        // Form values, matched by field name (the original may have changed since).
+        let form = self.form();
+        for (name, value) in &entry.fields {
+            if let Some(i) = form.iter().position(|f| f.name == *name).filter(|&i| form[i].can_hold(value)) {
+                self.fields[i] = value.clone();
+            }
+        }
+        self.saved = self.snapshot();
+        let n = self.items.len() + forms::changed(&form, &self.fields).count();
+        self.status = match n {
+            0 => format!("Reopened {}", file_name(&entry.original)),
+            n => format!("Reopened {} with {n} editable field{}", file_name(&entry.original), if n == 1 { "" } else { "s" }),
+        }
+        .into();
+        cx.notify();
     }
 
     /// Typing into the Recents search box (only while the gallery shows).
@@ -877,10 +998,10 @@ impl Editor {
                 return;
             }
             this.update(cx, |this, cx| {
-                match recents::clear(std::mem::take(&mut this.recents)) {
-                    Ok(entries) => this.recents = entries,
-                    Err(e) => this.status = format!("Couldn't update recents: {e:#}").into(),
+                if let Err(e) = recents::clear(&this.recents) {
+                    this.status = format!("Couldn't update recents: {e:#}").into();
                 }
+                this.recents.clear();
                 this.recents_query.clear();
                 this.recents_search_focused = false;
                 cx.notify();
@@ -901,17 +1022,14 @@ impl Editor {
     /// Render the small page images for the thumbnail rail (once per document).
     fn render_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
-        let pdf = doc.loaded.pdf.clone();
         let path = doc.path.clone();
-        let scales: Vec<f32> = doc.loaded.pages.iter().map(|p| THUMB_RENDER_PX / p.width.max(1.)).collect();
+        let pages: Vec<(usize, f32)> =
+            doc.loaded.pages.iter().map(|p| THUMB_RENDER_PX / p.width.max(1.)).enumerate().collect();
+        let pdf = doc.loaded.pdf.clone();
         self.thumb_task = Some(cx.spawn_in(window, async move |this, cx| {
-            for (index, scale) in scales.into_iter().enumerate() {
-                let pdf = pdf.clone();
-                let rendered = cx
-                    .background_executor()
-                    .spawn(async move { pdf::render_page(&pdf, index, scale) })
-                    .await;
-                let Some(image) = rendered.and_then(to_render_image) else { continue };
+            let (mut rendered, _rendering) = render_in_background(pdf, pages, cx.background_executor());
+            while let Some((index, page)) = rendered.next().await {
+                let Some(image) = page.and_then(to_render_image) else { continue };
                 let ok = this.update(cx, |this, cx| {
                     let Some(doc) = this.doc.as_mut().filter(|d| d.path == path) else { return false };
                     doc.pages[index].thumb = Some(image);
@@ -956,13 +1074,10 @@ impl Editor {
             if settle {
                 cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
             }
-            for index in stale {
-                let pdf = pdf.clone();
-                let rendered = cx
-                    .background_executor()
-                    .spawn(async move { pdf::render_page(&pdf, index, scale) })
-                    .await;
-                let Some(image) = rendered.and_then(to_render_image) else { continue };
+            let pages = stale.into_iter().map(|index| (index, scale)).collect();
+            let (mut rendered, _rendering) = render_in_background(pdf, pages, cx.background_executor());
+            while let Some((index, page)) = rendered.next().await {
+                let Some(image) = page.and_then(to_render_image) else { continue };
                 let ok = this.update_in(cx, |this, window, cx| {
                     let Some(doc) = this.doc.as_mut().filter(|d| d.path == path) else { return false };
                     let page = &mut doc.pages[index];
@@ -992,33 +1107,24 @@ impl Editor {
             return;
         };
         // A protected document: ask how to protect the copy.
-        const CHOICES: [(&str, Option<SaveProtection>); 4] = [
-            ("Keep Password", Some(SaveProtection::Keep)),
-            ("Change Password…", Some(SaveProtection::Change)),
-            ("Remove Password", Some(SaveProtection::Remove)),
-            ("Cancel", None),
-        ];
         let answer = window.prompt(
             PromptLevel::Info,
             &format!("“{}” is password protected", file_name(&doc.path)),
             Some("Should the copy you save need the same password to open, a new one, or none?"),
-            &CHOICES.map(|(label, _)| label),
+            &["Keep Password", "Change Password…", "Remove Password", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             let Ok(answer) = answer.await else { return };
-            let Some(Some(choice)) = CHOICES.get(answer).map(|(_, c)| *c) else { return };
-            this.update_in(cx, |this, window, cx| this.save_protected(choice, password, window, cx)).ok();
+            this.update_in(cx, |this, window, cx| match answer {
+                0 => this.save_with_password(Some(password), window, cx),
+                1 => this.save_with_new_password(window, cx),
+                2 => this.save_with_password(None, window, cx),
+                _ => {}
+            })
+            .ok();
         })
         .detach();
-    }
-
-    fn save_protected(&mut self, choice: SaveProtection, password: String, window: &mut Window, cx: &mut Context<Self>) {
-        match choice {
-            SaveProtection::Keep => self.save_with_password(Some(password), window, cx),
-            SaveProtection::Remove => self.save_with_password(None, window, cx),
-            SaveProtection::Change => self.save_with_new_password(window, cx),
-        }
     }
 
     /// Ask for a password (typed twice), then save a copy that needs it to open.
@@ -1034,7 +1140,6 @@ impl Editor {
             path: doc.path.clone(),
             text: String::new(),
             wrong: false,
-            recent: None,
             purpose: PasswordPurpose::NewPassword { first: None },
         });
         window.focus(&self.focus);
@@ -1058,8 +1163,7 @@ impl Editor {
         let picker = cx.prompt_for_new_path(&dir, Some(&suggested));
 
         let original = doc.path.clone();
-        let bytes = doc.loaded.bytes.clone();
-        let pages: Vec<PageGeom> = doc.loaded.pages.clone();
+        let loaded = doc.loaded.clone();
         let order = doc.order.clone();
         let page_count = order.len();
         let items = self.items.clone();
@@ -1086,17 +1190,15 @@ impl Editor {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picker.await else { return };
             let target = path.clone();
-            let saved_items = items.clone();
-            let saved_watermark = watermark.clone();
-            let saved_order = order.clone();
-            let saved_fields = values.clone();
+            let saved = Snapshot {
+                items: items.clone(),
+                watermark: watermark.clone(),
+                order: order.clone(),
+                fields: values.clone(),
+            };
             // Remembered by name: the values that differ from the file's own.
-            let filled: Vec<(String, FieldValue)> = form
-                .iter()
-                .zip(&values)
-                .filter(|(f, v)| f.value != **v)
-                .map(|(f, v)| (f.name.clone(), v.clone()))
-                .collect();
+            let filled: Vec<(String, FieldValue)> =
+                forms::changed(&form, &values).map(|(f, v)| (f.name.clone(), v.clone())).collect();
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -1109,7 +1211,7 @@ impl Editor {
                         form: &form,
                         values: &values,
                     };
-                    let written = pdf::save(&bytes, &pages, &edits)?;
+                    let written = loaded.save(&edits)?;
                     std::fs::write(&target, &written.bytes)?;
                     // No thumbnail of a protected document: it would be an unprotected
                     // picture of its first page.
@@ -1119,35 +1221,27 @@ impl Editor {
                 .await;
             this.update_in(cx, |this, window, cx| match result {
                 Ok((thumbnail, missing)) => {
-                    // Only clear "Edited" if nothing changed while the save was running.
-                    if this.revision == revision && this.doc.as_ref().is_some_and(|d| d.path == original) {
-                        this.dirty = false;
-                    }
-                    this.saved_items = saved_items.clone();
-                    this.saved_watermark = saved_watermark.clone();
-                    this.saved_order = saved_order.clone();
-                    if this.doc.as_ref().is_some_and(|d| d.path == original) {
-                        this.saved_fields = saved_fields.clone();
-                    }
-                    if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
-                        doc.last_output = Some(path.clone());
-                    }
                     // Recents are stored unencrypted, so for a protected document they
                     // remember only where it is, not what was typed into it.
-                    let recorded = recents::record(
-                        this.recents.clone(),
-                        &original,
-                        &path,
-                        page_count,
-                        if protected { &[] } else { &saved_items },
-                        saved_watermark.as_ref().filter(|_| !protected),
-                        Some(saved_order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p)),
-                        if protected { Vec::new() } else { filled.clone() },
+                    let contents = (!protected).then(|| recents::Contents {
+                        items: &saved.items,
+                        watermark: saved.watermark.as_ref(),
+                        fields: filled,
                         thumbnail,
-                    );
-                    match recorded {
+                    });
+                    let reordered = Some(saved.order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p));
+                    match recents::record(this.recents.clone(), &original, &path, page_count, reordered, contents) {
                         Ok(entries) => this.recents = entries,
                         Err(e) => eprintln!("could not update recents: {e:#}"),
+                    }
+                    // Unless another document was opened while the save was running.
+                    if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
+                        doc.last_output = Some(path.clone());
+                        this.saved = saved;
+                        // Only clear "Edited" if nothing changed meanwhile.
+                        if this.revision == revision {
+                            this.dirty = false;
+                        }
                     }
                     this.status = match redacted_pages {
                         0 => format!("Saved {}{protection_note}", path.display()),
@@ -1404,17 +1498,14 @@ impl Editor {
             }
             return;
         }
-        if self.watermark_editing {
+        if let Some(target) = self.input_target() {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                let line = text.lines().next().unwrap_or_default().to_string();
-                self.edit_watermark_text(cx, |t| t.push_str(&line));
-            }
-            return;
-        }
-        if self.editing.is_some() {
-            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                let text = text.replace("\r\n", "\n");
-                self.edit_text(cx, |t| t.push_str(&text));
+                let text = match target {
+                    // The watermark is one line: the first of what was copied.
+                    InputTarget::Watermark => text.lines().next().unwrap_or_default().to_string(),
+                    _ => text,
+                };
+                self.replace_input(None, &text, false, cx);
             }
             return;
         }
@@ -1701,50 +1792,99 @@ impl Editor {
 
     /// The gap between thumbnails closest to window y (0 = above the first).
     fn page_gap_at(&self, y: Pixels) -> usize {
-        let Some(doc) = &self.doc else { return 0 };
-        (0..doc.page_count())
-            .filter(|&i| doc.view(i).is_some_and(|v| v.thumb_bounds.get().center().y < y))
-            .count()
+        let Some(tops) = self.thumb_tops() else { return 0 };
+        tops.filter(|&(top, height)| top + height / 2. < y).count()
+    }
+
+    /// Where each thumbnail is in the rail right now: its top edge (window
+    /// coordinates) and height, number included. Worked out from the layout
+    /// rules and the first thumbnail as last painted, as only the thumbnails
+    /// near the viewport are drawn. `None` before anything has been painted.
+    fn thumb_tops(&self) -> Option<impl Iterator<Item = (Pixels, Pixels)> + '_> {
+        let doc = self.doc.as_ref()?;
+        let painted = self.painted_thumb.get()?;
+        let mut top = painted.top - painted.scroll + self.thumbs_scroll.offset().y;
+        Some(doc.geoms().map(move |geom| {
+            let height = px(thumb_size(geom).1 + THUMB_LABEL_GAP + LABEL_H);
+            let block = (top, height);
+            top += height + px(THUMB_GAP);
+            block
+        }))
+    }
+
+    /// Which thumbnails to draw (see `DRAWN_MARGIN`). The first always is: the
+    /// others are placed from it.
+    fn drawn_thumbs(&self) -> Vec<bool> {
+        let count = self.doc.as_ref().map_or(0, |d| d.page_count());
+        let viewport = self.thumbs_scroll.bounds();
+        let Some(tops) = self.thumb_tops().filter(|_| viewport.size.height > px(0.)) else { return vec![true; count] };
+        let margin = viewport.size.height * DRAWN_MARGIN;
+        tops.enumerate()
+            .map(|(index, (top, height))| index == 0 || (top + height >= viewport.top() - margin && top <= viewport.bottom() + margin))
+            .collect()
+    }
+
+    /// Which pages to draw (see `DRAWN_MARGIN`). The first always is (the
+    /// others are placed from it, see `layout_metrics`), and so is the page
+    /// with what is being typed into, which takes the typing. Before the
+    /// pages have been painted, all of them.
+    fn drawn_pages(&self) -> Vec<bool> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let count = doc.page_count();
+        let viewport = self.pages_scroll.bounds();
+        let measured = self.painted_zoom.get() > 0. && self.slot_bounds(0).is_some();
+        if !measured || viewport.size.height <= px(0.) {
+            return vec![true; count];
+        }
+        let margin = viewport.size.height * DRAWN_MARGIN;
+        let typing = self.editing.and_then(|id| self.items.iter().find(|i| i.id == id)).map(|i| i.page);
+        let field = self.field_editing.or(self.choice_open).and_then(|i| doc.loaded.form.get(i));
+        let holds_field = |index: usize| field.is_some_and(|f| f.widgets.iter().any(|w| w.page == doc.order[index]));
+        self.live_pages_bounds()
+            .enumerate()
+            .map(|(index, b)| {
+                index == 0
+                    || (b.bottom() >= viewport.top() - margin && b.top() <= viewport.bottom() + margin)
+                    || typing == Some(index)
+                    || holds_field(index)
+            })
+            .collect()
     }
 
     // -----------------------------------------------------------------------
     // Pages & zoom
     // -----------------------------------------------------------------------
 
-    /// Two layout measurements from the last paint that don't depend on zoom:
-    /// the content-space top of the first page, and the space between consecutive
-    /// pages (page label + gaps).
+    /// Two layout measurements that don't depend on zoom: the content-space
+    /// top of the first page (from the last paint), and the space between
+    /// consecutive pages (page label + gaps).
     fn layout_metrics(&self) -> (Pixels, Pixels) {
-        let fallback = (px(PAGES_PAD), px(48.));
-        let Some(doc) = &self.doc else { return fallback };
-        if doc.page_count() == 0 {
-            return fallback;
-        }
-        let Some(first) = self.slot_bounds(0) else { return fallback };
-        if self.painted_zoom.get() <= 0. || first.size.width <= px(0.) {
-            return fallback;
-        }
-        let lead = first.top() - self.pages_scroll.bounds().top() - self.painted_scroll.get().y;
-        let gap = match self.slot_bounds(1) {
-            Some(second) => second.top() - first.bottom(),
-            None => fallback.1,
-        };
-        (lead, gap)
+        let gap = px(PAGE_SPACING);
+        let first = self.slot_bounds(0).filter(|_| self.doc.is_some() && self.painted_zoom.get() > 0.);
+        let lead = first.map(|first| first.top() - self.pages_scroll.bounds().top() - self.painted_scroll.get().y);
+        (lead.unwrap_or(px(PAGES_PAD)), gap)
     }
 
     /// Where page `index` sits within the scrolled content at zoom `z`. Computed
     /// from the layout rules rather than the last paint, so it is right even
     /// before the pages have been painted at a new zoom or scroll position.
     fn page_content_bounds(&self, index: usize, z: f32) -> Option<Bounds<Pixels>> {
-        let pages: Vec<&PageGeom> = self.doc.as_ref()?.geoms().collect();
-        let geom = *pages.get(index)?;
+        self.pages_content_bounds(z).nth(index)
+    }
+
+    /// `page_content_bounds` of every page, from the first down.
+    fn pages_content_bounds(&self, z: f32) -> impl Iterator<Item = Bounds<Pixels>> + '_ {
         let (lead, gap) = self.layout_metrics();
-        let widest = pages.iter().map(|p| p.width).fold(0., f32::max);
+        let widest = self.doc.iter().flat_map(|d| d.geoms()).map(|p| p.width).fold(0., f32::max);
         // The page column is at least as wide as the viewport, and pages are centred in it.
         let content_w = self.pages_scroll.bounds().size.width.max(px(widest * z + 2. * PAGES_PAD));
-        let top = pages[..index].iter().fold(lead, |top, p| top + px(p.height * z) + gap);
-        let w = px(geom.width * z);
-        Some(Bounds::new(point((content_w - w) / 2., top), size(w, px(geom.height * z))))
+        let mut top = lead;
+        self.doc.iter().flat_map(|d| d.geoms()).map(move |geom| {
+            let (w, h) = (px(geom.width * z), px(geom.height * z));
+            let bounds = Bounds::new(point((content_w - w) / 2., top), size(w, h));
+            top += h + gap;
+            bounds
+        })
     }
 
     /// Where position `index` was last painted.
@@ -1754,20 +1894,24 @@ impl Editor {
 
     /// Where page `index` is on screen right now (window coordinates).
     fn live_page_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
-        let content = self.page_content_bounds(index, self.zoom)?;
+        self.live_pages_bounds().nth(index)
+    }
+
+    /// `live_page_bounds` of every page, from the first down.
+    fn live_pages_bounds(&self) -> impl Iterator<Item = Bounds<Pixels>> + '_ {
         let origin = self.pages_scroll.bounds().origin + self.pages_scroll.offset();
-        Some(Bounds::new(content.origin + origin, content.size))
+        self.pages_content_bounds(self.zoom).map(move |content| Bounds::new(content.origin + origin, content.size))
     }
 
     /// The page occupying most of the viewport.
     fn current_page(&self) -> Option<usize> {
-        let doc = self.doc.as_ref()?;
+        self.doc.as_ref()?;
         let viewport = self.pages_scroll.bounds();
         if viewport.size.height <= px(0.) {
             return Some(0);
         }
-        (0..doc.page_count())
-            .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
+        self.live_pages_bounds()
+            .enumerate()
             .map(|(i, b)| {
                 let visible = (b.bottom().min(viewport.bottom()) - b.top().max(viewport.top())).max(px(0.));
                 (i, visible)
@@ -1849,7 +1993,6 @@ impl Editor {
     /// The scroll offset that keeps the document point under `anchor` in place
     /// after zooming to `new_zoom`. (GPUI clamps it to the scrollable range.)
     fn offset_keeping(&self, anchor: Point<Pixels>, new_zoom: f32) -> Option<Point<Pixels>> {
-        let doc = self.doc.as_ref()?;
         let viewport = self.pages_scroll.bounds();
         if viewport.size.width <= px(0.) {
             return None;
@@ -1857,8 +2000,9 @@ impl Editor {
         // The page nearest the anchor, and the anchor's position on it in page points
         // (it may lie a little outside the page, e.g. in the gap between pages).
         let distance = |b: &Bounds<Pixels>| (b.top() - anchor.y).max(anchor.y - b.bottom()).max(px(0.));
-        let (index, bounds) = (0..doc.page_count())
-            .filter_map(|i| Some((i, self.live_page_bounds(i)?)))
+        let (index, bounds) = self
+            .live_pages_bounds()
+            .enumerate()
             .min_by(|a, b| distance(&a.1).partial_cmp(&distance(&b.1)).unwrap_or(std::cmp::Ordering::Equal))?;
         let on_page = (anchor - bounds.origin).map(|v| v / px(self.zoom));
         let after = self.page_content_bounds(index, new_zoom)?;
@@ -1972,12 +2116,10 @@ impl Editor {
         let Some(item) = self.item_mut(id) else { return };
         let ItemKind::Text { text, font_size } = &mut item.kind else { return };
         f(text);
-        // Rough size estimate (used for clamping to the page only).
-        let lines = text.split('\n');
-        let em = |l: &str| l.chars().map(|c| if c >= '\u{2e80}' { 1.0 } else { 0.55 }).sum::<f32>();
-        let longest = lines.clone().map(em).fold(0.55, f32::max);
-        item.w = longest * *font_size;
-        item.h = lines.count() as f32 * *font_size * LINE_HEIGHT;
+        (item.w, item.h) = text_item_size(text, *font_size);
+        if pdf::needs_installed_fonts(text) {
+            self.load_fonts(cx);
+        }
         cx.notify();
     }
 
@@ -2004,7 +2146,7 @@ impl Editor {
     fn set_redact_fill(&mut self, fill: RedactFill, cx: &mut Context<Self>) {
         self.redact_fill = fill;
         let Some(id) = self.selected else { return };
-        if self.items.iter().any(|i| i.id == id && matches!(i.kind, ItemKind::Redact { fill: f } if f != fill)) {
+        if self.items.iter().any(|i| i.id == id && i.redaction().is_some_and(|f| f != fill)) {
             self.checkpoint();
             if let Some(item) = self.item_mut(id) {
                 item.kind = ItemKind::Redact { fill };
@@ -2062,8 +2204,7 @@ impl Editor {
             Tool::Text | Tool::Date => {
                 let text = if tool == Tool::Date { self.settings.today() } else { String::new() };
                 let fs = self.font_size;
-                let line_h = fs * LINE_HEIGHT;
-                let w = text.chars().count().max(1) as f32 * fs * 0.55;
+                let (w, line_h) = text_item_size(&text, fs);
                 let id = self.add_item(page, x, y - line_h / 2., w, line_h, ItemKind::Text { text, font_size: fs }, cx);
                 // A date is complete as placed; don't drop the user into typing.
                 if tool == Tool::Date {
@@ -2095,9 +2236,6 @@ impl Editor {
     }
 
     fn close_menus(&mut self) {
-        if self.watermark_editing {
-            self.ime_marked = None;
-        }
         self.zoom_menu_open = false;
         self.date_menu_open = false;
         self.watermark_menu_open = false;
@@ -2257,15 +2395,18 @@ impl Editor {
             return;
         }
 
+        if ks.key == "backspace" && self.input_target().is_some() {
+            self.delete_backward(cx);
+            cx.stop_propagation();
+            return;
+        }
+
         // The Recents gallery: typing anywhere searches it.
         if self.doc.is_none() && !self.recents.is_empty() {
             if self.searching_recents() {
                 match ks.key.as_str() {
                     "escape" if self.recents_query.is_empty() => self.recents_search_focused = false,
                     "escape" => self.recents_query.clear(),
-                    "backspace" => {
-                        self.recents_query.pop();
-                    }
                     "enter" => {
                         if let Some(id) = self.shown_recents().first().map(|e| e.id.clone()) {
                             self.open_recent(&id, window, cx);
@@ -2297,22 +2438,12 @@ impl Editor {
         if let Some(index) = self.field_editing {
             let multiline = self.form().get(index).is_some_and(|f| matches!(f.kind, FieldKind::Text { multiline: true, .. }));
             match ks.key.as_str() {
-                "escape" => {
-                    self.finish_editing(cx);
-                    self.close_menus();
-                }
-                "backspace" => {
-                    if let Some(mut text) = self.field_input_text(index) {
-                        text.pop();
-                        self.type_into_field(index, text, cx);
-                    }
-                }
                 "enter" if multiline && !shortcut => {
                     if let Some(text) = self.field_input_text(index) {
                         self.type_into_field(index, text + "\n", cx);
                     }
                 }
-                "enter" => {
+                "escape" | "enter" => {
                     self.finish_editing(cx);
                     self.close_menus();
                 }
@@ -2327,9 +2458,6 @@ impl Editor {
         if self.editing.is_some() {
             match ks.key.as_str() {
                 "escape" => self.finish_editing(cx),
-                "backspace" => self.edit_text(cx, |t| {
-                    t.pop();
-                }),
                 "enter" => self.edit_text(cx, |t| t.push('\n')),
                 "tab" => {}
                 // Typed characters arrive through the input handler (see `input.rs`).
@@ -2345,9 +2473,6 @@ impl Editor {
                     self.watermark_editing = false;
                     cx.notify();
                 }
-                "backspace" => self.edit_watermark_text(cx, |t| {
-                    t.pop();
-                }),
                 "tab" => {}
                 _ => return,
             }
@@ -2742,7 +2867,6 @@ impl Editor {
         self.selected = None;
         self.watermark_editing = true;
         self.watermark_replace = true;
-        self.ime_marked = None;
         self.watermark_checkpointed = false;
         window.focus(&self.focus);
         cx.notify();
@@ -2828,19 +2952,10 @@ impl Editor {
         let text = current.as_ref().map(|w| w.text.clone()).unwrap_or_default();
         let selected_text = editing && self.watermark_replace && !text.is_empty();
 
-        let input = div()
+        let input = ui::text_field(if editing { ui::accent() } else { ui::border_strong() })
             .id("watermark-text")
-            .flex()
-            .items_center()
-            .h(px(30.))
             .mx_1()
             .mb_1()
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(if editing { ui::accent() } else { ui::border_strong() })
-            .bg(ui::surface())
-            .text_sm()
             .cursor(CursorStyle::IBeam)
             .overflow_hidden()
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.start_watermark_typing(window, cx)))
@@ -2855,7 +2970,7 @@ impl Editor {
                         .child(text.clone()),
                 )
             })
-            .when(editing && !selected_text, |d| d.child(div().w(px(1.5)).h(px(16.)).bg(ui::accent())))
+            .when(editing && !selected_text, |d| d.child(ui::caret(px(16.))))
             .when(editing, |d| d.relative().child(self.input_anchor(cx)));
 
         let mut panel = ui::menu_panel()
@@ -3359,7 +3474,7 @@ impl Editor {
                     })
                     .collect();
                 let last = lines.len() - 1;
-                let mut caret = Some(div().relative().w(px(1.5)).h(lh).bg(ui::accent()).child(self.input_anchor(cx)));
+                let mut caret = editing.then(|| ui::caret(lh).relative().child(self.input_anchor(cx)));
                 div()
                     .flex()
                     .flex_col()
@@ -3378,7 +3493,7 @@ impl Editor {
                                 d.child(div().underline().text_decoration_color(ui::accent()).child(composing))
                             })
                             .when(!after.is_empty(), |d| d.child(after))
-                            .when(editing && i == last, |d| d.children(caret.take()))
+                            .when(i == last, |d| d.children(caret.take()))
                     }))
                     .into_any_element()
             }
@@ -3391,10 +3506,7 @@ impl Editor {
             ItemKind::Redact { fill } => div()
                 .w(px(item.w * z))
                 .h(px(item.h * z))
-                .bg(match fill {
-                    RedactFill::Black => gpui::black(),
-                    RedactFill::White => gpui::white(),
-                })
+                .bg(redact_color(*fill))
                 // A white box on a white page would be invisible; outline it here
                 // (only on screen, not in the saved file).
                 .when(*fill == RedactFill::White, |d| d.border_1().border_dashed().border_color(rgba(0x0000004d)))
@@ -3408,13 +3520,7 @@ impl Editor {
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
-                                let o = bounds.origin;
-                                let p = |x: f32, y: f32| o + point(px(x * s), px(y * s));
-                                let mut b = PathBuilder::stroke(px(s * 0.12));
-                                b.move_to(p(0.15, 0.5));
-                                b.line_to(p(0.4, 0.8));
-                                b.line_to(p(0.85, 0.15));
-                                if let Ok(path) = b.build() {
+                                if let Some(path) = fields::mark_path(&forms::Symbol::Check.mark(), bounds.origin, s) {
                                     window.paint_path(path, gpui::black());
                                 }
                             },
@@ -3426,10 +3532,7 @@ impl Editor {
         };
 
         let is_text = item.is_text();
-        let redact_fill = match item.kind {
-            ItemKind::Redact { fill } => Some(fill),
-            _ => None,
-        };
+        let redact_fill = item.redaction();
         let multi_page = self.doc.as_ref().is_some_and(|d| d.page_count() > 1);
         // Show the HUD above the field, or below it when there's no room on the page.
         let hud_above = item.y * z > 44.;
@@ -3451,7 +3554,7 @@ impl Editor {
             .cursor(CursorStyle::Arrow)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when_some(redact_fill, |h, current| {
-                let swatch = |fill: RedactFill, name: &'static str, cx: &mut Context<Self>| {
+                let swatch = |fill: RedactFill, name: &'static str, label: &'static str, cx: &mut Context<Self>| {
                     let active = current == fill;
                     div()
                         .id((name, id as usize))
@@ -3466,16 +3569,16 @@ impl Editor {
                             div()
                                 .size(px(14.))
                                 .rounded(px(3.))
-                                .bg(if fill == RedactFill::Black { gpui::black() } else { gpui::white() })
+                                .bg(redact_color(fill))
                                 .border_1()
                                 .border_color(rgba(0xffffff8c))
                                 .when(active, |d| d.border_2().border_color(ui::accent())),
                         )
-                        .tooltip(ui::tooltip(if fill == RedactFill::Black { "Black" } else { "White" }, None))
+                        .tooltip(ui::tooltip(label, None))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_redact_fill(fill, cx)))
                 };
-                h.child(swatch(RedactFill::Black, "redact-black", cx))
-                    .child(swatch(RedactFill::White, "redact-white", cx))
+                h.child(swatch(RedactFill::Black, "redact-black", "Black", cx))
+                    .child(swatch(RedactFill::White, "redact-white", "White", cx))
                     .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgba(0xffffff26)))
             })
             .when(is_text, |h| {
@@ -3645,12 +3748,12 @@ impl Editor {
                 let open_id = entry.id.clone();
                 let remove_id = entry.id.clone();
                 let output = entry.output.clone();
-                let original_missing = !entry.original.exists();
-                let output_exists = entry.output.exists();
+                let original_missing = !self.file_exists(&entry.original);
+                let output_exists = self.file_exists(&entry.output);
                 let fields = entry.items.len();
 
                 let thumb = match &entry.thumbnail {
-                    Some(path) if entry.thumb_height > 0 && path.exists() => {
+                    Some(path) if entry.thumb_height > 0 && self.file_exists(path) => {
                         let aspect = entry.thumb_width as f32 / entry.thumb_height as f32;
                         let (box_w, box_h) = (CARD_W - 2. * THUMB_PAD, THUMB_BOX_H - 2. * THUMB_PAD);
                         let w = box_w.min(box_h * aspect);
@@ -3885,19 +3988,12 @@ impl Editor {
     fn render_recents_search(&self, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.searching_recents();
         let query = self.recents_query.clone();
-        let caret = focused.then(|| div().relative().flex_none().w(px(1.5)).h(px(15.)).bg(ui::accent()).child(self.input_anchor(cx)));
-        div()
+        let caret = focused.then(|| ui::caret(px(15.)).relative().flex_none().child(self.input_anchor(cx)));
+        ui::text_field(if focused { ui::accent() } else { ui::border() })
             .id("recents-search")
-            .flex()
-            .items_center()
             .gap_1p5()
             .w(px(260.))
             .h(px(32.))
-            .px_2()
-            .rounded_md()
-            .bg(ui::surface())
-            .border_1()
-            .border_color(if focused { ui::accent() } else { ui::border() })
             .when(focused, |d| d.shadow(ui::ring()))
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(
@@ -3958,22 +4054,26 @@ impl Editor {
                 .when(top, |d| d.top(px(-12.)))
                 .when(!top, |d| d.bottom(px(-12.)))
         };
-        let thumbs: Vec<_> = doc
-            .order
-            .iter()
-            .enumerate()
-            .map(|(index, &source)| {
-                let (geom, view) = (&doc.loaded.pages[source], &doc.pages[source]);
-                let is_current = current == Some(index);
-                let fields = self.items.iter().filter(|i| i.page == index).count();
-                let aspect = geom.width / geom.height.max(1.);
-                let (w, h) = if aspect >= 1. || THUMB_W / aspect <= 1.5 * THUMB_W {
-                    (THUMB_W, THUMB_W / aspect)
-                } else {
-                    (1.5 * THUMB_W * aspect, 1.5 * THUMB_W)
-                };
-                let bounds = view.thumb_bounds.clone();
-                let drag = PageDrag { from: index, image: view.thumb.clone(), size: (w, h) };
+        let drawn = self.drawn_thumbs();
+        let mut thumbs = Vec::new();
+        // The height of the thumbnails left out since the last one drawn.
+        let mut skipped: Option<f32> = None;
+        for (index, &source) in doc.order.iter().enumerate() {
+            let (geom, view) = (&doc.loaded.pages[source], &doc.pages[source]);
+            let (w, h) = thumb_size(geom);
+            if !drawn[index] {
+                let above = skipped.map_or(0., |above| above + THUMB_GAP);
+                skipped = Some(above + h + THUMB_LABEL_GAP + LABEL_H);
+                continue;
+            }
+            if let Some(height) = skipped.take() {
+                thumbs.push(div().flex_none().h(px(height)).into_any_element());
+            }
+            let is_current = current == Some(index);
+            let fields = self.items.iter().filter(|i| i.page == index).count();
+            let (scroll, painted) = (self.thumbs_scroll.clone(), self.painted_thumb.clone());
+            let drag = PageDrag { from: index, image: view.thumb.clone(), size: (w, h) };
+            thumbs.push(
                 div()
                     .id(("thumb", index))
                     .group("thumb")
@@ -3982,11 +4082,16 @@ impl Editor {
                     .flex_col()
                     .flex_none()
                     .items_center()
-                    .gap_1p5()
+                    .gap(px(THUMB_LABEL_GAP))
                     .cursor(CursorStyle::PointingHand)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.scroll_to_page(index, cx)))
                     .on_drag(drag, |drag: &PageDrag, _, _, cx| cx.new(|_| drag.clone()))
-                    .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+                    .when(index == 0, |d| {
+                        let measure = move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            painted.set(Some(PaintedThumb { top: b.top(), scroll: scroll.offset().y }));
+                        };
+                        d.child(canvas(measure, |_, _, _, _| {}).absolute().size_full())
+                    })
                     .when(drop_target == Some(index), |d| d.child(drop_line(true)))
                     .when(index + 1 == page_count && drop_target == Some(page_count), |d| d.child(drop_line(false)))
                     .child(
@@ -4050,14 +4155,20 @@ impl Editor {
                     )
                     .child(
                         div()
+                            .h(px(LABEL_H))
+                            .line_height(px(LABEL_H))
                             .text_xs()
                             .text_color(if is_current { ui::accent() } else { ui::text_tertiary() })
                             .when(is_current, |d| d.font_weight(FontWeight::MEDIUM))
                             .group_hover("thumb", |s| s.text_color(ui::text_primary()))
                             .child((index + 1).to_string()),
                     )
-            })
-            .collect();
+                    .into_any_element(),
+            );
+        }
+        if let Some(height) = skipped {
+            thumbs.push(div().flex_none().h(px(height)).into_any_element());
+        }
 
         div()
             .id("thumb-rail")
@@ -4068,7 +4179,8 @@ impl Editor {
             .w(px(THUMB_RAIL_W))
             .h_full()
             .overflow_y_scroll()
-            .gap_5()
+            .track_scroll(&self.thumbs_scroll)
+            .gap(px(THUMB_GAP))
             .pt_4()
             .pb_6()
             .bg(ui::sidebar_bg())
@@ -4105,16 +4217,18 @@ impl Editor {
         let dots: String = "•".repeat(prompt.text.chars().count());
         let name = file_name(&prompt.path);
         let had_password = self.doc.as_ref().is_some_and(|d| d.loaded.password.is_some());
-        let (title, detail, placeholder, error, action) = match &prompt.purpose {
-            PasswordPurpose::Open => (
+        let copy_title = format!("{} for the copy of “{name}”", if had_password { "New password" } else { "Password" });
+        let (title, detail, placeholder, error, action, icon) = match &prompt.purpose {
+            PasswordPurpose::Open { .. } => (
                 format!("“{name}” is password protected"),
                 "Enter its password to open it. When you save a copy, you can keep, change or remove the password.",
                 "Password",
                 "That password isn't right. Try again.",
                 "Open",
+                "open",
             ),
             PasswordPurpose::NewPassword { first: None } => (
-                format!("{} for the copy of “{name}”", if had_password { "New password" } else { "Password" }),
+                copy_title,
                 if had_password {
                     "The copy you save will need this password to open. The original keeps its own."
                 } else {
@@ -4123,29 +4237,22 @@ impl Editor {
                 "Password",
                 "The passwords didn't match. Enter the password again.",
                 "Next",
+                "lock",
             ),
             PasswordPurpose::NewPassword { first: Some(_) } => (
-                format!("{} for the copy of “{name}”", if had_password { "New password" } else { "Password" }),
+                copy_title,
                 "Type the password again to make sure.",
                 "Repeat the password",
                 "",
                 "Save",
+                "lock",
             ),
         };
-        let field = div()
-            .flex()
-            .items_center()
-            .h(px(30.))
-            .px_2()
-            .rounded_md()
-            .bg(ui::surface())
-            .border_1()
-            .border_color(if prompt.wrong { ui::danger() } else { ui::accent() })
+        let field = ui::text_field(if prompt.wrong { ui::danger() } else { ui::accent() })
             .shadow(ui::ring())
-            .text_sm()
             .when(prompt.text.is_empty(), |d| d.child(div().text_color(ui::text_tertiary()).child(placeholder)))
             .when(!prompt.text.is_empty(), |d| d.child(dots))
-            .child(div().w(px(1.5)).h(px(16.)).bg(ui::accent()));
+            .child(ui::caret(px(16.)));
         let card = div()
             .w(px(360.))
             .flex()
@@ -4193,7 +4300,7 @@ impl Editor {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_password(cx))),
                     )
                     .child(
-                        ui::primary_button("password-open", if action == "Open" { "open" } else { "lock" }, action)
+                        ui::primary_button("password-open", icon, action)
                             .when(prompt.text.is_empty(), |d| d.opacity(0.5))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit_password(window, cx))),
                     ),
@@ -4234,9 +4341,25 @@ impl Editor {
             CursorStyle::Arrow
         };
         let cursor = if self.tool == Tool::Select { hand } else { CursorStyle::Crosshair };
-        let mut page_elements = Vec::with_capacity(page_count);
+        let drawn = self.drawn_pages();
+        let (_, gap) = self.layout_metrics();
+        let mut page_elements = Vec::new();
+        // The width and height of the pages left out since the last one drawn.
+        let mut skipped: Option<(f32, Pixels)> = None;
+        let space = |(width, height): (f32, Pixels)| div().flex_none().w(px(width)).h(height);
         for (index, &source) in doc.order.iter().enumerate() {
             let (geom, view) = (&doc.loaded.pages[source], &doc.pages[source]);
+            if !drawn[index] {
+                // It isn't anywhere on screen (see `page_at`).
+                if let Some(slot) = self.page_slots.get(index) {
+                    slot.set(Bounds::default());
+                }
+                // Each page takes its height and `gap`; the last one's gap is the list's own.
+                let (width, height) = skipped.unwrap_or((0., px(-PAGE_GAP)));
+                skipped = Some((width.max(geom.width * z), height + px(geom.height * z) + gap));
+                continue;
+            }
+            page_elements.extend(skipped.take().map(space));
             // Redactions always cover the other fields (they do in the saved file, too).
             let mut on_page: Vec<&Item> = self.items.iter().filter(|i| i.page == index).collect();
             on_page.sort_by_key(|i| i.is_redaction());
@@ -4306,16 +4429,19 @@ impl Editor {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap_2()
+                    .gap(px(PAGE_LABEL_GAP))
                     .child(page)
                     .child(
                         div()
+                            .h(px(LABEL_H))
+                            .line_height(px(LABEL_H))
                             .text_xs()
                             .text_color(ui::text_tertiary())
                             .child(format!("{} of {page_count}", index + 1)),
                     ),
             );
         }
+        page_elements.extend(skipped.map(space));
 
         let hint = match self.tool {
             Tool::Select => None,
@@ -4375,7 +4501,7 @@ impl Editor {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap_6()
+                            .gap(px(PAGE_GAP))
                             .flex_none()
                             .px_8()
                             .py_8()
@@ -4584,6 +4710,21 @@ fn relative_time(timestamp: i64) -> String {
 }
 
 /// Wrap a rendered page (already BGRA) as a GPUI image.
+/// Render pages (index and scale) of a document in the background, one after
+/// the other and sharing what they have in common (see `pdf::render_pages`).
+/// They arrive as they finish, for as long as they're being received and the
+/// task is kept.
+fn render_in_background(
+    pdf: Arc<hayro::hayro_syntax::Pdf>,
+    pages: Vec<(usize, f32)>,
+    executor: &gpui::BackgroundExecutor,
+) -> (mpsc::UnboundedReceiver<(usize, Option<pdf::RenderedPage>)>, Task<()>) {
+    let (done, rendered) = mpsc::unbounded();
+    let rendering = executor
+        .spawn(async move { pdf::render_pages(&pdf, pages, |index, page| done.unbounded_send((index, page)).is_ok()) });
+    (rendered, rendering)
+}
+
 fn to_render_image(page: pdf::RenderedPage) -> Option<Arc<RenderImage>> {
     let buffer = image::RgbaImage::from_raw(page.width, page.height, page.bgra)?;
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
@@ -4655,14 +4796,19 @@ mod tests {
     use super::*;
     use gpui::{EntityInputHandler as _, Modifiers, TestAppContext, VisualTestContext};
 
+    /// Where this run's tests keep their files.
+    fn test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn setup(cx: &mut TestAppContext) -> (Entity<Editor>, &mut VisualTestContext) {
         // A file per test: tests run in parallel, and rewriting a shared file
         // while another test reads it makes that test's open fail.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("sample-{n}.pdf"));
+        let path = test_dir().join(format!("sample-{n}.pdf"));
         std::fs::write(&path, crate::pdf::tests::sample_pdf()).unwrap();
 
         cx.update(bind_keys);
@@ -4695,7 +4841,11 @@ mod tests {
             assert_eq!(e.items.len(), 1);
             let item = &e.items[0];
             match &item.kind {
-                ItemKind::Text { text, .. } => assert_eq!(text, "Hi !"),
+                ItemKind::Text { text, font_size } => {
+                    assert_eq!(text, "Hi !");
+                    // Its box is as wide as the text will be in the saved file.
+                    assert!((item.w - pdf::measure_text(text, *font_size)).abs() < 0.01, "{}", item.w);
+                }
                 _ => panic!("expected text"),
             }
             assert_eq!(e.editing, None);
@@ -4747,7 +4897,7 @@ mod tests {
     #[gpui::test]
     fn filling_in_the_documents_own_form(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let dir = test_dir();
         let path = dir.join("form.pdf");
         std::fs::write(&path, crate::pdf::tests::sample_form()).unwrap();
         editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
@@ -4767,7 +4917,12 @@ mod tests {
 
         // Click into the name field and type; Tab goes on to the notes.
         cx.simulate_click(origin + point(px(150.), px(182.)), Modifiers::none());
-        cx.simulate_input("Jane");
+        cx.simulate_input("Jax");
+        cx.simulate_keystrokes("backspace");
+        // Pasting goes into the field as well (not onto the page, as a copied item would).
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("ne".into()));
+        editor.update(cx, |e, cx| e.paste(cx));
+        editor.read_with(cx, |e, _| assert!(e.items.is_empty()));
         cx.simulate_keystrokes("tab");
         cx.simulate_input("line one");
         cx.simulate_keystrokes("enter");
@@ -4803,13 +4958,25 @@ mod tests {
         assert_eq!(value(&editor, cx, "name"), text("Jane"));
         cx.simulate_keystrokes("secondary-shift-z");
 
-        // Saving puts the values into the form.
-        let (bytes, pages, form, values) = editor.read_with(cx, |e, _| {
-            let d = e.doc.as_ref().unwrap();
-            (d.loaded.bytes.clone(), d.loaded.pages.clone(), d.loaded.form.clone(), e.fields.clone())
+        // A field's text is laid out once for a value, and again when that changes.
+        let name = index(&editor, cx, "name");
+        editor.read_with(cx, |e, _| {
+            let field = &e.form()[name];
+            let layout = |value: &str| e.field_layout(name, field, 0, &field.widgets[0], &text(value));
+            let jane = layout("Jane");
+            assert_eq!(jane.runs[0].text, "Jane");
+            assert!(Rc::ptr_eq(&jane, &layout("Jane")));
+            assert_eq!(layout("Jo").runs[0].text, "Jo");
         });
+
+        // Saving puts the values into the form. The file is parsed once (it was, to
+        // read its form), and each save starts from that as it was.
+        let (loaded, values) = editor.read_with(cx, |e, _| (e.doc.as_ref().unwrap().loaded.clone(), e.fields.clone()));
+        let form = loaded.form.clone();
         let edits = crate::pdf::Edits { order: &[0, 1], form: &form, values: &values, ..Default::default() };
-        let out = crate::pdf::save(&bytes, &pages, &edits).unwrap().bytes;
+        let out = loaded.save(&edits).unwrap().bytes;
+        assert_eq!(loaded.save(&edits).unwrap().bytes, out);
+        assert_eq!(crate::pdf::save(&loaded.bytes, &loaded.pages, &edits).unwrap().bytes, out);
         let saved = crate::pdf::load(out).unwrap();
         let saved: Vec<_> = saved.form.iter().map(|f| (f.name.as_str(), f.value.clone())).collect();
         assert_eq!(saved[0], ("name", text("Jane")));
@@ -4822,24 +4989,22 @@ mod tests {
             id: "form-entry".into(),
             original: original.clone(),
             output: original.with_file_name("form-out.pdf"),
-            saved_at: 0,
             page_count: 2,
-            thumbnail: None,
-            thumb_width: 0,
-            thumb_height: 0,
-            items: Vec::new(),
-            watermark: None,
-            order: None,
             fields: vec![
                 ("name".into(), text("Restored")),
                 ("size".into(), FieldValue::On(Some("L".into()))),
                 ("agree".into(), FieldValue::On(Some("Bogus".into()))),
                 ("gone".into(), text("x")),
             ],
+            ..RecentEntry::default()
         };
         editor.update_in(cx, |e, window, cx| {
             e.close_document(window, cx);
-            assert!(e.open_path(original, window, cx));
+            e.open_path(original.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, cx| {
+            assert_eq!(e.doc.as_ref().map(|d| &d.path), Some(&original));
             e.restore_recent(&entry, cx);
             assert!(!e.dirty);
         });
@@ -4856,15 +5021,8 @@ mod tests {
             id: name.into(),
             original: PathBuf::from(format!("/docs/{name}")),
             output: PathBuf::from(format!("/docs/out/{name}")),
-            saved_at: 0,
             page_count: 1,
-            thumbnail: None,
-            thumb_width: 0,
-            thumb_height: 0,
-            items: Vec::new(),
-            watermark: None,
-            order: None,
-            fields: Vec::new(),
+            ..RecentEntry::default()
         };
         editor.update_in(cx, |e, window, cx| {
             e.close_document(window, cx);
@@ -4912,7 +5070,7 @@ mod tests {
     #[gpui::test]
     fn protected_pdfs_ask_for_their_password(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let dir = test_dir();
         let path = dir.join("protected.pdf");
         std::fs::write(&path, crate::pdf::tests::encrypted(&crate::pdf::tests::sample_pdf(), "sesame", "owner")).unwrap();
 
@@ -4944,10 +5102,11 @@ mod tests {
     #[gpui::test]
     fn saving_a_protected_pdf_asks_how_to_protect_the_copy(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let dir = test_dir();
         let path = dir.join("protected-save.pdf");
         std::fs::write(&path, crate::pdf::tests::encrypted(&crate::pdf::tests::sample_pdf(), "sesame", "owner")).unwrap();
         editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
         cx.simulate_input("sesame");
         cx.simulate_keystrokes("enter");
         let opens = |out: &Path, password: Option<&str>| {
@@ -5013,7 +5172,7 @@ mod tests {
     #[gpui::test]
     fn a_password_can_be_added_when_saving(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
-        let dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
+        let dir = test_dir();
         let out = dir.join("now-protected.pdf");
         cx.simulate_keystrokes("secondary-alt-s");
         cx.simulate_input("p4ss");
@@ -5045,9 +5204,7 @@ mod tests {
         editor.update(cx, |e, _| e.tool = Tool::Check);
         cx.simulate_click(origin + point(px(60.), px(60.)), Modifiers::none());
 
-        let sig_dir = std::env::temp_dir().join(format!("pdf_signer_ui_test_{}", std::process::id()));
-        std::fs::create_dir_all(&sig_dir).unwrap();
-        let sig_path = sig_dir.join("sig.png");
+        let sig_path = test_dir().join("sig.png");
         let mut img = image::RgbaImage::from_pixel(300, 100, image::Rgba([255, 255, 255, 255]));
         for x in 20..280 {
             img.put_pixel(x, 50, image::Rgba([0, 0, 80, 255]));
@@ -5156,6 +5313,119 @@ mod tests {
         cx.simulate_mouse_move(point(px(5.), px(5.)), None, Modifiers::none());
         editor.update_in(cx, |e, window, cx| e.drop_tool(Tool::Check, window, cx));
         editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 1));
+    }
+
+    /// A PDF of `count` blank pages, some upright and some on their side.
+    fn long_pdf(count: usize) -> Vec<u8> {
+        use lopdf::{Document, Object, dictionary};
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let kids: Vec<Object> = (0..count)
+            .map(|i| {
+                let (w, h) = if i % 3 == 0 { (792, 612) } else { (612, 792) };
+                let page = dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), w.into(), h.into()],
+                };
+                doc.add_object(page).into()
+            })
+            .collect();
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count as i64 }));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[gpui::test]
+    fn only_pages_near_the_viewport_are_drawn(cx: &mut TestAppContext) {
+        const PAGES: usize = 40;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1.0, window, cx));
+        cx.run_until_parked();
+        let drawn = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| (0..PAGES).filter(|&i| e.slot_bounds(i).is_some()).collect::<Vec<_>>())
+        };
+
+        // At the top, only the first few pages are there.
+        let at_top = drawn(&editor, cx);
+        assert!(at_top.contains(&0) && at_top.len() < 10 && at_top.iter().all(|&i| i < 10), "{at_top:?}");
+
+        // The rest still take up their space: a page far down is where it would be
+        // with every page drawn, and is drawn once it's scrolled to.
+        editor.update(cx, |e, cx| e.scroll_to_page(30, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let (painted, expected) = (e.slot_bounds(30).expect("drawn when scrolled to"), e.live_page_bounds(30).unwrap());
+            assert!((painted.top() - expected.top()).abs() < px(1.), "{painted:?} vs {expected:?}");
+            assert!((painted.left() - expected.left()).abs() < px(1.), "{painted:?} vs {expected:?}");
+            assert_eq!(e.current_page(), Some(30));
+        });
+        let in_the_middle = drawn(&editor, cx);
+        assert!(in_the_middle.starts_with(&[0]) && !in_the_middle.contains(&10), "{in_the_middle:?}");
+
+        // The same at a zoom that gives pages fractional sizes.
+        editor.update_in(cx, |e, window, cx| e.set_zoom(0.73, window, cx));
+        cx.run_until_parked();
+        editor.update(cx, |e, cx| e.scroll_to_page(37, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let (painted, expected) = (e.slot_bounds(37).expect("drawn when scrolled to"), e.live_page_bounds(37).unwrap());
+            assert!((painted.top() - expected.top()).abs() < px(1.), "{painted:?} vs {expected:?}");
+        });
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1.0, window, cx));
+        editor.update(cx, |e, cx| e.scroll_to_page(30, cx));
+        cx.run_until_parked();
+        let origin = editor.read_with(cx, |e, _| e.slot_bounds(30).unwrap().origin);
+
+        // It takes clicks and typing like any other page, and stays while it's typed into.
+        editor.update(cx, |e, _| e.tool = Tool::Text);
+        cx.simulate_click(origin + point(px(100.), px(150.)), Modifiers::none());
+        cx.simulate_input("a");
+        editor.update(cx, |e, cx| e.scroll_to_page(5, cx));
+        cx.run_until_parked();
+        assert!(drawn(&editor, cx).contains(&30));
+        cx.simulate_input("b");
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 1);
+            assert_eq!(e.items[0].page, 30);
+            assert!(matches!(&e.items[0].kind, ItemKind::Text { text, .. } if text == "ab"));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!drawn(&editor, cx).contains(&30));
+
+        // The thumbnail rail does the same, and is as long as with every thumbnail drawn.
+        let rail = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| (e.drawn_thumbs().iter().filter(|&&d| d).count(), e.thumbs_scroll.max_offset().height))
+        };
+        let (some, length) = rail(&editor, cx);
+        assert!(some < PAGES && length > px(0.), "{some} thumbnails, {length:?}");
+        editor.read_with(cx, |e, _| {
+            e.painted_thumb.set(None);
+            assert!(e.drawn_thumbs().iter().all(|&d| d));
+        });
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let full_length = editor.read_with(cx, |e, _| {
+            assert!(e.painted_thumb.get().is_some(), "the rail was drawn again");
+            e.thumbs_scroll.max_offset().height
+        });
+        assert!((length - full_length).abs() < px(1.), "{length:?} vs {full_length:?}");
+        // Thumbnails are dropped between the ones they're over.
+        editor.read_with(cx, |e, _| {
+            let (top, height) = e.thumb_tops().unwrap().nth(2).unwrap();
+            assert_eq!(e.page_gap_at(top + height / 2. + px(1.)), 3);
+            assert_eq!(e.page_gap_at(top - px(1.)), 2);
+        });
     }
 
     #[gpui::test]

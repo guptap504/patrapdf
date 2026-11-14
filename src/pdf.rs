@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use hayro::hayro_interpret::InterpreterSettings;
@@ -21,9 +21,13 @@ use crate::model::{Item, ItemKind, LINE_HEIGHT, PageGeom, RedactFill, TextMetric
 // Loading & rendering
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct LoadedPdf {
     /// The file's bytes, decrypted if it needed a password (the writer starts from these).
     pub bytes: Arc<Vec<u8>>,
+    /// `bytes` as the writer reads them, kept from the first time that was
+    /// needed (to open the file, or to save it), so they're parsed only once.
+    parsed: Arc<OnceLock<Document>>,
     pub pdf: Arc<Pdf>,
     pub pages: Vec<PageGeom>,
     /// The password the file was opened with, if it needed one. Saved copies
@@ -31,6 +35,22 @@ pub struct LoadedPdf {
     pub password: Option<String>,
     /// Form fields that can be filled in.
     pub form: Arc<Vec<Field>>,
+}
+
+impl LoadedPdf {
+    /// The document for the writer to change: a copy of the parsed file.
+    fn document(&self) -> Result<Document> {
+        if let Some(doc) = self.parsed.get() {
+            return Ok(doc.clone());
+        }
+        let doc = open_document(&self.bytes)?;
+        Ok(self.parsed.get_or_init(|| doc).clone())
+    }
+
+    /// Produce the edited copy of this document (see [`apply`]).
+    pub fn save(&self, edits: &Edits) -> Result<Written> {
+        apply(self.document()?, &self.pages, edits)
+    }
 }
 
 /// A PDF that can't be opened without (the right) password.
@@ -51,32 +71,39 @@ impl std::fmt::Display for PasswordError {
 
 impl std::error::Error for PasswordError {}
 
+/// Open a PDF as it is in the file, for tests to look at what was saved.
+#[cfg(test)]
 pub fn load(bytes: Vec<u8>) -> Result<LoadedPdf> {
     load_with_password(bytes, None)
 }
 
-/// Open a PDF, decrypting it with `password` if it needs one. Fails with a
-/// [`PasswordError`] when a password is needed but missing or wrong.
+/// Like [`load`], for a PDF that may need `password`.
+#[cfg(test)]
 pub fn load_with_password(bytes: Vec<u8>, password: Option<&str>) -> Result<LoadedPdf> {
     load_inner(bytes, password, false)
 }
 
-/// Open a PDF for the editor: like [`load_with_password`], but the pages
-/// render without the form fields that can be filled in, as the editor draws
-/// those itself (with the values being typed).
+/// Open a PDF for the editor, decrypting it with `password` if it needs one.
+/// Fails with a [`PasswordError`] when a password is needed but missing or
+/// wrong. The pages render without the form fields that can be filled in, as
+/// the editor draws those itself (with the values being typed).
 pub fn open_for_editing(bytes: Vec<u8>, password: Option<&str>) -> Result<LoadedPdf> {
     load_inner(bytes, password, true)
 }
 
 fn load_inner(bytes: Vec<u8>, password: Option<&str>, hide_fields: bool) -> Result<LoadedPdf> {
     let bytes = Arc::new(bytes);
+    // The file as lopdf reads it, once that has been needed.
+    let mut parsed: Option<Document> = None;
     let (bytes, pdf, password) = match Pdf::new(bytes.clone()) {
         Ok(pdf) => (bytes, pdf, None),
         Err(LoadPdfError::Decryption(DecryptionError::PasswordProtected)) => {
             let Some(password) = password else { return Err(PasswordError::Required.into()) };
             // Work on a decrypted copy from here on: the renderer and the writer
             // both see the same plain file. (lopdf takes the owner password too.)
-            let plain = Arc::new(decrypt(&bytes, password)?);
+            let (doc, plain) = decrypt(&bytes, password)?;
+            parsed = Some(doc);
+            let plain = Arc::new(plain);
             let pdf = Pdf::new(plain.clone()).map_err(|e| anyhow!("could not read the decrypted PDF: {e:?}"))?;
             (plain, pdf, Some(password.to_string()))
         }
@@ -102,21 +129,30 @@ fn load_inner(bytes: Vec<u8>, password: Option<&str>, hide_fields: bool) -> Resu
     let mut pdf = pdf;
     let mut form = Vec::new();
     if has_form(&pdf) {
-        let mut doc = Document::load_mem(&bytes).context("lopdf could not parse the PDF")?;
+        let doc = match parsed.take() {
+            Some(doc) => doc,
+            None => Document::load_mem(&bytes).context("lopdf could not parse the PDF")?,
+        };
         form = forms::read(&doc, &pages);
         if hide_fields && !form.is_empty() {
+            // Only what is shown changes; the writer starts from the file as it is.
+            let mut shown = doc.clone();
             for widget in form.iter().flat_map(|f| &f.widgets) {
-                if let Ok(dict) = doc.get_dictionary_mut(widget.id) {
+                if let Ok(dict) = shown.get_dictionary_mut(widget.id) {
                     let flags = dict.get(b"F").and_then(Object::as_i64).unwrap_or(0);
-                    dict.set("F", flags | 2);
+                    dict.set("F", flags | forms::ANNOT_HIDDEN);
                 }
             }
-            let shown = save_document(doc)?;
+            let shown = save_document(&mut shown, None)?;
             pdf = Pdf::new(shown).map_err(|e| anyhow!("could not read PDF: {e:?}"))?;
         }
+        parsed = Some(doc);
     }
+    // One that still has to be decrypted is left for the writer to open (see `open_document`).
+    let parsed = parsed.filter(|doc| !doc.is_encrypted());
     Ok(LoadedPdf {
         bytes,
+        parsed: Arc::new(parsed.map(OnceLock::from).unwrap_or_default()),
         pdf: Arc::new(pdf),
         pages,
         password,
@@ -134,8 +170,9 @@ fn has_form(pdf: &Pdf) -> bool {
         .is_some_and(|fields| fields.iter::<hayro::hayro_syntax::object::Object>().next().is_some())
 }
 
-/// The file decrypted with `password` (the user or the owner password).
-fn decrypt(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
+/// The file decrypted with `password` (the user or the owner password): as a
+/// document, and as the bytes of that document.
+fn decrypt(bytes: &[u8], password: &str) -> Result<(Document, Vec<u8>)> {
     let mut doc = Document::load_mem_with_options(bytes, lopdf::LoadOptions::with_password(password)).map_err(|e| match e {
         lopdf::Error::InvalidPassword => anyhow::Error::from(PasswordError::Incorrect),
         e => anyhow!("could not decrypt the PDF: {e}"),
@@ -145,16 +182,17 @@ fn decrypt(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         doc.decrypt(password).map_err(|e| anyhow!("could not decrypt the PDF: {e}"))?;
     }
     doc.trailer.remove(b"Encrypt");
-    save_document(doc)
+    doc.encryption_state = None;
+    let plain = save_document(&mut doc, None)?;
+    Ok((doc, plain))
 }
 
-/// Encrypt a finished PDF with AES-256, with `password` as both the user and
-/// the owner password (so it opens with the password it was opened with).
-fn protect(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
+/// Encrypt a finished document with AES-256, with `password` as both the user
+/// and the owner password (so it opens with the password it was opened with).
+fn encrypt(doc: &mut Document, password: &str) -> Result<()> {
     use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
     use lopdf::{EncryptionState, EncryptionVersion, Permissions};
 
-    let mut doc = Document::load_mem(bytes).context("lopdf could not parse the PDF")?;
     let mut key = [0u8; 32];
     let mut id = [0u8; 16];
     getrandom::fill(&mut key).and_then(|_| getrandom::fill(&mut id)).map_err(|e| anyhow!("no secure random numbers: {e}"))?;
@@ -170,16 +208,11 @@ fn protect(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         permissions: Permissions::all(),
     })
     .map_err(|e| anyhow!("could not set up encryption: {e}"))?;
-    // Streams are compressed first: encrypted data doesn't compress.
-    doc.compress();
     if !doc.trailer.has(b"ID") {
         let id = Object::String(id.to_vec(), lopdf::StringFormat::Hexadecimal);
         doc.trailer.set("ID", vec![id.clone(), id]);
     }
-    doc.encrypt(&state).map_err(|e| anyhow!("could not encrypt the PDF: {e}"))?;
-    let mut out = Vec::new();
-    doc.save_to(&mut out).context("could not serialize PDF")?;
-    Ok(out)
+    doc.encrypt(&state).map_err(|e| anyhow!("could not encrypt the PDF: {e}"))
 }
 
 /// A rendered page bitmap in BGRA order (what GPUI expects).
@@ -190,16 +223,39 @@ pub struct RenderedPage {
 }
 
 pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Option<RenderedPage> {
-    render(pdf, index, scale, false)
+    render(pdf, &RenderCache::new(), index, scale, false)
 }
 
-fn render(pdf: &Pdf, index: usize, scale: f32, transparent: bool) -> Option<RenderedPage> {
-    let pages = pdf.pages();
-    let page = pages.get(index)?;
+/// Render several pages (index and scale) of a document, handing each to
+/// `each` as it's done; `each` says whether to go on. What drawing one page
+/// works out (the document's fonts, glyph shapes and bitmaps, colour
+/// profiles) is kept for the rest of them.
+pub fn render_pages(
+    pdf: &Pdf,
+    pages: impl IntoIterator<Item = (usize, f32)>,
+    mut each: impl FnMut(usize, Option<RenderedPage>) -> bool,
+) {
     let cache = RenderCache::new();
+    for (index, scale) in pages {
+        if !each(index, render(pdf, &cache, index, scale, false)) {
+            break;
+        }
+    }
+}
+
+/// Render the first page of a PDF (one that opens without a password),
+/// `width_px` pixels wide.
+pub fn render_first_page(bytes: Vec<u8>, width_px: f32) -> Option<RenderedPage> {
+    let pdf = Pdf::new(bytes).ok()?;
+    let (width, _) = pdf.pages().first()?.render_dimensions();
+    render_page(&pdf, 0, width_px / width.max(1.))
+}
+
+fn render<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, index: usize, scale: f32, transparent: bool) -> Option<RenderedPage> {
+    let page = pdf.pages().get(index)?;
     let pixmap = hayro::render(
         page,
-        &cache,
+        cache,
         &InterpreterSettings::default(),
         &RenderSettings::default(),
         &PixmapSettings {
@@ -236,8 +292,8 @@ pub fn render_watermark(width: f32, height: f32, watermark: &Watermark, scale: f
     let pages_id = doc.new_object_id();
     let mut fonts = Fonts::default();
     let mut resources = PageResources::default();
-    let wm = WatermarkResources::add(&mut doc, watermark);
-    let ops = watermark_ops(&mut doc, width, height, flip, watermark, wm, &mut fonts, &mut resources)?;
+    let state = watermark_state(&mut doc, watermark);
+    let ops = watermark_ops(&mut doc, width, height, flip, watermark, state, &mut fonts, &mut resources)?;
     fonts.finish(&mut doc).ok()?;
     let content = doc.add_object(Stream::new(dictionary! {}, ops.into_bytes()));
     let page = doc.add_object(dictionary! {
@@ -256,7 +312,7 @@ pub fn render_watermark(width: f32, height: f32, watermark: &Watermark, scale: f
     let mut bytes = Vec::new();
     doc.save_to(&mut bytes).ok()?;
     let pdf = Pdf::new(bytes).ok()?;
-    render(&pdf, 0, scale, true)
+    render(&pdf, &RenderCache::new(), 0, scale, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,12 +326,7 @@ const PAGE_IMAGE: &str = "PdfSignerPage";
 /// Resolution of redacted pages, which are rebuilt as images: 3 × 72 = 216 dpi.
 const REDACT_SCALE: f32 = 3.0;
 
-/// Produce a new PDF with the watermark and all overlay items burned into the
-/// page content, then apply any redactions.
-///
-/// `source_pages` are the original document's pages; `order` lists, for each
-/// page of the output, which original page it is (pages left out are deleted).
-/// Item page numbers refer to positions in `order`.
+/// [`save`] with just pages, items and a watermark, for tests.
 #[cfg(test)]
 pub fn write(
     original: &[u8],
@@ -310,43 +361,54 @@ pub struct Written {
     pub missing: BTreeSet<char>,
 }
 
-/// Produce the edited copy of a document: see [`write`].
+/// [`apply`] to a file's bytes, for tests (the app saves a [`LoadedPdf`]).
+#[cfg(test)]
 pub fn save(original: &[u8], source_pages: &[PageGeom], edits: &Edits) -> Result<Written> {
+    apply(open_document(original)?, source_pages, edits)
+}
+
+/// Produce the edited copy of a document: a new PDF with the form filled in,
+/// the watermark and all overlay items burned into the page content, and then
+/// any redactions applied.
+///
+/// `source_pages` are the original document's pages; `edits.order` lists, for
+/// each page of the output, which original page it is (pages left out are
+/// deleted). Item page numbers refer to positions in `order`.
+fn apply(mut doc: Document, source_pages: &[PageGeom], edits: &Edits) -> Result<Written> {
     let Edits { order, items, watermark, metrics, password, form, values } = *edits;
     let identity = order.len() == source_pages.len() && order.iter().enumerate().all(|(i, &p)| i == p);
-    let (arranged, pages): (Vec<u8>, Vec<PageGeom>) = if identity {
-        (original.to_vec(), source_pages.to_vec())
+    let pages: Vec<PageGeom> = if identity {
+        source_pages.to_vec()
     } else {
         let pages = order
             .iter()
             .map(|&i| source_pages.get(i).cloned().ok_or_else(|| anyhow!("page {} does not exist", i + 1)))
             .collect::<Result<_>>()?;
-        (arrange_pages(original, order)?, pages)
+        arrange_pages(&mut doc, order)?;
+        pages
     };
     let pages = pages.as_slice();
     let watermark = watermark.filter(|w| !w.text.trim().is_empty());
-    let form = if values.len() == form.len() { form.iter().zip(values).collect() } else { Vec::new() };
-    let (mut bytes, missing) = write_overlays(&arranged, pages, items, watermark, metrics, &form)?;
-    let redactions: Vec<&Item> = items.iter().filter(|i| i.is_redaction() && i.w >= 1. && i.h >= 1.).collect();
+    let filled: Vec<_> = if values.len() == form.len() { forms::changed(form, values).collect() } else { Vec::new() };
+    let redactions: Vec<(&Item, RedactFill)> =
+        items.iter().filter(|i| i.w >= 1. && i.h >= 1.).filter_map(|i| Some((i, i.redaction()?))).collect();
+    let missing = write_overlays(&mut doc, pages, items, watermark, metrics, &filled)?;
     if !redactions.is_empty() {
-        bytes = redact(&bytes, pages, &redactions)?;
+        // Redacted pages become pictures of themselves as written so far.
+        let written = save_document(&mut doc, None)?;
+        redact(&mut doc, written, pages, &redactions)?;
     }
-    if let Some(password) = password {
-        bytes = protect(&bytes, password)?;
-    }
-    Ok(Written { bytes, missing })
+    Ok(Written { bytes: save_document(&mut doc, password)?, missing })
 }
 
 fn write_overlays(
-    original: &[u8],
+    doc: &mut Document,
     pages: &[PageGeom],
     items: &[Item],
     watermark: Option<&Watermark>,
     metrics: TextMetrics,
-    form: &[(&Field, &FieldValue)],
-) -> Result<(Vec<u8>, BTreeSet<char>)> {
-    let mut doc = open_document(original)?;
-
+    filled: &[(&Field, &FieldValue)],
+) -> Result<BTreeSet<char>> {
     let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
     if page_ids.len() != pages.len() {
         bail!(
@@ -357,8 +419,8 @@ fn write_overlays(
     }
 
     let mut fonts = Fonts::default();
-    fill_form(&mut doc, form, metrics, &mut fonts)?;
-    let watermark_res = watermark.map(|w| WatermarkResources::add(&mut doc, w));
+    fill_form(doc, filled, metrics, &mut fonts)?;
+    let watermark = watermark.map(|w| (w, watermark_state(doc, w)));
     let mut images: HashMap<PathBuf, (ObjectId, String)> = HashMap::new();
 
     for (page_index, (&page_id, geom)) in page_ids.iter().zip(pages).enumerate() {
@@ -372,8 +434,8 @@ fn write_overlays(
         let mut resources = PageResources::default();
 
         // The watermark goes over the page content but under the filled-in fields.
-        if let (Some(wm), Some(res)) = (watermark, watermark_res) {
-            if let Some(wm_ops) = watermark_ops(&mut doc, geom.width, geom.height, v, wm, res, &mut fonts, &mut resources) {
+        if let Some((wm, state)) = watermark {
+            if let Some(wm_ops) = watermark_ops(doc, geom.width, geom.height, v, wm, state, &mut fonts, &mut resources) {
                 ops.push_str(&wm_ops);
             }
         }
@@ -389,7 +451,7 @@ fn write_overlays(
                     ops.push_str(&format!("q {} cm 0 g BT\n", fmt_m(m)));
                     for (i, line) in text.split('\n').enumerate() {
                         let baseline = (metrics.baseline_ratio + i as f32 * LINE_HEIGHT) * font_size;
-                        fonts.show_text(&mut doc, line, false, *font_size, (0., -baseline), &mut ops, &mut resources);
+                        fonts.show_text(doc, line, false, *font_size, (0., -baseline), &mut ops, &mut resources);
                     }
                     ops.push_str("ET Q\n");
                 }
@@ -397,7 +459,7 @@ fn write_overlays(
                     let (img_id, name) = match images.get(&sig.path) {
                         Some(entry) => entry.clone(),
                         None => {
-                            let id = add_image(&mut doc, &sig.path)?;
+                            let id = add_image(doc, &sig.path)?;
                             let entry = (id, format!("PdfSignerIm{}", images.len()));
                             images.insert(sig.path.clone(), entry.clone());
                             entry
@@ -411,17 +473,9 @@ fn write_overlays(
                     ops.push_str(&format!("q {} cm /{name} Do Q\n", fmt_m(m)));
                 }
                 ItemKind::Check => {
-                    let s = item.w as f64;
                     let m = v * Affine::translate((item.x as f64, (item.y + item.h) as f64)) * Affine::FLIP_Y;
-                    let p = |x: f64, y: f64| format!("{} {}", num(x * s), num(y * s));
-                    ops.push_str(&format!(
-                        "q {} cm 0 G {} w 1 J 1 j {} m {} l {} l S Q\n",
-                        fmt_m(m),
-                        num(s * 0.12),
-                        p(0.15, 0.5),
-                        p(0.4, 0.2),
-                        p(0.85, 0.85),
-                    ));
+                    let mark = mark_ops(&forms::Symbol::Check.mark(), (0., 0.), item.w);
+                    ops.push_str(&format!("q {} cm 0 G 1 J 1 j\n{mark}Q\n", fmt_m(m)));
                 }
                 // Applied afterwards by `redact`, on top of everything else.
                 ItemKind::Redact { .. } => {}
@@ -431,13 +485,12 @@ fn write_overlays(
         if ops.is_empty() {
             continue;
         }
-        let merged = resources.merge_into(&doc, effective_resources(&doc, page_id));
+        let merged = resources.merge_into(doc, effective_resources(doc, page_id));
         doc.get_dictionary_mut(page_id)?.set("Resources", merged);
-        append_content(&mut doc, page_id, ops.into_bytes())?;
+        append_content(doc, page_id, ops.into_bytes())?;
     }
 
-    let missing = fonts.finish(&mut doc)?;
-    Ok((save_document(doc)?, missing))
+    fonts.finish(doc)
 }
 
 /// Writes text into content streams: in standard Helvetica when it can show
@@ -462,40 +515,43 @@ impl Fonts {
         })
     }
 
-    /// Lay out a line that Helvetica can't show.
-    fn shape(&mut self, text: &str, bold: bool) -> fonts::Line {
-        let line = FontBook::system().shape(text, bold);
-        self.missing.extend(line.missing.iter().copied());
+    /// Lay out a line of text, noting the characters no font can show.
+    fn line<'a>(&mut self, text: &'a str, bold: bool) -> TextLine<'a> {
+        let line = TextLine::new(text, bold);
+        if let TextLine::Shaped(shaped) = &line {
+            self.missing.extend(shaped.missing.iter().copied());
+        }
         line
     }
 
-    /// Draw a shaped line (between BT and ET) with its baseline starting at `at`.
-    fn show_shaped(&mut self, doc: &mut Document, line: &fonts::Line, size: f32, at: (f32, f32), ops: &mut String, res: &mut PageResources) {
-        let embedder = self.embedder.get_or_insert_with(|| Embedder::new(FontBook::system()));
-        embedder.show(doc, line, size, at, ops, &mut res.fonts);
+    /// Draw a line (between BT and ET) with its baseline starting at `at`.
+    fn show(&mut self, doc: &mut Document, line: &TextLine, size: f32, at: (f32, f32), ops: &mut String, res: &mut PageResources) {
+        match line {
+            TextLine::Standard { text: "", .. } => {}
+            TextLine::Standard { text, bold } => {
+                let name = if *bold { HELV_BOLD } else { HELV };
+                let font = self.helvetica(doc, *bold);
+                PageResources::add(&mut res.fonts, name, font);
+                ops.push_str(&format!(
+                    "/{name} {} Tf 1 0 0 1 {} {} Tm <{}> Tj\n",
+                    num(size as f64),
+                    num(at.0 as f64),
+                    num(at.1 as f64),
+                    winansi_hex(text)
+                ));
+            }
+            TextLine::Shaped(shaped) => {
+                let embedder = self.embedder.get_or_insert_with(|| Embedder::new(FontBook::system()));
+                embedder.show(doc, shaped, size, at, ops, &mut res.fonts);
+            }
+        }
     }
 
     /// Draw one line of text (between BT and ET) with its baseline starting at `at`.
     #[allow(clippy::too_many_arguments)]
     fn show_text(&mut self, doc: &mut Document, text: &str, bold: bool, size: f32, at: (f32, f32), ops: &mut String, res: &mut PageResources) {
-        if text.is_empty() {
-            return;
-        }
-        if winansi_encodable(text) {
-            let name = if bold { HELV_BOLD } else { HELV };
-            let font = self.helvetica(doc, bold);
-            PageResources::add(&mut res.fonts, name, font);
-            ops.push_str(&format!(
-                "/{name} {} Tf 1 0 0 1 {} {} Tm <{}> Tj\n",
-                num(size as f64),
-                num(at.0 as f64),
-                num(at.1 as f64),
-                winansi_hex(text)
-            ));
-        } else {
-            let line = self.shape(text, bold);
-            self.show_shaped(doc, &line, size, at, ops, res);
-        }
+        let line = self.line(text, bold);
+        self.show(doc, &line, size, at, ops, res);
     }
 
     /// Write the embedded fonts; returns the characters no font could show.
@@ -504,6 +560,35 @@ impl Fonts {
             embedder.finish(doc)?;
         }
         Ok(self.missing)
+    }
+}
+
+/// A line of text as the writer draws it: in standard Helvetica when that can
+/// show all of it, otherwise shaped with the installed fonts.
+enum TextLine<'a> {
+    Standard { text: &'a str, bold: bool },
+    Shaped(Arc<fonts::Line>),
+}
+
+impl<'a> TextLine<'a> {
+    fn new(text: &'a str, bold: bool) -> Self {
+        Self::standard(text, bold).unwrap_or_else(|| Self::Shaped(FontBook::system().shape(text, bold)))
+    }
+
+    /// The line in standard Helvetica, if that can show all of it.
+    fn standard(text: &'a str, bold: bool) -> Option<Self> {
+        winansi_encodable(text).then_some(Self::Standard { text, bold })
+    }
+
+    /// Advance width of the line, in em.
+    fn width(&self) -> f64 {
+        match self {
+            Self::Standard { text, bold } => {
+                let widths = if *bold { &HELVETICA_BOLD_WIDTHS } else { &HELVETICA_WIDTHS };
+                text.chars().map(|c| widths[winansi(c) as usize] as u32).sum::<u32>() as f64 / 1000.
+            }
+            Self::Shaped(shaped) => shaped.width as f64,
+        }
     }
 }
 
@@ -552,8 +637,13 @@ fn open_document(bytes: &[u8]) -> Result<Document> {
     Ok(doc)
 }
 
-fn save_document(mut doc: Document) -> Result<Vec<u8>> {
+/// The bytes of a finished document, encrypted with `password` if there is one.
+fn save_document(doc: &mut Document, password: Option<&str>) -> Result<Vec<u8>> {
+    // Streams are compressed before they're encrypted: encrypted data doesn't compress.
     doc.compress();
+    if let Some(password) = password {
+        encrypt(doc, password)?;
+    }
     let mut out = Vec::new();
     doc.save_to(&mut out).context("could not serialize PDF")?;
     Ok(out)
@@ -573,8 +663,7 @@ const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 /// just from the page list: references to them (bookmarks, links, named
 /// destinations) are cleared, form fields living on them are dropped, as is the
 /// structure tree, and everything left unreferenced is pruned.
-fn arrange_pages(original: &[u8], order: &[usize]) -> Result<Vec<u8>> {
-    let mut doc = open_document(original)?;
+fn arrange_pages(doc: &mut Document, order: &[usize]) -> Result<()> {
     let ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
     if order.is_empty() {
         bail!("a PDF needs at least one page");
@@ -597,7 +686,7 @@ fn arrange_pages(original: &[u8], order: &[usize]) -> Result<Vec<u8>> {
             if doc.get_dictionary(id)?.has(key.as_bytes()) {
                 continue;
             }
-            if let Some(value) = inherited(&doc, id, key) {
+            if let Some(value) = inherited(doc, id, key) {
                 doc.get_dictionary_mut(id)?.set(key, value);
             }
         }
@@ -612,9 +701,9 @@ fn arrange_pages(original: &[u8], order: &[usize]) -> Result<Vec<u8>> {
     if !removed.is_empty() {
         let mut removed_annots = HashSet::new();
         for &id in &removed {
-            removed_annots.extend(page_annotations(&doc, id));
+            removed_annots.extend(page_annotations(doc, id));
         }
-        strip_form_fields(&mut doc, &removed_annots);
+        strip_form_fields(doc, &removed_annots);
         if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
             catalog.remove(b"StructTreeRoot");
             catalog.remove(b"MarkInfo");
@@ -624,7 +713,7 @@ fn arrange_pages(original: &[u8], order: &[usize]) -> Result<Vec<u8>> {
         }
         doc.prune_objects();
     }
-    save_document(doc)
+    Ok(())
 }
 
 /// The value of `key` inherited from the page's ancestors, if any.
@@ -652,7 +741,7 @@ fn clear_references(object: &mut Object, targets: &HashSet<ObjectId>) {
 }
 
 /// The annotation objects of a page.
-fn page_annotations(doc: &Document, page_id: ObjectId) -> Vec<ObjectId> {
+pub(crate) fn page_annotations(doc: &Document, page_id: ObjectId) -> Vec<ObjectId> {
     let annots = doc.get_dictionary(page_id).ok().and_then(|p| p.get(b"Annots").ok().cloned());
     let annots = match annots {
         Some(Object::Reference(id)) => doc.get_object(id).ok().cloned(),
@@ -664,7 +753,8 @@ fn page_annotations(doc: &Document, page_id: ObjectId) -> Vec<ObjectId> {
     }
 }
 
-fn num(v: f64) -> String {
+/// A number as written in content streams: up to four decimals.
+pub(crate) fn num(v: f64) -> String {
     let s = format!("{v:.4}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     if s == "-0" { "0".into() } else { s.to_string() }
@@ -822,26 +912,19 @@ fn append_content(doc: &mut Document, page_id: ObjectId, overlay: Vec<u8>) -> Re
 // Watermark
 // ---------------------------------------------------------------------------
 
-/// The transparency state for the watermark.
-#[derive(Clone, Copy)]
-struct WatermarkResources {
-    state: ObjectId,
-}
-
-impl WatermarkResources {
-    fn add(doc: &mut Document, watermark: &Watermark) -> Self {
-        let opacity = watermark.opacity.clamp(0., 1.);
-        let state = doc.add_object(dictionary! {
-            "Type" => "ExtGState",
-            "CA" => opacity,
-            "ca" => opacity,
-        });
-        Self { state }
-    }
+/// The transparency state for the watermark, as a document object.
+fn watermark_state(doc: &mut Document, watermark: &Watermark) -> ObjectId {
+    let opacity = watermark.opacity.clamp(0., 1.);
+    doc.add_object(dictionary! {
+        "Type" => "ExtGState",
+        "CA" => opacity,
+        "ca" => opacity,
+    })
 }
 
 /// Content-stream operators that draw the watermark on a page of the given
-/// displayed size. `v` maps view space to the page's user space.
+/// displayed size. `v` maps view space to the page's user space, and `state`
+/// is the watermark's [`watermark_state`].
 #[allow(clippy::too_many_arguments)]
 fn watermark_ops(
     doc: &mut Document,
@@ -849,18 +932,13 @@ fn watermark_ops(
     height: f32,
     v: Affine,
     watermark: &Watermark,
-    wm: WatermarkResources,
+    state: ObjectId,
     fonts: &mut Fonts,
     res: &mut PageResources,
 ) -> Option<String> {
     let text = watermark.text.trim();
-    // Width in em, and a shaped line when Helvetica can't show the text.
-    let (em, shaped) = if winansi_encodable(text) {
-        (text.chars().map(|c| HELVETICA_BOLD_WIDTHS[winansi(c) as usize] as f64).sum::<f64>() / 1000., None)
-    } else {
-        let line = fonts.shape(text, true);
-        (line.width as f64, Some(line))
-    };
+    let line = fonts.line(text, true);
+    let em = line.width();
     if em <= 0. {
         return None;
     }
@@ -876,13 +954,10 @@ fn watermark_ops(
     // space (y down), rotating by -angle tilts the text up to the right.
     let m = v * Affine::translate((w / 2., h / 2.)) * Affine::rotate(-angle) * Affine::FLIP_Y;
     let [r, g, b] = [16, 8, 0].map(|shift| num(((watermark.color >> shift) & 0xff) as f64 / 255.));
-    PageResources::add(&mut res.states, WM_GS, wm.state);
+    PageResources::add(&mut res.states, WM_GS, state);
     let mut ops = format!("q /{WM_GS} gs {r} {g} {b} rg {} cm BT\n", fmt_m(m));
     let at = ((-em * size / 2.) as f32, (-CAP_HEIGHT * size / 2.) as f32);
-    match shaped {
-        Some(line) => fonts.show_shaped(doc, &line, size as f32, at, &mut ops, res),
-        None => fonts.show_text(doc, text, true, size as f32, at, &mut ops, res),
-    }
+    fonts.show(doc, &line, size as f32, at, &mut ops, res);
     ops.push_str("ET Q\n");
     Some(ops)
 }
@@ -913,14 +988,14 @@ const HELVETICA_BOLD_WIDTHS: [u16; 256] = [
 // Form fields
 // ---------------------------------------------------------------------------
 
-/// Write changed field values into the form: the value itself (so other apps
+/// Write new field values into the form: the value itself (so other apps
 /// read it and the form stays fillable) and a new appearance showing it.
-fn fill_form(doc: &mut Document, form: &[(&Field, &FieldValue)], metrics: TextMetrics, fonts: &mut Fonts) -> Result<()> {
+/// Fields not among `filled` keep their original appearance.
+fn fill_form(doc: &mut Document, filled: &[(&Field, &FieldValue)], metrics: TextMetrics, fonts: &mut Fonts) -> Result<()> {
     let mut changed = false;
-    for &(field, value) in form {
-        // Unchanged fields keep their original appearance; fields on deleted
-        // pages are gone.
-        if *value == field.value || doc.get_dictionary(field.id).is_err() {
+    for &(field, value) in filled {
+        // Fields on deleted pages are gone.
+        if doc.get_dictionary(field.id).is_err() {
             continue;
         }
         changed = true;
@@ -952,8 +1027,9 @@ fn fill_form(doc: &mut Document, form: &[(&Field, &FieldValue)], metrics: TextMe
                 doc.get_dictionary_mut(field.id)?.set("V", Object::Name(state.into_bytes()));
                 for widget in &field.widgets {
                     let Ok(dict) = doc.get_dictionary(widget.id) else { continue };
-                    let on = widget.on_state.clone().unwrap_or_else(|| "Yes".into());
-                    if !has_appearance(doc, dict, &on) {
+                    // Button widgets always have an "on" state (see `forms::read`).
+                    let Some(on) = widget.on_state.clone() else { continue };
+                    if !forms::normal_appearances(doc, dict).is_some_and(|normal| normal.has(on.as_bytes())) {
                         let (on_ap, off_ap) = button_appearances(widget);
                         let (on_ap, off_ap) = (doc.add_object(on_ap), doc.add_object(off_ap));
                         let mut normal = Dictionary::new();
@@ -970,42 +1046,40 @@ fn fill_form(doc: &mut Document, form: &[(&Field, &FieldValue)], metrics: TextMe
     if changed {
         // An XFA form inside the file would take precedence over the fields in
         // some apps, showing the old values.
-        let catalog_id = doc.trailer.get(b"Root").and_then(Object::as_reference)?;
-        let form_ref = doc.get_dictionary(catalog_id)?.get(b"AcroForm").ok().cloned();
-        match form_ref {
-            Some(Object::Reference(id)) => {
-                if let Ok(form) = doc.get_dictionary_mut(id) {
-                    form.remove(b"XFA");
-                }
-            }
-            Some(Object::Dictionary(_)) => {
-                if let Ok(Object::Dictionary(form)) = doc.get_dictionary_mut(catalog_id)?.get_mut(b"AcroForm") {
-                    form.remove(b"XFA");
-                }
-            }
-            _ => {}
+        if let Some(form) = acroform_mut(doc) {
+            form.remove(b"XFA");
         }
     }
     Ok(())
 }
 
-/// Whether a button widget has a normal appearance for `state`.
-fn has_appearance(doc: &Document, widget: &Dictionary, state: &str) -> bool {
-    widget
-        .get(b"AP")
-        .ok()
-        .and_then(|ap| resolve_dict(doc, ap))
-        .and_then(|ap| ap.get(b"N").ok().and_then(|n| resolve_dict(doc, n)))
-        .is_some_and(|normal| normal.has(state.as_bytes()))
+/// The document's form dictionary, whether the catalog holds it or refers to it.
+fn acroform_mut(doc: &mut Document) -> Option<&mut Dictionary> {
+    let reference = doc.catalog().ok()?.get(b"AcroForm").ok()?.as_reference().ok();
+    match reference {
+        Some(id) => doc.get_dictionary_mut(id).ok(),
+        None => doc.catalog_mut().ok()?.get_mut(b"AcroForm").ok()?.as_dict_mut().ok(),
+    }
 }
 
 /// Width of `text` at `size`, as the writer will draw it.
 pub fn measure_text(text: &str, size: f32) -> f32 {
-    if winansi_encodable(text) {
-        text.chars().map(|c| HELVETICA_WIDTHS[winansi(c) as usize] as f32).sum::<f32>() / 1000. * size
-    } else {
-        FontBook::system().shape(text, false).width * size
-    }
+    TextLine::new(text, false).width() as f32 * size
+}
+
+/// Like [`measure_text`], but without waiting for anything: `None` while the
+/// text needs the installed fonts and they haven't been found yet.
+pub fn measure_text_now(text: &str, size: f32) -> Option<f32> {
+    let line = match TextLine::standard(text, false) {
+        Some(line) => line,
+        None => TextLine::Shaped(FontBook::loaded()?.shape(text, false)),
+    };
+    Some(line.width() as f32 * size)
+}
+
+/// Whether drawing `text` takes the installed fonts (standard Helvetica can't show it).
+pub fn needs_installed_fonts(text: &str) -> bool {
+    !winansi_encodable(text)
 }
 
 /// The start of a widget's appearance: the form XObject dictionary, and its
@@ -1099,44 +1173,41 @@ fn text_appearance(
 fn button_appearances(widget: &Widget) -> (Stream, Stream) {
     let (dict, frame) = appearance_frame(widget);
     let (w, h) = widget.size;
-    let d = (w.min(h) - 2. * (widget.border_width + 1.)).max(1.);
-    let (x0, y0) = ((w - d) / 2., (h - d) / 2.);
+    let (origin, side) = widget.mark_box(w, h);
+    let paint = color(widget.text_color);
+    let mark = mark_ops(&widget.symbol.mark(), origin, side);
+    let on = Stream::new(dict.clone(), format!("{frame}q {paint} rg {paint} RG 1 J 1 j\n{mark}Q\n").into_bytes());
+    let off = Stream::new(dict, frame.into_bytes());
+    (on, off)
+}
+
+/// Operators that draw a check mark (or the like) in the square of side `d`
+/// whose bottom-left corner is at (x0, y0), in the current colours.
+fn mark_ops(mark: &forms::Mark, (x0, y0): (f32, f32), d: f32) -> String {
     let p = |(x, y): (f32, f32)| format!("{} {}", num((x0 + x * d) as f64), num((y0 + y * d) as f64));
-    let mut mark = format!("q {} rg {} RG 1 J 1 j\n", color(widget.text_color), color(widget.text_color));
-    match widget.symbol.mark() {
+    let trace = |points: &[(f32, f32)]| -> String {
+        points.iter().enumerate().map(|(i, &point)| format!("{} {}\n", p(point), if i == 0 { "m" } else { "l" })).collect()
+    };
+    match mark {
         forms::Mark::Lines(lines) => {
-            mark.push_str(&format!("{} w\n", num((d * 0.12) as f64)));
-            for line in lines {
-                for (i, &point) in line.iter().enumerate() {
-                    mark.push_str(&format!("{} {}\n", p(point), if i == 0 { "m" } else { "l" }));
-                }
-                mark.push_str("S\n");
-            }
+            let strokes: String = lines.iter().map(|line| trace(line) + "S\n").collect();
+            format!("{} w\n{strokes}", num((d * forms::MARK_STROKE) as f64))
         }
-        forms::Mark::Polygon(points) => {
-            for (i, &point) in points.iter().enumerate() {
-                mark.push_str(&format!("{} {}\n", p(point), if i == 0 { "m" } else { "l" }));
-            }
-            mark.push_str("h f\n");
-        }
+        forms::Mark::Polygon(points) => trace(points) + "h f\n",
         forms::Mark::Disc(r) => {
             // A circle from four Bézier curves.
-            let (cx, cy, r) = ((w / 2.) as f64, (h / 2.) as f64, (r * d) as f64);
+            let (cx, cy, r) = ((x0 + d / 2.) as f64, (y0 + d / 2.) as f64, (r * d) as f64);
             let k = r * 0.5523;
-            mark.push_str(&format!(
+            format!(
                 "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c f\n",
                 num(cx + r), num(cy),
                 num(cx + r), num(cy + k), num(cx + k), num(cy + r), num(cx), num(cy + r),
                 num(cx - k), num(cy + r), num(cx - r), num(cy + k), num(cx - r), num(cy),
                 num(cx - r), num(cy - k), num(cx - k), num(cy - r), num(cx), num(cy - r),
                 num(cx + k), num(cy - r), num(cx + r), num(cy - k), num(cx + r), num(cy),
-            ));
+            )
         }
     }
-    mark.push_str("Q\n");
-    let on = Stream::new(dict.clone(), format!("{frame}{mark}").into_bytes());
-    let off = Stream::new(dict, frame.into_bytes());
-    (on, off)
 }
 
 /// Advance widths (1/1000 em) of Helvetica, indexed by WinAnsi code (from the
@@ -1173,28 +1244,24 @@ const HELVETICA_WIDTHS: [u16; 256] = [
 /// page's original text, fonts, images, annotations and form fields are
 /// dropped. Unreferenced objects are then pruned, so none of it survives in
 /// the saved file. Pages without redactions are untouched.
-fn redact(bytes: &[u8], pages: &[PageGeom], redactions: &[&Item]) -> Result<Vec<u8>> {
-    let pdf = Pdf::new(bytes.to_vec()).map_err(|e| anyhow!("could not re-read PDF for redaction: {e:?}"))?;
-    let mut doc = Document::load_mem(bytes).context("lopdf could not parse the PDF")?;
+fn redact(doc: &mut Document, written: Vec<u8>, pages: &[PageGeom], redactions: &[(&Item, RedactFill)]) -> Result<()> {
+    let pdf = Pdf::new(written).map_err(|e| anyhow!("could not re-read PDF for redaction: {e:?}"))?;
+    let cache = RenderCache::new();
     let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
-    let redacted_pages: BTreeSet<usize> = redactions.iter().map(|r| r.page).filter(|&p| p < pages.len()).collect();
+    let redacted_pages: BTreeSet<usize> = redactions.iter().map(|(r, _)| r.page).filter(|&p| p < pages.len()).collect();
     let mut removed_annots: HashSet<ObjectId> = HashSet::new();
 
     for page_index in redacted_pages {
         let geom = &pages[page_index];
         let page_id = page_ids[page_index];
-        let rendered = render_page(&pdf, page_index, REDACT_SCALE)
+        let rendered = render(&pdf, &cache, page_index, REDACT_SCALE, false)
             .ok_or_else(|| anyhow!("could not render page {} for redaction", page_index + 1))?;
         let (pw, ph) = (rendered.width as usize, rendered.height as usize);
         let mut rgb: Vec<u8> = rendered.bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
 
         // Burn the boxes in, rounding outwards so no partly covered pixel survives.
         let (sx, sy) = (pw as f32 / geom.width, ph as f32 / geom.height);
-        for r in redactions.iter().filter(|r| r.page == page_index) {
-            let fill = match r.kind {
-                ItemKind::Redact { fill } => fill,
-                _ => RedactFill::Black,
-            };
+        for (r, fill) in redactions.iter().filter(|(r, _)| r.page == page_index) {
             let x0 = ((r.x * sx).floor().max(0.) as usize).min(pw);
             let x1 = (((r.x + r.w) * sx).ceil().max(0.) as usize).min(pw);
             let y0 = ((r.y * sy).floor().max(0.) as usize).min(ph);
@@ -1227,7 +1294,7 @@ fn redact(bytes: &[u8], pages: &[PageGeom], redactions: &[&Item]) -> Result<Vec<
         let _ = content.compress();
         let content_id = doc.add_object(content);
 
-        removed_annots.extend(page_annotations(&doc, page_id));
+        removed_annots.extend(page_annotations(doc, page_id));
 
         let page = doc.get_dictionary_mut(page_id)?;
         // Anything else on the page that could carry the original content.
@@ -1239,9 +1306,9 @@ fn redact(bytes: &[u8], pages: &[PageGeom], redactions: &[&Item]) -> Result<Vec<
         page.set("Resources", dictionary! { "XObject" => dictionary! { PAGE_IMAGE => image_id } });
     }
 
-    strip_document_text(&mut doc, &removed_annots);
+    strip_document_text(doc, &removed_annots);
     doc.prune_objects();
-    save_document(doc)
+    Ok(())
 }
 
 /// Remove document-level copies of redacted content: form fields whose
@@ -1258,25 +1325,10 @@ fn strip_document_text(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
 
 /// Drop form fields that are (or whose widgets all are) among `removed_annots`.
 fn strip_form_fields(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
-    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
-
-    let Some(form) = doc.get_dictionary(catalog_id).ok().and_then(|c| c.get(b"AcroForm").ok().cloned()) else {
-        return;
-    };
-    let form_id = form.as_reference().ok();
-    let Some(mut form) = resolve_dict(doc, &form) else { return };
-    let Ok(Object::Array(fields)) = form.get(b"Fields").cloned() else { return };
+    let Some(Ok(Object::Array(fields))) = acroform_mut(doc).map(|form| form.get(b"Fields").cloned()) else { return };
     let kept: Vec<Object> = fields.into_iter().filter(|f| keep_field(doc, f, removed_annots, 0)).collect();
-    form.set("Fields", kept);
-    match form_id {
-        Some(id) => {
-            doc.objects.insert(id, Object::Dictionary(form));
-        }
-        None => {
-            if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
-                catalog.set("AcroForm", form);
-            }
-        }
+    if let Some(form) = acroform_mut(doc) {
+        form.set("Fields", kept);
     }
 }
 
@@ -1580,6 +1632,16 @@ pub(crate) mod tests {
         assert!(text.contains("Page 1 - Name:"));
         assert!(text.contains("secret-field-value"));
         assert!(text.contains(&winansi_hex("signed")));
+
+        // So does a copy with a redaction, which is written out once more.
+        let items = [Item { id: 1, page: 0, x: 60., y: 60., w: 300., h: 90., kind: ItemKind::Redact { fill: RedactFill::Black } }];
+        let edits = Edits { order: &[0, 1], items: &items, password: Some("open sesame"), ..Edits::default() };
+        let out = save(&loaded.bytes, &loaded.pages, &edits).unwrap().bytes;
+        assert!(!String::from_utf8_lossy(&out).contains("Page 2 - Name:"));
+        assert_eq!(password_error(load(out.clone())), Some(PasswordError::Required));
+        let text = all_text(&load_with_password(out, Some("open sesame")).unwrap().bytes);
+        assert!(!text.contains("Page 1 - Name:"), "the redacted page's text is gone");
+        assert!(text.contains("Page 2 - Name:"));
     }
 
     #[test]
@@ -1662,7 +1724,8 @@ pub(crate) mod tests {
         field(&mut doc, &mut fields, &mut annots1, dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => Object::string_literal("name"),
             "Rect" => rect([100, 600, 300, 620]), "DA" => Object::string_literal("/Helv 0 Tf 0 g"),
-            "MK" => dictionary! { "BC" => vec![0.into(), 0.into(), 1.into()] }, "P" => page1,
+            "MK" => dictionary! { "BC" => vec![0.into(), 0.into(), 1.into()] }, "BS" => dictionary! { "W" => 2 },
+            "P" => page1,
         });
         field(&mut doc, &mut fields, &mut annots1, dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => Object::string_literal("notes"), "Ff" => 4096,
@@ -1766,6 +1829,9 @@ pub(crate) mod tests {
         assert!(upright.widgets[0].upright && w > h);
         assert_eq!(upright.widgets[0].size, (200., 20.));
         assert!(name.widgets[0].upright);
+        // The border is as wide as the widget says (1 when it doesn't say).
+        assert_eq!(name.widgets[0].border_width, 2.);
+        assert_eq!(upright.widgets[0].border_width, 0., "no border colour, no border");
     }
 
     /// Fields and their values as another app would read them from `pdf`.

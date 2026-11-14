@@ -2,20 +2,58 @@
 //! values (the page image is rendered without them), and filled in by
 //! clicking and typing. Values are saved into the fields themselves.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Bounds, Context, CursorStyle, Hsla, MouseButton, MouseDownEvent, PathBuilder, SharedString, Window,
-    anchored, canvas, deferred, div, fill, point, prelude::*, px, quad,
+    AnyElement, Bounds, Context, CursorStyle, Hsla, MouseButton, MouseDownEvent, Path, PathBuilder, Pixels, Point,
+    SharedString, Window, anchored, canvas, deferred, div, fill, point, prelude::*, px, quad,
 };
 
-use super::{Editor, Tool};
-use crate::forms::{self, Field, FieldKind, FieldValue, Mark, Widget};
+use super::{Editor, Tool, text_width};
+use crate::fonts::FontBook;
+use crate::forms::{self, Field, FieldKind, FieldValue, Mark, TextLayout, Widget};
 use crate::model::{LINE_HEIGHT, TEXT_FONT};
-use crate::{pdf, ui};
+use crate::ui;
+
+/// A field's text laid out in one of its widgets, and what that was worked
+/// out from: its value, where baselines go, and whether the installed fonts
+/// were there to measure with.
+pub(super) struct CachedLayout {
+    value: FieldValue,
+    baseline_ratio: f32,
+    fonts: bool,
+    layout: Rc<TextLayout>,
+}
 
 fn color([r, g, b]: [f32; 3]) -> Hsla {
     gpui::Rgba { r, g, b, a: 1. }.into()
+}
+
+/// The outline of a check mark (or the like) in the square of side `d` whose
+/// top-left corner is at `origin`.
+pub(super) fn mark_path(mark: &Mark, origin: Point<Pixels>, d: f32) -> Option<Path<Pixels>> {
+    let circle;
+    let (stroked, lines): (bool, &[Vec<(f32, f32)>]) = match mark {
+        Mark::Lines(lines) => (true, lines),
+        Mark::Polygon(points) => (false, std::slice::from_ref(points)),
+        Mark::Disc(r) => {
+            let around = (0..=32).map(|i| i as f32 / 32. * std::f32::consts::TAU);
+            circle = [around.map(|a| (0.5 + r * a.cos(), 0.5 + r * a.sin())).collect()];
+            (false, &circle)
+        }
+    };
+    let mut builder = if stroked { PathBuilder::stroke(px(d * forms::MARK_STROKE)) } else { PathBuilder::fill() };
+    for line in lines {
+        for (i, &(x, y)) in line.iter().enumerate() {
+            let at = origin + point(px(x * d), px((1. - y) * d));
+            if i == 0 { builder.move_to(at) } else { builder.line_to(at) }
+        }
+        if !stroked {
+            builder.close();
+        }
+    }
+    builder.build().ok()
 }
 
 impl Editor {
@@ -66,7 +104,6 @@ impl Editor {
         self.selected = None;
         self.field_editing = Some(index);
         self.typing_checkpointed = false;
-        self.ime_marked = None;
         cx.notify();
     }
 
@@ -78,7 +115,7 @@ impl Editor {
         let mut stops: Vec<(usize, i64, i64, usize)> = form
             .iter()
             .enumerate()
-            .filter(|(_, f)| matches!(f.kind, FieldKind::Text { .. } | FieldKind::Choice { editable: true, .. }))
+            .filter(|(_, f)| f.kind.takes_typing())
             .filter_map(|(i, f)| {
                 f.widgets.iter().find_map(|w| {
                     let page = doc.order.iter().position(|&p| p == w.page)?;
@@ -134,13 +171,12 @@ impl Editor {
         match &field.kind {
             FieldKind::Text { .. } => self.start_field_editing(index, window, cx),
             FieldKind::CheckBox | FieldKind::Radio { .. } => {
-                let on = widget.on_state.clone();
-                let selected = matches!(&value, Some(FieldValue::On(Some(s))) if Some(s) == on.as_ref());
+                let selected = value.as_ref().is_some_and(|v| widget.is_on(v));
                 let no_toggle_off = matches!(field.kind, FieldKind::Radio { no_toggle_off: true });
                 if selected && no_toggle_off {
                     return;
                 }
-                let new = if selected { None } else { on };
+                let new = if selected { None } else { widget.on_state.clone() };
                 self.set_field_value(index, FieldValue::On(new), cx);
             }
             FieldKind::Choice { combo: true, editable, .. } => {
@@ -171,17 +207,47 @@ impl Editor {
 
     /// The fields on the page with original index `source`.
     pub(super) fn render_widgets(&self, source: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let form = self.form();
-        let mut out = Vec::new();
-        for (index, field) in form.iter().enumerate() {
-            let Some(value) = self.fields.get(index) else { continue };
-            for (widget_index, widget) in field.widgets.iter().enumerate() {
-                if widget.page == source {
-                    out.push(self.render_widget(index, field, widget_index, widget, value, cx));
-                }
-            }
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let on_page = doc.widgets.get(source).map_or(&[][..], Vec::as_slice);
+        on_page
+            .iter()
+            .filter_map(|&(index, widget_index)| {
+                let (field, value) = (doc.loaded.form.get(index)?, self.fields.get(index)?);
+                Some(self.render_widget(index, field, widget_index, field.widgets.get(widget_index)?, value, cx))
+            })
+            .collect()
+    }
+
+    /// The text of field `index` laid out in one of its widgets. Every frame
+    /// draws it, so it's worked out again only when what it depends on has changed.
+    pub(super) fn field_layout(&self, index: usize, field: &Field, widget_index: usize, widget: &Widget, value: &FieldValue) -> Rc<TextLayout> {
+        let baseline_ratio = self.metrics.baseline_ratio;
+        let fonts = FontBook::loaded().is_some();
+        let cache = self.doc.as_ref().map(|doc| &doc.layouts);
+        let key = (index, widget_index);
+        let kept = cache.and_then(|cache| {
+            let cache = cache.borrow();
+            let kept = cache.get(&key)?;
+            (kept.fonts == fonts && kept.baseline_ratio == baseline_ratio && kept.value == *value).then(|| kept.layout.clone())
+        });
+        if let Some(layout) = kept {
+            return layout;
         }
-        out
+        // Turned fields are previewed upright, filling their box on screen.
+        let [_, _, w, h] = widget.rect;
+        let turned;
+        let shown = if widget.upright {
+            widget
+        } else {
+            turned = Widget { size: (w, h), ..widget.clone() };
+            &turned
+        };
+        let layout = Rc::new(forms::layout(field, shown, value, baseline_ratio, &mut text_width));
+        if let Some(cache) = cache {
+            let kept = CachedLayout { value: value.clone(), baseline_ratio, fonts, layout: layout.clone() };
+            cache.borrow_mut().insert(key, kept);
+        }
+        layout
     }
 
     fn render_widget(
@@ -196,21 +262,9 @@ impl Editor {
         let z = self.zoom;
         let [x, y, w, h] = widget.rect;
         let editing = self.field_editing == Some(index);
-        // Turned fields are previewed upright, filling their box on screen.
-        let shown = if widget.upright { widget.clone() } else { Widget { size: (w, h), ..widget.clone() } };
         let ratio = self.metrics.baseline_ratio;
-        let layout = match field.kind {
-            FieldKind::Text { .. } | FieldKind::Choice { .. } => {
-                Some(forms::layout(field, &shown, value, ratio, &mut pdf::measure_text))
-            }
-            _ => None,
-        };
-        let mark = match (&field.kind, value) {
-            (FieldKind::CheckBox | FieldKind::Radio { .. }, FieldValue::On(Some(on))) if widget.on_state.as_ref() == Some(on) => {
-                Some(widget.symbol.mark())
-            }
-            _ => None,
-        };
+        let layout = (!field.kind.is_button()).then(|| self.field_layout(index, field, widget_index, widget, value));
+        let mark = widget.is_on(value).then(|| (widget.symbol.mark(), widget.mark_box(w, h)));
 
         // Background, border, list highlight and check mark.
         let (background, border, border_width, text_color) =
@@ -231,40 +285,9 @@ impl Editor {
                 if let (Some(bc), true) = (border, border_width > 0.) {
                     window.paint_quad(quad(bounds, px(0.), gpui::transparent_black(), px(border_width * z), color(bc), Default::default()));
                 }
-                if let Some(mark) = &mark {
-                    let d = ((w.min(h)) - 2. * (border_width + 1.)).max(1.) * z;
-                    let origin = bounds.origin + point(px((w * z - d) / 2.), px((h * z - d) / 2.));
-                    let p = |(mx, my): (f32, f32)| origin + point(px(mx * d), px((1. - my) * d));
-                    let path = match mark {
-                        Mark::Lines(lines) => {
-                            let mut b = PathBuilder::stroke(px(d * 0.12));
-                            for line in lines {
-                                for (i, &point) in line.iter().enumerate() {
-                                    if i == 0 { b.move_to(p(point)) } else { b.line_to(p(point)) }
-                                }
-                            }
-                            b.build()
-                        }
-                        Mark::Polygon(points) => {
-                            let mut b = PathBuilder::fill();
-                            for (i, &point) in points.iter().enumerate() {
-                                if i == 0 { b.move_to(p(point)) } else { b.line_to(p(point)) }
-                            }
-                            b.close();
-                            b.build()
-                        }
-                        Mark::Disc(r) => {
-                            let mut b = PathBuilder::fill();
-                            for i in 0..=32 {
-                                let a = i as f32 / 32. * std::f32::consts::TAU;
-                                let point = (0.5 + r * a.cos(), 0.5 + r * a.sin());
-                                if i == 0 { b.move_to(p(point)) } else { b.line_to(p(point)) }
-                            }
-                            b.close();
-                            b.build()
-                        }
-                    };
-                    if let Ok(path) = path {
+                if let Some((mark, ((left, top), side))) = &mark {
+                    let origin = bounds.origin + point(px(left * z), px(top * z));
+                    if let Some(path) = mark_path(mark, origin, side * z) {
                         window.paint_path(path, color(text_color));
                     }
                 }
@@ -293,13 +316,10 @@ impl Editor {
             if editing {
                 let (left, top) = line(layout.caret.0, layout.caret.1);
                 runs.push(
-                    div()
+                    ui::caret(px(size * LINE_HEIGHT * z))
                         .absolute()
                         .left(left)
                         .top(top)
-                        .w(px(1.5))
-                        .h(px(size * LINE_HEIGHT * z))
-                        .bg(ui::accent())
                         .child(self.input_anchor(cx))
                         .into_any_element(),
                 );
@@ -315,10 +335,7 @@ impl Editor {
         });
 
         let combo = matches!(field.kind, FieldKind::Choice { combo: true, .. });
-        let cursor = match field.kind {
-            FieldKind::Text { .. } | FieldKind::Choice { editable: true, .. } => CursorStyle::IBeam,
-            _ => CursorStyle::PointingHand,
-        };
+        let cursor = if field.kind.takes_typing() { CursorStyle::IBeam } else { CursorStyle::PointingHand };
         let name: SharedString = field.name.clone().into();
         let mut element = div()
             .id(SharedString::from(format!("form-field-{index}-{widget_index}")))

@@ -12,58 +12,91 @@ use gpui::{
 use super::Editor;
 use crate::model::ItemKind;
 
+/// What typed text goes into.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum InputTarget {
+    /// The Recents search box.
+    Recents,
+    /// A form field of the document (its index).
+    Field(usize),
+    /// A text item (its id).
+    Item(u64),
+    Watermark,
+}
+
 impl Editor {
+    /// What is being typed into, if anything. The password prompt takes its
+    /// keys directly instead (no input method, as in system password fields).
+    pub(super) fn input_target(&self) -> Option<InputTarget> {
+        if self.password_prompt.is_some() {
+            None
+        } else if self.searching_recents() {
+            Some(InputTarget::Recents)
+        } else if let Some(index) = self.field_editing {
+            Some(InputTarget::Field(index))
+        } else if let Some(id) = self.editing {
+            Some(InputTarget::Item(id))
+        } else {
+            self.watermark_editing.then_some(InputTarget::Watermark)
+        }
+    }
+
     /// The text being typed into, if any.
     pub(super) fn input_text(&self) -> Option<String> {
-        if self.password_prompt.is_some() {
-            return None;
-        }
-        if self.searching_recents() {
-            return Some(self.recents_query.clone());
-        }
-        if let Some(index) = self.field_editing {
-            return self.field_input_text(index);
-        }
-        if let Some(id) = self.editing {
-            return self.items.iter().find(|i| i.id == id).and_then(|item| match &item.kind {
+        match self.input_target()? {
+            InputTarget::Recents => Some(self.recents_query.clone()),
+            InputTarget::Field(index) => self.field_input_text(index),
+            InputTarget::Item(id) => self.items.iter().find(|i| i.id == id).and_then(|item| match &item.kind {
                 ItemKind::Text { text, .. } => Some(text.clone()),
                 _ => None,
-            });
-        }
-        if self.watermark_editing {
+            }),
             // While the whole text is selected, the next input replaces it.
-            return Some(match (&self.watermark, self.watermark_replace) {
+            InputTarget::Watermark => Some(match (&self.watermark, self.watermark_replace) {
                 (Some(watermark), false) => watermark.text.clone(),
                 _ => String::new(),
-            });
+            }),
         }
-        None
     }
 
     fn set_input_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.searching_recents() {
-            self.recents_query = text.replace('\n', " ");
-            cx.notify();
-        } else if let Some(index) = self.field_editing {
-            self.type_into_field(index, text, cx);
-        } else if self.editing.is_some() {
-            self.edit_text(cx, move |t| *t = text);
-        } else if self.watermark_editing {
-            let line = text.replace('\n', " ");
-            self.edit_watermark_text(cx, move |t| *t = line);
+        match self.input_target() {
+            Some(InputTarget::Recents) => {
+                self.recents_query = text.replace('\n', " ");
+                cx.notify();
+            }
+            Some(InputTarget::Field(index)) => self.type_into_field(index, text, cx),
+            Some(InputTarget::Item(_)) => self.edit_text(cx, move |t| *t = text),
+            Some(InputTarget::Watermark) => {
+                let line = text.replace('\n', " ");
+                self.edit_watermark_text(cx, move |t| *t = line);
+            }
+            None => {}
         }
     }
 
-    /// The text being composed by an input method (byte range), if still valid.
+    /// The part of `text` (what is being typed into) that an input method is
+    /// still composing, as a byte range, if there is one and it's still valid.
     pub(super) fn marked_range(&self, text: &str) -> Option<Range<usize>> {
-        self.ime_marked
-            .clone()
-            .filter(|r| r.start <= r.end && r.end <= text.len() && text.is_char_boundary(r.start) && text.is_char_boundary(r.end))
+        let (target, r) = self.ime_marked.clone()?;
+        let valid = Some(target) == self.input_target()
+            && r.start <= r.end
+            && r.end <= text.len()
+            && text.is_char_boundary(r.start)
+            && text.is_char_boundary(r.end);
+        valid.then_some(r)
+    }
+
+    /// Backspace: delete the last character of what is being typed into.
+    pub(super) fn delete_backward(&mut self, cx: &mut Context<Self>) {
+        let Some(mut text) = self.input_text() else { return };
+        text.pop();
+        self.ime_marked = None;
+        self.set_input_text(text, cx);
     }
 
     /// Replace `range` (UTF-16 offsets), or else the text being composed, or
     /// else nothing at the end, with `new`. `mark` keeps it as composing text.
-    fn replace_input(&mut self, range: Option<Range<usize>>, new: &str, mark: bool, cx: &mut Context<Self>) {
+    pub(super) fn replace_input(&mut self, range: Option<Range<usize>>, new: &str, mark: bool, cx: &mut Context<Self>) {
         let Some(mut text) = self.input_text() else { return };
         let range = range
             .map(|r| byte_offset(&text, r.start)..byte_offset(&text, r.end.max(r.start)))
@@ -71,7 +104,8 @@ impl Editor {
             .unwrap_or(text.len()..text.len());
         let new = new.replace("\r\n", "\n").replace('\r', "\n");
         text.replace_range(range.clone(), &new);
-        self.ime_marked = (mark && !new.is_empty()).then(|| range.start..range.start + new.len());
+        let marked = range.start..range.start + new.len();
+        self.ime_marked = self.input_target().filter(|_| mark && !new.is_empty()).map(|target| (target, marked));
         self.set_input_text(text, cx);
     }
 

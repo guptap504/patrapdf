@@ -12,7 +12,7 @@
 //! recents/assets/*.png      copies of the signature images used by entries
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ const MAX_ENTRIES: usize = 100;
 /// Thumbnail width in pixels (displayed at roughly half that on Retina screens).
 const THUMB_WIDTH_PX: f32 = 360.;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecentEntry {
     /// Stable id derived from the original's path.
     pub id: String,
@@ -116,9 +116,7 @@ fn write_index(entries: &[RecentEntry]) -> Result<()> {
 
 /// Render the first page of a PDF as a PNG thumbnail.
 pub fn make_thumbnail(pdf_bytes: Vec<u8>) -> Option<Thumbnail> {
-    let loaded = pdf::load(pdf_bytes).ok()?;
-    let scale = THUMB_WIDTH_PX / loaded.pages[0].width.max(1.);
-    let page = pdf::render_page(&loaded.pdf, 0, scale)?;
+    let page = pdf::render_first_page(pdf_bytes, THUMB_WIDTH_PX)?;
     let mut rgba = page.bgra;
     for px in rgba.chunks_exact_mut(4) {
         px.swap(0, 2);
@@ -149,23 +147,33 @@ fn store_asset(source: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
+/// What an entry remembers of a saved document, to reopen it with its edits.
+#[derive(Default)]
+pub struct Contents<'a> {
+    pub items: &'a [Item],
+    pub watermark: Option<&'a Watermark>,
+    /// Values typed into the document's own form fields, by field name.
+    pub fields: Vec<(String, FieldValue)>,
+    pub thumbnail: Option<Thumbnail>,
+}
+
 /// Record (or update) the entry for `original` after a successful save.
+/// Without `contents` the entry only remembers where the document is.
 /// Returns the updated list, most recent first.
-#[allow(clippy::too_many_arguments)]
 pub fn record(
     mut entries: Vec<RecentEntry>,
     original: &Path,
     output: &Path,
     page_count: usize,
-    items: &[Item],
-    watermark: Option<&Watermark>,
     order: Option<&[usize]>,
-    fields: Vec<(String, FieldValue)>,
-    thumbnail: Option<Thumbnail>,
+    contents: Option<Contents>,
 ) -> Result<Vec<RecentEntry>> {
+    let Contents { items, watermark, fields, thumbnail } = contents.unwrap_or_default();
     let id = hash_hex(original);
     let saved_at = chrono::Utc::now().timestamp();
 
+    // The same signature is often on many pages: it is stored once.
+    let mut stored: HashMap<&Path, Option<PathBuf>> = HashMap::new();
     let saved_items = items
         .iter()
         .filter_map(|item| {
@@ -175,7 +183,7 @@ pub fn record(
                     font_size: *font_size,
                 },
                 ItemKind::Image { sig } => SavedKind::Image {
-                    path: store_asset(&sig.path).ok()?,
+                    path: stored.entry(sig.path.as_path()).or_insert_with(|| store_asset(&sig.path).ok()).clone()?,
                 },
                 ItemKind::Check => SavedKind::Check,
                 ItemKind::Redact { fill } => SavedKind::Redact { fill: *fill },
@@ -247,13 +255,13 @@ pub fn remove(mut entries: Vec<RecentEntry>, id: &str) -> Result<Vec<RecentEntry
 }
 
 /// Empty the gallery (the PDFs themselves are untouched).
-pub fn clear(entries: Vec<RecentEntry>) -> Result<Vec<RecentEntry>> {
-    for entry in &entries {
+pub fn clear(entries: &[RecentEntry]) -> Result<()> {
+    for entry in entries {
         remove_file_quietly(entry.thumbnail.as_deref());
     }
     write_index(&[])?;
     collect_garbage(&[]);
-    Ok(Vec::new())
+    Ok(())
 }
 
 /// Whether an entry matches a search: every word of `query` appears in the
@@ -345,7 +353,13 @@ mod tests {
         let thumb = make_thumbnail(pdf::tests::sample_pdf()).expect("thumbnail");
         assert!(thumb.width > 0 && thumb.height > thumb.width);
 
-        let entries = record(Vec::new(), &original, &output, 2, &items, Some(&watermark), Some(&[1, 0]), vec![("name".into(), FieldValue::Text("Jo".into()))], Some(thumb)).unwrap();
+        let contents = Contents {
+            items: &items,
+            watermark: Some(&watermark),
+            fields: vec![("name".into(), FieldValue::Text("Jo".into()))],
+            thumbnail: Some(thumb),
+        };
+        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), Some(contents)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -372,7 +386,8 @@ mod tests {
         assert_eq!(loaded[0].fields, [("name".to_string(), FieldValue::Text("Jo".into()))]);
 
         // Saving the same original again updates the entry instead of adding one.
-        let entries = record(loaded, &original, &output, 2, &restored, None, None, Vec::new(), None).unwrap();
+        let contents = Contents { items: &restored, ..Contents::default() };
+        let entries = record(loaded, &original, &output, 2, None, Some(contents)).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

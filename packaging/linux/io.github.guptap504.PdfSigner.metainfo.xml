@@ -29,6 +29,13 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.3.1" date="2026-11-14">
+      <description>
+        <p>Long documents scroll and zoom smoothly: only the pages on screen are drawn.</p>
+        <p>Documents open in the background, and pages render and save faster.</p>
+        <p>Pasting works in form fields and the Recents search; form field borders keep their width.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-14">
       <description>
         <p>Fill in a PDF's own form fields; the saved copy stays fillable.</p>

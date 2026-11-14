@@ -86,7 +86,8 @@ pub struct Item {
     /// Top-left corner in view space (points).
     pub x: f32,
     pub y: f32,
-    /// Size in points. For text this is only an estimate (used for clamping).
+    /// Size in points. For text this is the box around its lines as measured
+    /// (an estimate while the fonts it needs are still being found).
     pub w: f32,
     pub h: f32,
     pub kind: ItemKind,
@@ -98,7 +99,15 @@ impl Item {
     }
 
     pub fn is_redaction(&self) -> bool {
-        matches!(self.kind, ItemKind::Redact { .. })
+        self.redaction().is_some()
+    }
+
+    /// The colour of a redaction box (nothing for other items).
+    pub fn redaction(&self) -> Option<RedactFill> {
+        match self.kind {
+            ItemKind::Redact { fill } => Some(fill),
+            _ => None,
+        }
     }
 }
 

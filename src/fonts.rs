@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use fontdb::{Database, FaceInfo, ID, Style};
@@ -19,6 +19,8 @@ use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use rustybuzz::ttf_parser;
 use subsetter::GlyphRemapper;
 use unicode_bidi::{BidiClass, BidiInfo, bidi_class};
+
+use crate::pdf::num;
 
 /// Font families to try first, in order. The first is the font the editor
 /// draws text with (see `model::TEXT_FONT`), so Latin text looks the same.
@@ -76,22 +78,36 @@ const PREFERRED: &[&str] = if cfg!(target_os = "macos") {
 
 /// The installed fonts usable in PDFs, in order of preference.
 pub struct FontBook {
-    db: Database,
+    /// Locked only to look a face up, never while its data is being read.
+    db: Mutex<Database>,
     /// Usable faces in order of preference, for regular and bold text.
     order: [Vec<ID>; 2],
     /// Which face each character was given (`None`: no font has it).
     choices: Mutex<HashMap<(char, bool), Option<ID>>>,
+    /// Lines laid out before, regular and bold. The editor measures the same
+    /// text on every frame, and the writer draws the lines it measured.
+    lines: Mutex<[HashMap<String, Arc<Line>>; 2]>,
 }
 
+/// The line cache is emptied when it gets to this many lines.
+const MAX_CACHED_LINES: usize = 2048;
+
+static SYSTEM: OnceLock<FontBook> = OnceLock::new();
+
 impl FontBook {
-    /// The fonts installed on this computer (loaded on first use).
+    /// The fonts installed on this computer. They are found on first use,
+    /// which takes a while: not something to wait for while drawing.
     pub fn system() -> &'static FontBook {
-        static SYSTEM: OnceLock<FontBook> = OnceLock::new();
         SYSTEM.get_or_init(|| {
             let mut db = Database::new();
             db.load_system_fonts();
             FontBook::new(db, PREFERRED)
         })
+    }
+
+    /// The installed fonts, if they have been found already.
+    pub fn loaded() -> Option<&'static FontBook> {
+        SYSTEM.get()
     }
 
     pub fn new(db: Database, preferred: &[&str]) -> Self {
@@ -120,9 +136,10 @@ impl FontBook {
             ids
         });
         Self {
-            db,
+            db: Mutex::new(db),
             order,
             choices: Mutex::new(HashMap::new()),
+            lines: Mutex::default(),
         }
     }
 
@@ -140,15 +157,46 @@ impl FontBook {
     }
 
     fn covers(&self, id: ID, c: char) -> bool {
-        self.db
-            .with_face_data(id, |data, index| {
-                ttf_parser::Face::parse(data, index).ok().and_then(|f| f.glyph_index(c)).is_some()
-            })
-            .unwrap_or(false)
+        let covers = |data: &[u8], index| ttf_parser::Face::parse(data, index).ok().and_then(|f| f.glyph_index(c)).is_some();
+        // Faces in use are already mapped; others are only looked into here.
+        self.db.lock().ok().and_then(|db| db.with_face_data(id, covers)).unwrap_or(false)
+    }
+
+    /// Read a face that text is set in. Its file stays mapped from then on,
+    /// rather than being opened and mapped again for every line.
+    fn with_face<T>(&self, id: ID, read: impl FnOnce(&[u8], u32) -> T) -> Option<T> {
+        // SAFETY: the file is mapped read-only, exactly as fontdb's own
+        // `with_face_data` maps it for each call; here the mapping is kept.
+        // Either way, installed font files must not be rewritten in place
+        // while they are in use.
+        let (data, index) = unsafe { self.db.lock().ok()?.make_shared_face_data(id)? };
+        Some(read((*data).as_ref(), index))
+    }
+
+    /// A face's PostScript and family names.
+    fn names(&self, id: ID) -> Option<(String, String)> {
+        let db = self.db.lock().ok()?;
+        let info = db.face(id)?;
+        Some((info.post_script_name.clone(), family_name(info).to_string()))
     }
 
     /// Lay out one line of text: fonts, visual order and shaping.
-    pub fn shape(&self, text: &str, bold: bool) -> Line {
+    pub fn shape(&self, text: &str, bold: bool) -> Arc<Line> {
+        if let Some(line) = self.lines.lock().ok().and_then(|lines| lines[bold as usize].get(text).cloned()) {
+            return line;
+        }
+        let line = Arc::new(self.lay_out(text, bold));
+        if let Ok(mut lines) = self.lines.lock() {
+            let lines = &mut lines[bold as usize];
+            if lines.len() >= MAX_CACHED_LINES {
+                lines.clear();
+            }
+            lines.insert(text.to_owned(), line.clone());
+        }
+        line
+    }
+
+    fn lay_out(&self, text: &str, bold: bool) -> Line {
         let text = text.replace('\t', " ");
         let mut line = Line::default();
         if text.is_empty() {
@@ -201,44 +249,43 @@ impl FontBook {
     }
 
     fn shape_segment(&self, text: &str, face: ID, rtl: bool, pen: f32, out: &mut Vec<Glyph>) -> f32 {
-        self.db
-            .with_face_data(face, |data, index| {
-                let Some(font) = rustybuzz::Face::from_slice(data, index) else { return pen };
-                let upem = font.units_per_em() as f32;
-                let mut buffer = rustybuzz::UnicodeBuffer::new();
-                buffer.push_str(text);
-                buffer.set_direction(if rtl {
-                    rustybuzz::Direction::RightToLeft
-                } else {
-                    rustybuzz::Direction::LeftToRight
+        self.with_face(face, |data, index| {
+            let Some(font) = rustybuzz::Face::from_slice(data, index) else { return pen };
+            let upem = font.units_per_em() as f32;
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(text);
+            buffer.set_direction(if rtl {
+                rustybuzz::Direction::RightToLeft
+            } else {
+                rustybuzz::Direction::LeftToRight
+            });
+            let shaped = rustybuzz::shape(&font, &[], buffer);
+            // Cluster starts in logical order give each cluster's text.
+            let mut starts: Vec<usize> = shaped.glyph_infos().iter().map(|g| g.cluster as usize).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            let cluster_text = |start: usize| {
+                let next = starts.iter().find(|&&s| s > start).copied().unwrap_or(text.len());
+                text.get(start..next).unwrap_or_default().to_string()
+            };
+            let mut seen = HashSet::new();
+            let mut pen = pen;
+            for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+                let id = info.glyph_id as u16;
+                let cluster = info.cluster as usize;
+                out.push(Glyph {
+                    face,
+                    id,
+                    x: pen + pos.x_offset as f32 / upem,
+                    y: pos.y_offset as f32 / upem,
+                    width: font.glyph_hor_advance(ttf_parser::GlyphId(id)).unwrap_or(0) as f32 / upem,
+                    text: if seen.insert(cluster) { cluster_text(cluster) } else { String::new() },
                 });
-                let shaped = rustybuzz::shape(&font, &[], buffer);
-                // Cluster starts in logical order give each cluster's text.
-                let mut starts: Vec<usize> = shaped.glyph_infos().iter().map(|g| g.cluster as usize).collect();
-                starts.sort_unstable();
-                starts.dedup();
-                let cluster_text = |start: usize| {
-                    let next = starts.iter().find(|&&s| s > start).copied().unwrap_or(text.len());
-                    text.get(start..next).unwrap_or_default().to_string()
-                };
-                let mut seen = HashSet::new();
-                let mut pen = pen;
-                for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
-                    let id = info.glyph_id as u16;
-                    let cluster = info.cluster as usize;
-                    out.push(Glyph {
-                        face,
-                        id,
-                        x: pen + pos.x_offset as f32 / upem,
-                        y: pos.y_offset as f32 / upem,
-                        width: font.glyph_hor_advance(ttf_parser::GlyphId(id)).unwrap_or(0) as f32 / upem,
-                        text: if seen.insert(cluster) { cluster_text(cluster) } else { String::new() },
-                    });
-                    pen += pos.x_advance as f32 / upem;
-                }
-                pen
-            })
-            .unwrap_or(pen)
+                pen += pos.x_advance as f32 / upem;
+            }
+            pen
+        })
+        .unwrap_or(pen)
     }
 }
 
@@ -353,13 +400,13 @@ impl<'a> Embedder<'a> {
             if !continues {
                 flush(&mut run, ops);
                 if current != Some(index) {
-                    ops.push_str(&format!("/{} {} Tf\n", font.name, num(size)));
+                    ops.push_str(&format!("/{} {} Tf\n", font.name, num(size as f64)));
                     if !resources.iter().any(|(name, _)| *name == font.name) {
                         resources.push((font.name.clone(), font.object));
                     }
                     current = Some(index);
                 }
-                ops.push_str(&format!("1 0 0 1 {} {} Tm\n", num(gx), num(gy)));
+                ops.push_str(&format!("1 0 0 1 {} {} Tm\n", num(gx as f64), num(gy as f64)));
             }
             run.push_str(&format!("{cid:04X}"));
             next = Some((gx + glyph.width * size, gy));
@@ -385,10 +432,9 @@ impl<'a> Embedder<'a> {
     /// Write the fonts used so far into the document.
     pub fn finish(self, doc: &mut Document) -> Result<()> {
         for font in self.fonts {
-            let info = self.book.db.face(font.face).ok_or_else(|| anyhow!("font disappeared"))?;
-            let postscript = sanitize_name(&info.post_script_name);
-            let family = family_name(info).to_string();
-            let built = self.book.db.with_face_data(font.face, |data, index| -> Result<_> {
+            let (postscript, family) = self.book.names(font.face).ok_or_else(|| anyhow!("font disappeared"))?;
+            let postscript = sanitize_name(&postscript);
+            let built = self.book.with_face(font.face, |data, index| -> Result<_> {
                 let face = ttf_parser::Face::parse(data, index).map_err(|e| anyhow!("could not read font {family}: {e}"))?;
                 let subset = subsetter::subset_with_variations(data, index, &[], &font.glyphs)
                     .map_err(|e| anyhow!("could not embed font {family}: {e}"))?;
@@ -533,12 +579,6 @@ fn sanitize_name(name: &str) -> String {
     if clean.is_empty() { "Font".into() } else { clean }
 }
 
-fn num(v: f32) -> String {
-    let s = format!("{v:.3}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    if s == "-0" { "0".into() } else { s.to_string() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +614,7 @@ mod tests {
         let Some(book) = book_with("سلام") else { return };
         let line = book.shape("سلام", false);
         // Shaping picks contextual forms: the ids differ from the isolated letters'.
-        let isolated: Vec<u16> = "سلام".chars().flat_map(|c| book.shape(&c.to_string(), false).glyphs).map(|g| g.id).collect();
+        let isolated: Vec<u16> = "سلام".chars().flat_map(|c| book.shape(&c.to_string(), false).glyphs.clone()).map(|g| g.id).collect();
         let joined: Vec<u16> = line.glyphs.iter().map(|g| g.id).collect();
         assert_ne!(joined, isolated);
     }
