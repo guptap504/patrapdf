@@ -3,6 +3,7 @@
 
 mod about;
 mod assets;
+mod clipboard;
 mod editor;
 mod fonts;
 mod forms;
@@ -10,6 +11,7 @@ mod gestures;
 mod model;
 mod pdf;
 mod recents;
+mod search;
 mod settings;
 mod signatures;
 mod ui;
@@ -21,16 +23,20 @@ use futures::StreamExt;
 use gpui::{Application, Menu, MenuItem};
 
 use editor::{
-    About, AddPages, AddSignature, CheckForUpdates, CloseDocument, Copy, Cut, DiscardChanges, Duplicate, KeyboardShortcuts, Open, Paste, Quit, Redo, Save,
-    SaveWithPassword, ToggleLeftSidebar, ToggleRightSidebar, Undo, VisitWebsite, ZoomFitPage, ZoomFitWidth, ZoomIn, ZoomOut, ZoomReset,
+    About, AddPages, AddSignature, CheckForUpdates, CloseDocument, Copy, CopyPdf, Cut, DiscardChanges, Duplicate, Find, FindNext, FindPrevious, KeyboardShortcuts, MinimizeWindow, NewWindow, Open,
+    Paste, Quit, Redo, Save, SaveWithPassword, ToggleLeftSidebar, ToggleRightSidebar, Undo, VisitWebsite, ZoomFitPage, ZoomFitWidth, ZoomIn, ZoomOut,
+    ZoomReset, ZoomWindow,
 };
 
 fn main() {
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
+    // The PDFs to open, each in a window of its own.
+    let mut paths = std::env::args_os().skip(1).map(PathBuf::from);
+    let initial = paths.next();
+    let more: Vec<PathBuf> = paths.collect();
 
     let app = Application::new().with_assets(assets::Assets);
     // PDFs opened from the Finder ("Open With", or dropped on the Dock icon) arrive
-    // as file URLs, possibly before the window exists; queue them until it does.
+    // as file URLs, possibly before the first window exists; queue them until it does.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     app.on_open_urls(move |urls| {
         let _ = open_tx.unbounded_send(urls);
@@ -38,9 +44,19 @@ fn main() {
 
     app.run(move |cx| {
         editor::bind_keys(cx);
+        signatures::secure_data_dir();
+        clipboard::tidy();
         let updater = updater::init(settings::Settings::load().check_for_updates, cx);
         let self_updating = updater.read(cx).support().is_ok();
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| editor::request_quit(cx));
+        // Once the window the action came from is done with it: the new one is placed beside it.
+        cx.on_action(|_: &NewWindow, cx| {
+            cx.defer(|cx| {
+                if let Err(e) = editor::open_editor(cx, None) {
+                    eprintln!("failed to open window: {e:#}");
+                }
+            })
+        });
         cx.set_menus(vec![
             Menu {
                 name: "PatraPDF".into(),
@@ -53,9 +69,11 @@ fn main() {
             Menu {
                 name: "File".into(),
                 items: vec![
+                    MenuItem::action("New Window", NewWindow),
                     MenuItem::action("Open…", Open),
                     MenuItem::action("Save As…", Save),
                     MenuItem::action("Save with Password…", SaveWithPassword),
+                    MenuItem::action("Copy PDF to Clipboard", CopyPdf),
                     MenuItem::action("Discard Changes…", DiscardChanges),
                     MenuItem::action("Close Document", CloseDocument),
                     MenuItem::separator(),
@@ -73,6 +91,10 @@ fn main() {
                     MenuItem::action("Copy", Copy),
                     MenuItem::action("Paste", Paste),
                     MenuItem::action("Duplicate", Duplicate),
+                    MenuItem::separator(),
+                    MenuItem::action("Find…", Find),
+                    MenuItem::action("Find Next", FindNext),
+                    MenuItem::action("Find Previous", FindPrevious),
                 ],
             },
             Menu {
@@ -88,6 +110,11 @@ fn main() {
                     MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
                 ],
             },
+            // macOS lists the open windows at the end of the menu with this name.
+            Menu {
+                name: "Window".into(),
+                items: vec![MenuItem::action("Minimize", MinimizeWindow), MenuItem::action("Zoom", ZoomWindow)],
+            },
             Menu {
                 name: "Help".into(),
                 items: vec![
@@ -98,26 +125,24 @@ fn main() {
             },
         ]);
 
-        match editor::open_editor(cx, initial.clone()) {
-            Ok(window) => {
-                cx.spawn(async move |cx| {
-                    while let Some(urls) = open_rx.next().await {
-                        for path in urls.iter().filter_map(|u| file_url_path(u)) {
-                            let _ = window.update(cx, |editor, window, cx| {
-                                window.activate_window();
-                                editor.request_open(Some(path), window, cx);
-                            });
-                        }
-                    }
-                })
-                .detach();
-            }
-            Err(e) => {
-                eprintln!("failed to open window: {e:#}");
-                cx.quit();
-            }
+        if let Err(e) = editor::open_editor(cx, initial) {
+            eprintln!("failed to open window: {e:#}");
+            cx.quit();
         }
-        // A single-window app: closing the window quits.
+        for path in more {
+            editor::open_document(cx, path, None);
+        }
+        cx.spawn(async move |cx| {
+            while let Some(urls) = open_rx.next().await {
+                let _ = cx.update(|cx| {
+                    for path in urls.iter().filter_map(|u| file_url_path(u)) {
+                        editor::open_document(cx, path, None);
+                    }
+                });
+            }
+        })
+        .detach();
+        // Closing the last window quits.
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

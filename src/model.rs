@@ -56,6 +56,32 @@ pub enum ItemKind {
     Check,
     /// A redaction box. On save, everything under it is removed from the file.
     Redact { fill: RedactFill },
+    /// A box of see-through colour, as left by a highlighter pen.
+    Highlight { color: u32 },
+    /// The outline of a box, or of the oval that fills it.
+    Outline { oval: bool, color: u32, width: f32 },
+    /// A line through `points` (as fractions of the item's box, from its top
+    /// left): drawn freehand, or straight between two, with an arrow head at
+    /// the end if `arrow`.
+    Stroke { points: Arc<[[f32; 2]]>, color: u32, width: f32, arrow: bool },
+}
+
+/// The highlighter's colours, and the pen's (which shapes are drawn with too): `0xRRGGBB`.
+pub const HIGHLIGHT_COLORS: &[(&str, u32)] = &[("Yellow", 0xffe14d), ("Green", 0x8ce99a), ("Pink", 0xffa8c9), ("Blue", 0x91c8ff)];
+pub const PEN_COLORS: &[(&str, u32)] = &[("Red", 0xe5484d), ("Blue", 0x1e4fd6), ("Green", 0x2b9a66), ("Orange", 0xf76b15), ("Black", 0x111111)];
+/// How wide the pen draws, in points.
+pub const PEN_WIDTHS: &[(&str, f32)] = &[("Thin", 1.5), ("Medium", 3.), ("Thick", 6.)];
+
+/// The ends of the two barbs of an arrow head, on a line `width` wide that
+/// ends at `to` coming from `from`. `unit` is the length of a point.
+pub fn arrow_barbs(from: (f32, f32), to: (f32, f32), width: f32, unit: f32) -> [(f32, f32); 2] {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length = dx.hypot(dy).max(f32::EPSILON);
+    let (ux, uy) = (dx / length, dy / length);
+    let size = (width * 4.).max(8. * unit);
+    // 28° to either side of the line.
+    let (sin, cos) = (0.469, 0.883);
+    [1., -1.].map(|side| (to.0 - size * (ux * cos - side * uy * sin), to.1 - size * (uy * cos + side * ux * sin)))
 }
 
 /// The colour a redaction box covers things with.
@@ -107,6 +133,67 @@ impl Item {
         match self.kind {
             ItemKind::Redact { fill } => Some(fill),
             _ => None,
+        }
+    }
+
+    /// The colour of something drawn on the page, and whether it is the
+    /// highlighter's (`true`) or the pen's.
+    pub fn color(&self) -> Option<(bool, u32)> {
+        match self.kind {
+            ItemKind::Highlight { color } => Some((true, color)),
+            ItemKind::Outline { color, .. } | ItemKind::Stroke { color, .. } => Some((false, color)),
+            _ => None,
+        }
+    }
+
+    pub fn set_color(&mut self, to: u32) {
+        if let ItemKind::Highlight { color } | ItemKind::Outline { color, .. } | ItemKind::Stroke { color, .. } = &mut self.kind {
+            *color = to;
+        }
+    }
+
+    /// How wide its line is, if it is drawn with the pen.
+    pub fn pen_width(&self) -> Option<f32> {
+        match self.kind {
+            ItemKind::Outline { width, .. } | ItemKind::Stroke { width, .. } => Some(width),
+            _ => None,
+        }
+    }
+
+    pub fn set_pen_width(&mut self, to: f32) {
+        if let ItemKind::Outline { width, .. } | ItemKind::Stroke { width, .. } = &mut self.kind {
+            *width = to;
+        }
+    }
+
+    /// Whether its width and height are resized separately (other items keep their shape).
+    pub fn stretches(&self) -> bool {
+        matches!(self.kind, ItemKind::Redact { .. } | ItemKind::Highlight { .. } | ItemKind::Outline { .. } | ItemKind::Stroke { .. })
+    }
+
+    /// The points a stroke runs through, in view space.
+    pub fn stroke_points(&self) -> Vec<(f32, f32)> {
+        match &self.kind {
+            ItemKind::Stroke { points, .. } => points.iter().map(|[x, y]| (self.x + x * self.w, self.y + y * self.h)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Make a stroke run through `through` (view space): its box is the one
+    /// around them, never too thin to take hold of.
+    pub fn fit_stroke(&mut self, through: &[(f32, f32)]) {
+        const MIN: f32 = 8.;
+        let span = |values: &mut dyn Iterator<Item = f32>| {
+            let (low, high) = values.fold((f32::MAX, f32::MIN), |(low, high), v| (low.min(v), high.max(v)));
+            if high - low < MIN { ((low + high - MIN) / 2., MIN) } else { (low, high - low) }
+        };
+        if through.is_empty() {
+            return;
+        }
+        let ((x, w), (y, h)) = (span(&mut through.iter().map(|p| p.0)), span(&mut through.iter().map(|p| p.1)));
+        (self.x, self.y, self.w, self.h) = (x, y, w, h);
+        if let ItemKind::Stroke { points, .. } = &mut self.kind {
+            *points = through.iter().map(|&(px, py)| [(px - x) / w, (py - y) / h]).collect();
         }
     }
 }

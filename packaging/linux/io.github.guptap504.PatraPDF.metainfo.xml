@@ -15,7 +15,9 @@
     <ul>
       <li>Type text, add dates and checkmarks anywhere on a page</li>
       <li>Place your signature from an image; the paper background is removed automatically</li>
+      <li>Highlight text, draw freehand, and add shapes and arrows</li>
       <li>Redact: black out content and remove it from the file for good</li>
+      <li>Find text in the document, and work on several documents in windows of their own</li>
       <li>Stamp a watermark across every page</li>
       <li>Delete and reorder pages, and add pages from other PDFs</li>
     </ul>
@@ -29,6 +31,14 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.5.0" date="2026-11-14">
+      <description>
+        <p>Annotate: highlight text, draw freehand, and add rectangles, ovals, lines and arrows.</p>
+        <p>Find text in the document, and open each document in a window of its own.</p>
+        <p>Copy the finished PDF to the clipboard, to paste straight into an email, a chat or a folder.</p>
+        <p>Redacting or deleting a page now also removes every copy of its form values from the file.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-11-14">
       <description>
         <p>PDF Signer is now PatraPDF.</p>

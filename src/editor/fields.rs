@@ -101,6 +101,7 @@ impl Editor {
 
     pub(super) fn start_field_editing(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        self.unfocus_find();
         self.selected = None;
         self.field_editing = Some(index);
         self.typing_checkpointed = false;

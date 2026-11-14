@@ -102,7 +102,12 @@ pub fn detect() -> Result<Install, NoUpdates> {
         .iter()
         .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
         .collect::<Vec<_>>();
-    detect_from(std::env::consts::OS, &exe, std::env::var_os("APPIMAGE").map(PathBuf::from), &program_files)
+    // The AppImage this runs from: the one whose unpacked contents hold the
+    // executable. (Started by another app that is an AppImage, a copy installed
+    // some other way inherits that app's variables, and must not replace it.)
+    let inside = |dir: std::ffi::OsString| PathBuf::from(dir).canonicalize().is_ok_and(|dir| exe.starts_with(dir));
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|_| std::env::var_os("APPDIR").is_some_and(inside));
+    detect_from(std::env::consts::OS, &exe, appimage, &program_files)
 }
 
 fn detect_from(os: &str, exe: &Path, appimage: Option<PathBuf>, program_files: &[PathBuf]) -> Result<Install, NoUpdates> {
@@ -285,7 +290,7 @@ fn hex32(hex: &str) -> Option<[u8; 32]> {
 }
 
 /// Download and verify the update for `install` from `release` into `dir`.
-/// Returns the verified package. Runs on a background thread.
+/// Returns the verified package and its checksum. Runs on a background thread.
 #[allow(clippy::too_many_arguments)]
 fn download_update(
     agent: &ureq::Agent,
@@ -296,7 +301,7 @@ fn download_update(
     public_key: &str,
     progress: &AtomicU64,
     cancel: &AtomicBool,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, [u8; 32])> {
     let name = asset_name(install, version);
     let asset = release.asset(&name)?;
     ensure!(asset.size > 0 && asset.size <= MAX_PACKAGE_BYTES, "the update has an unexpected size");
@@ -317,7 +322,25 @@ fn download_update(
         return Err(e);
     }
     fs::rename(&partial, &path)?;
-    Ok(path)
+    Ok((path, expected))
+}
+
+/// Check that `package` is still the file that was verified when it was
+/// downloaded: it may have waited a long while to be installed.
+fn verify_unchanged(package: &Path, expected: &[u8; 32]) -> Result<()> {
+    let mut file = fs::File::open(package)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    ensure!(&digest == expected, "the update was changed after it was downloaded. It was not installed.");
+    Ok(())
 }
 
 fn download_to(
@@ -647,7 +670,8 @@ pub struct Updater {
     enabled: bool,
     status: Status,
     release: Option<ReleaseInfo>,
-    package: Option<PathBuf>,
+    /// The downloaded update, with the checksum it was verified to have.
+    package: Option<(PathBuf, [u8; 32])>,
     state: State,
     manual: bool,
     feed_url: String,
@@ -905,7 +929,7 @@ impl Updater {
             self.state.skipped_version = Some(version.to_string());
             self.state.save();
         }
-        if let Some(package) = self.package.take() {
+        if let Some((package, _)) = self.package.take() {
             let _ = fs::remove_file(package);
         }
         self.release = None;
@@ -917,8 +941,8 @@ impl Updater {
     /// caller quits the app on success.
     pub fn install_and_restart(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let install = self.install.clone().map_err(|reason| anyhow!(reason.message()))?;
-        let package = self.package.take().ok_or_else(|| anyhow!("no update is ready"))?;
-        let result = install_package(&install, &package, true);
+        let (package, checksum) = self.package.take().ok_or_else(|| anyhow!("no update is ready"))?;
+        let result = verify_unchanged(&package, &checksum).and_then(|()| install_package(&install, &package, true));
         if result.is_err() {
             self.release = None;
             self.status = Status::Idle;
@@ -930,8 +954,8 @@ impl Updater {
 
     /// Quitting with an update ready: install it now, so the next launch is new.
     fn install_on_quit(&mut self) {
-        if let (Ok(install), Some(package)) = (&self.install, self.package.take()) {
-            if let Err(e) = install_package(install, &package, false) {
+        if let (Ok(install), Some((package, checksum))) = (&self.install, self.package.take()) {
+            if let Err(e) = verify_unchanged(&package, &checksum).and_then(|()| install_package(install, &package, false)) {
                 eprintln!("couldn't install the update: {e:#}");
             }
         }
@@ -1132,7 +1156,7 @@ iGRB6/YzdNLb7YjqOANKbqyVKaED8jM0rwg3dd1X+97zdP4sIQNMBrSBF1jbliwtcAs54pQbrW0+k0cQ
         let install = Install::AppImage { path: "/x".into() };
         let r = release("v9.9.9", base, size);
         let (progress, cancel) = (AtomicU64::new(0), AtomicBool::new(false));
-        download_update(&agent(), &r, &install, &v("9.9.9"), &dir, TEST_KEY, &progress, &cancel)
+        download_update(&agent(), &r, &install, &v("9.9.9"), &dir, TEST_KEY, &progress, &cancel).map(|(path, _)| path)
     }
 
     #[test]
@@ -1297,7 +1321,13 @@ iGRB6/YzdNLb7YjqOANKbqyVKaED8jM0rwg3dd1X+97zdP4sIQNMBrSBF1jbliwtcAs54pQbrW0+k0cQ
         updater.read_with(cx, |u, _| {
             assert_eq!(u.status(), &Status::Ready { version: v("9.9.9") });
             assert_eq!(u.release().unwrap().notes, "• Faster");
-            assert_eq!(fs::read(u.package.as_ref().unwrap()).unwrap(), package);
+            let (path, checksum) = u.package.clone().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), package);
+            // Changed while it waited to be installed: it no longer passes.
+            assert!(verify_unchanged(&path, &checksum).is_ok());
+            fs::write(&path, b"something else").unwrap();
+            assert!(verify_unchanged(&path, &checksum).unwrap_err().to_string().contains("was changed"));
+            fs::write(&path, &package).unwrap();
         });
         assert_eq!(events.borrow().as_slice(), &[Event::Ready { manual: true }]);
 

@@ -21,6 +21,8 @@ pub(super) enum InputTarget {
     Field(usize),
     /// A text item (its id).
     Item(u64),
+    /// The find bar.
+    Find,
     Watermark,
 }
 
@@ -37,6 +39,8 @@ impl Editor {
             Some(InputTarget::Field(index))
         } else if let Some(id) = self.editing {
             Some(InputTarget::Item(id))
+        } else if self.find_focused() {
+            Some(InputTarget::Find)
         } else {
             self.watermark_editing.then_some(InputTarget::Watermark)
         }
@@ -47,6 +51,7 @@ impl Editor {
         match self.input_target()? {
             InputTarget::Recents => Some(self.recents_query.clone()),
             InputTarget::Field(index) => self.field_input_text(index),
+            InputTarget::Find => self.find.as_ref().map(|find| find.query.clone()),
             InputTarget::Item(id) => self.items.iter().find(|i| i.id == id).and_then(|item| match &item.kind {
                 ItemKind::Text { text, .. } => Some(text.clone()),
                 _ => None,
@@ -66,6 +71,7 @@ impl Editor {
                 cx.notify();
             }
             Some(InputTarget::Field(index)) => self.type_into_field(index, text, cx),
+            Some(InputTarget::Find) => self.set_find_query(text.replace('\n', " "), cx),
             Some(InputTarget::Item(_)) => self.edit_text(cx, move |t| *t = text),
             Some(InputTarget::Watermark) => {
                 let line = text.replace('\n', " ");

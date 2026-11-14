@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::model;
 use crate::signatures;
 
 /// Date formats offered for the Date tool (chrono `strftime` patterns).
@@ -18,6 +19,10 @@ pub struct Settings {
     /// Whether the tools and signatures (left) and the page thumbnails (right) are shown.
     pub show_left_sidebar: bool,
     pub show_right_sidebar: bool,
+    /// What the highlighter and the pen were last set to (see `model::PEN_COLORS` and the like).
+    pub highlight_color: u32,
+    pub pen_color: u32,
+    pub pen_width: f32,
 }
 
 impl Default for Settings {
@@ -27,6 +32,9 @@ impl Default for Settings {
             check_for_updates: true,
             show_left_sidebar: true,
             show_right_sidebar: true,
+            highlight_color: model::HIGHLIGHT_COLORS[0].1,
+            pen_color: model::PEN_COLORS[0].1,
+            pen_width: model::PEN_WIDTHS[1].1,
         }
     }
 }
@@ -44,6 +52,15 @@ impl Settings {
         // Ignore formats we no longer offer (e.g. a hand-edited file).
         if !DATE_FORMATS.contains(&settings.date_format.as_str()) {
             settings.date_format = Self::default().date_format;
+        }
+        if !model::HIGHLIGHT_COLORS.iter().any(|c| c.1 == settings.highlight_color) {
+            settings.highlight_color = Self::default().highlight_color;
+        }
+        if !model::PEN_COLORS.iter().any(|c| c.1 == settings.pen_color) {
+            settings.pen_color = Self::default().pen_color;
+        }
+        if !model::PEN_WIDTHS.iter().any(|w| w.1 == settings.pen_width) {
+            settings.pen_width = Self::default().pen_width;
         }
         settings
     }

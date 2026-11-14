@@ -5,7 +5,7 @@
 //! `pdf::fill_form`), so the saved PDF is still a fillable form that other
 //! apps show and edit as usual.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hayro::kurbo::{Affine, Point, Rect};
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -252,10 +252,11 @@ pub fn read(doc: &Document, pages: &[PageGeom]) -> Vec<Field> {
         ..Inherited::default()
     };
     let mut fields = Vec::new();
+    let mut seen = HashSet::new();
     if let Ok(Object::Array(roots)) = form.get_deref(b"Fields", doc) {
         for root in roots {
             if let Ok(id) = root.as_reference() {
-                walk(doc, id, &defaults, pages, &page_of, &mut fields, 0);
+                walk(doc, id, &defaults, pages, &page_of, &mut fields, &mut seen, 0);
             }
         }
     }
@@ -269,10 +270,13 @@ fn walk(
     pages: &[PageGeom],
     page_of: &HashMap<ObjectId, usize>,
     out: &mut Vec<Field>,
+    seen: &mut HashSet<ObjectId>,
     depth: usize,
 ) {
     let Ok(dict) = doc.get_dictionary(id) else { return };
-    if depth > 32 {
+    // Each field once: a damaged (or crafted) file can list one under many
+    // parents, which would otherwise be walked again for every path to it.
+    if depth > 32 || !seen.insert(id) {
         return;
     }
     let mut attrs = parent.clone();
@@ -309,7 +313,7 @@ fn walk(
     let (subfields, widgets): (Vec<ObjectId>, Vec<ObjectId>) =
         kids.into_iter().partition(|k| doc.get_dictionary(*k).is_ok_and(|d| d.has(b"T")));
     for kid in subfields {
-        walk(doc, kid, &attrs, pages, page_of, out, depth + 1);
+        walk(doc, kid, &attrs, pages, page_of, out, seen, depth + 1);
     }
     let mut widget_ids = widgets;
     if dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Widget") {

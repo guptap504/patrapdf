@@ -3,7 +3,8 @@
 //! GPUI 0.2 has no gesture events: its macOS view (`GPUIView`) doesn't
 //! implement `magnifyWithEvent:`, so AppKit drops pinches. We add that method
 //! to the class through the Objective-C runtime and forward each pinch step
-//! over a channel, which the editor drains on the main thread.
+//! over a channel to the window it was made over, whose editor drains it on
+//! the main thread.
 
 use std::sync::Mutex;
 
@@ -17,21 +18,30 @@ pub struct Pinch {
     pub position: (f32, f32),
 }
 
-static SENDER: Mutex<Option<mpsc::UnboundedSender<Pinch>>> = Mutex::new(None);
+/// Each window's native view (its address) and where that window's pinches go.
+static SENDERS: Mutex<Vec<(usize, mpsc::UnboundedSender<Pinch>)>> = Mutex::new(Vec::new());
 
-/// Start receiving pinch gestures. A later call replaces the earlier receiver
-/// (the app has a single window).
-pub fn subscribe() -> mpsc::UnboundedReceiver<Pinch> {
+/// Start receiving the pinch gestures made over `window`. The stream ends at
+/// once where there are none to receive (anywhere but macOS).
+pub fn subscribe(window: &gpui::Window) -> mpsc::UnboundedReceiver<Pinch> {
     let (tx, rx) = mpsc::unbounded();
-    *SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     #[cfg(target_os = "macos")]
-    mac::install();
+    if let Some(view) = mac::view_of(window) {
+        let mut senders = SENDERS.lock().unwrap_or_else(|e| e.into_inner());
+        // Windows that have closed; a new view may be given an old one's address.
+        senders.retain(|(_, tx)| !tx.is_closed());
+        senders.push((view, tx));
+        mac::install();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, tx);
     rx
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn send(pinch: Pinch) {
-    if let Some(tx) = SENDER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+fn send(view: usize, pinch: Pinch) {
+    let senders = SENDERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, tx)) = senders.iter().find(|(v, tx)| *v == view && !tx.is_closed()) {
         let _ = tx.unbounded_send(pinch);
     }
 }
@@ -68,12 +78,29 @@ mod mac {
             let location: NSPoint = msg_send![event, locationInWindow];
             let frame: NSRect = msg_send![this, frame];
             if magnification.is_finite() {
-                send(Pinch {
-                    factor: (1.0 + magnification).max(0.1) as f32,
-                    // AppKit's origin is bottom-left; GPUI's is top-left.
-                    position: (location.x as f32, (frame.size.y - location.y) as f32),
-                });
+                send(
+                    this as *const Object as usize,
+                    Pinch {
+                        factor: (1.0 + magnification).max(0.1) as f32,
+                        // AppKit's origin is bottom-left; GPUI's is top-left.
+                        position: (location.x as f32, (frame.size.y - location.y) as f32),
+                    },
+                );
             }
+        }
+    }
+
+    /// The address of the window's native view (a `GPUIView`), which is what
+    /// AppKit hands `magnify_with_event`.
+    pub fn view_of(window: &gpui::Window) -> Option<usize> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        // GPUI's test windows have no native view, and panic when asked for one.
+        if cfg!(test) {
+            return None;
+        }
+        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+            RawWindowHandle::AppKit(handle) => Some(handle.ns_view.as_ptr() as usize),
+            _ => None,
         }
     }
 
@@ -103,7 +130,7 @@ mod tests {
 
     #[test]
     fn pinch_handler_is_installed_on_gpuis_view() {
-        let _rx = super::subscribe();
+        super::mac::install();
         let class = Class::get("GPUIView").expect("GPUI registers its view class at load time");
         assert!(class.instance_method(Sel::register("magnifyWithEvent:")).is_some());
     }

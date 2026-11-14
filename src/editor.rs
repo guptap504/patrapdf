@@ -11,14 +11,14 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, Global, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
-    Subscription, Task, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
+    Subscription, Task, WeakEntity, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
     size,
 };
 
-use crate::model::{Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, PageImport, RedactFill, Signature, TEXT_FONT, TextMetrics};
+use crate::model::{self, Watermark, Item, ItemKind, LINE_HEIGHT, PageGeom, PageImport, RedactFill, Signature, TEXT_FONT, TextMetrics};
 
 mod fields;
 mod input;
@@ -27,6 +27,8 @@ use crate::fonts::FontBook;
 use crate::forms::{self, FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
+use crate::clipboard;
+use crate::search;
 use crate::gestures;
 use crate::settings::{self, Settings};
 use crate::signatures;
@@ -36,15 +38,20 @@ use crate::updater::{self, Updater};
 actions!(
     patrapdf,
     [
+        NewWindow,
         Open,
         Save,
         SaveWithPassword,
+        CopyPdf,
         Undo,
         Redo,
         Copy,
         Cut,
         Paste,
         Duplicate,
+        Find,
+        FindNext,
+        FindPrevious,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -54,6 +61,8 @@ actions!(
         AddPages,
         CloseDocument,
         DiscardChanges,
+        MinimizeWindow,
+        ZoomWindow,
         ToggleLeftSidebar,
         ToggleRightSidebar,
         KeyboardShortcuts,
@@ -67,6 +76,40 @@ actions!(
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.0;
 const MAX_RENDER_SCALE: f32 = 6.0;
+/// How many bytes of page bitmaps a document keeps. One with more pages than
+/// that holds has the pages around the one in view drawn, and the rest again
+/// when they are scrolled to.
+const RENDER_BUDGET: usize = 1 << 30;
+
+/// The pages (by position) to keep drawn at `scale`, nearest to `current`
+/// first: as many as `budget` bytes hold, and the nearest three whatever they take.
+fn pages_in_budget(sizes: &[(f32, f32)], current: usize, scale: f32, budget: usize) -> Vec<usize> {
+    let mut positions: Vec<usize> = (0..sizes.len()).collect();
+    positions.sort_by_key(|&position| position.abs_diff(current));
+    let mut left = budget;
+    let mut kept = 0;
+    for (n, &position) in positions.iter().enumerate() {
+        let (width, height) = sizes[position];
+        let scale = pdf::render_scale(width, height, scale);
+        let bytes = (width * scale) as usize * (height * scale) as usize * 4;
+        if n >= 3 && bytes > left {
+            break;
+        }
+        left = left.saturating_sub(bytes);
+        kept = n + 1;
+    }
+    positions.truncate(kept);
+    positions
+}
+
+/// In a document too long to keep every page drawn: what the drawn pages were
+/// chosen for. They are chosen again once the view has moved `slack` pages
+/// from `page`, or the pages are not in this `order` any more.
+struct DrawnAround {
+    page: usize,
+    slack: usize,
+    order: Vec<usize>,
+}
 const DEFAULT_FONT_SIZE: f32 = 12.0;
 const DEFAULT_SIG_WIDTH: f32 = 150.0;
 const DEFAULT_SIG_MAX_HEIGHT: f32 = 55.0;
@@ -105,8 +148,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "File",
         &[
             ("Open a PDF", "⌘O"),
+            ("New window", "⌘N"),
             ("Save a filled copy", "⌘S"),
             ("Save with a password", "⌥⌘S"),
+            ("Copy the PDF to the clipboard", "⇧⌘C"),
             ("Add signature image", "⇧⌘S"),
             ("All documents", "⌘W"),
             ("Search recent documents", "⌘F"),
@@ -119,6 +164,8 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Cut / Copy / Paste field", "⌘X  ⌘C  ⌘V"),
             ("Duplicate field", "⌘D"),
             ("Delete field", "⌫"),
+            ("Find in the document", "⌘F"),
+            ("Next / Previous match", "⌘G  ⇧⌘G"),
             ("Nudge (Shift = 10pt)", "←↑→↓"),
             ("Next / Previous form field", "Tab  ⇧Tab"),
         ],
@@ -143,6 +190,24 @@ enum Tool {
     Date,
     Check,
     Redact,
+    Highlight,
+    Pen,
+    Rectangle,
+    Oval,
+    Line,
+    Arrow,
+}
+
+impl Tool {
+    /// Whether it draws an annotation where it is dragged over the page. Such
+    /// a tool stays in hand afterwards, to draw the next.
+    fn draws(self) -> bool {
+        matches!(self, Tool::Highlight | Tool::Pen) || self.is_shape()
+    }
+
+    fn is_shape(self) -> bool {
+        matches!(self, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow)
+    }
 }
 
 /// How the zoom level is chosen.
@@ -187,6 +252,12 @@ fn tool_label(tool: Tool) -> (&'static str, &'static str) {
         Tool::Date => ("calendar", "Date"),
         Tool::Check => ("check", "Checkmark"),
         Tool::Redact => ("redact", "Redact"),
+        Tool::Highlight => ("highlight", "Highlight"),
+        Tool::Pen => ("pen", "Draw"),
+        Tool::Rectangle => ("square", "Rectangle"),
+        Tool::Oval => ("circle", "Oval"),
+        Tool::Line => ("line", "Line"),
+        Tool::Arrow => ("arrow", "Arrow"),
     }
 }
 
@@ -267,8 +338,19 @@ struct PanState {
 enum DragMode {
     Move,
     Resize,
-    /// Drawing a new redaction box from the point where the drag started.
+    /// Drawing a new box (a redaction, a highlight, a shape) from the point where the drag started.
     Draw,
+    /// Drawing a straight line from there.
+    Line,
+    /// Drawing freehand.
+    Ink,
+}
+
+impl DragMode {
+    /// Whether the drag draws a new item.
+    fn draws(self) -> bool {
+        matches!(self, DragMode::Draw | DragMode::Line | DragMode::Ink)
+    }
 }
 
 struct DragState {
@@ -278,6 +360,8 @@ struct DragState {
     start: (f32, f32, f32, f32),
     snapshot: Snapshot,
     moved: bool,
+    /// The page points (view space) a line being drawn runs through.
+    points: Vec<(f32, f32)>,
 }
 
 /// The first thumbnail of the rail as it was painted.
@@ -293,6 +377,8 @@ struct PageView {
     /// Small render for the page thumbnail rail.
     thumb: Option<Arc<RenderImage>>,
     rendered_scale: f32,
+    /// The scale it is drawn at, or is being drawn at by the render under way.
+    requested_scale: f32,
 }
 
 struct OpenDoc {
@@ -314,6 +400,9 @@ struct OpenDoc {
     order: Vec<usize>,
     /// Where this document was last saved to (suggested on the next save).
     last_output: Option<PathBuf>,
+    /// The text of each page of the original file, by original index, once it
+    /// has been read (which starts when it is first looked through, see `FindBar`).
+    text: Vec<Option<search::PageText>>,
 }
 
 impl OpenDoc {
@@ -368,6 +457,19 @@ impl std::fmt::Display for ImportGone {
 
 impl std::error::Error for ImportGone {}
 
+/// The most a file to open may hold: more is not a document this can work on.
+const MAX_FILE_BYTES: u64 = 2 << 30;
+
+/// Read a file to open. Its path can come from outside the app (the command
+/// line, another app), and name anything: only a real file is read, not a
+/// device or a pipe, and not more than could be a document.
+fn read_document(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::metadata(path)?;
+    anyhow::ensure!(file.is_file(), "{} is not a file", path.display());
+    anyhow::ensure!(file.len() <= MAX_FILE_BYTES, "{} is too large to open", path.display());
+    Ok(std::fs::read(path)?)
+}
+
 /// `base` with the pages added to it again that a Recents entry remembers.
 fn with_imports(base: LoadedPdf, imports: &[PageImport]) -> anyhow::Result<LoadedPdf> {
     if imports.is_empty() {
@@ -376,7 +478,7 @@ fn with_imports(base: LoadedPdf, imports: &[PageImport]) -> anyhow::Result<Loade
     let gone = |import: &PageImport| anyhow::Error::new(ImportGone(import.path.clone()));
     let mut sources = Vec::with_capacity(imports.len());
     for import in imports {
-        let source = std::fs::read(&import.path).ok().and_then(|bytes| pdf::open_as_source(bytes, None).ok());
+        let source = read_document(&import.path).ok().and_then(|bytes| pdf::open_as_source(bytes, None).ok());
         sources.push(source.ok_or_else(|| gone(import))?);
     }
     let additions: Vec<_> = sources.iter().zip(imports).map(|(source, import)| (source, import.pages.as_slice())).collect();
@@ -412,6 +514,18 @@ fn parse_page_ranges(text: &str, count: usize) -> Result<Vec<usize>, String> {
     Ok(pages)
 }
 
+/// Looking for text in the document (⌘F): the find bar is open.
+#[derive(Default)]
+struct FindBar {
+    query: String,
+    /// The bar has the keyboard: typing goes into `query`.
+    focused: bool,
+    /// Where `query` occurs on each page, by original index (nowhere, on pages not read yet).
+    hits: Vec<Vec<Vec<search::Area>>>,
+    /// The occurrence being shown: its page (original index) and which one on that page.
+    current: Option<(usize, usize)>,
+}
+
 /// Asking for the password of a protected PDF, or for a new password for a
 /// copy of one.
 struct PasswordPrompt {
@@ -435,13 +549,22 @@ enum AfterOpen {
     NoteImportGone(PathBuf),
 }
 
+/// Where a finished copy goes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SaveTo {
+    /// A file, where the user says.
+    File,
+    /// The clipboard, to paste into an email, a chat or a folder.
+    Clipboard,
+}
+
 #[derive(Clone, PartialEq)]
 enum PasswordPurpose {
     /// Opening the document at `path`, and what to do once it's open.
     Open { then: Option<AfterOpen> },
     /// Choosing the password for a saved copy; `first` is set once it's been
     /// typed, while it's typed again to confirm.
-    NewPassword { first: Option<String> },
+    NewPassword { first: Option<String>, to: SaveTo },
     /// Reading the PDF at `path` to add pages from it.
     Import,
 }
@@ -536,6 +659,9 @@ pub struct Editor {
     recents: Vec<RecentEntry>,
     password_prompt: Option<PasswordPrompt>,
     import_prompt: Option<ImportPrompt>,
+    find: Option<FindBar>,
+    /// The pages' text being read (see `read_text`).
+    text_task: Option<Task<()>>,
     next_id: u64,
     selected: Option<u64>,
     editing: Option<u64>,
@@ -557,6 +683,9 @@ pub struct Editor {
     /// Set when a sidebar was shown or hidden: the page view's new size is
     /// only known after the next layout, so "fit" zoom has to be worked out again.
     refit: bool,
+    /// Which shape the "Annotate" section's shape row draws, and whether its menu is open.
+    shape_tool: Tool,
+    shape_menu_open: bool,
     /// Set when a click outside closed a menu, so that same click can't reopen it.
     menu_dismissed: bool,
     settings: Settings,
@@ -588,8 +717,12 @@ pub struct Editor {
     /// (see `file_exists`).
     seen_files: RefCell<(Instant, HashMap<PathBuf, bool>)>,
     render_task: Option<Task<()>>,
+    render_budget: usize,
+    drawn_around: Option<DrawnAround>,
     /// The document being read and parsed, to be shown when that's done.
     open_task: Option<Task<()>>,
+    /// Which document that is, until it is shown (or can't be).
+    opening: Option<PathBuf>,
     /// The installed fonts being found (see `load_fonts`).
     fonts_task: Option<Task<()>>,
     thumb_task: Option<Task<()>>,
@@ -597,6 +730,27 @@ pub struct Editor {
     /// The app's updater (absent in tests), and our subscriptions to it.
     updater: Option<Entity<Updater>>,
     _updater_subscriptions: Vec<Subscription>,
+    /// "Check for Updates" was chosen in this window, which gives the answer.
+    asked_for_updates: bool,
+}
+
+/// Every window and its editor. The windows show the same signatures, Recents
+/// and settings, and a document is open in one of them at a time.
+#[derive(Default)]
+struct Windows(Vec<(AnyWindowHandle, WeakEntity<Editor>)>);
+
+impl Global for Windows {}
+
+/// The open windows and their editors.
+fn editor_windows(cx: &App) -> Vec<(AnyWindowHandle, Entity<Editor>)> {
+    let open = cx.windows();
+    let Some(windows) = cx.try_global::<Windows>() else { return Vec::new() };
+    windows.0.iter().filter(|(window, _)| open.contains(window)).filter_map(|(window, editor)| Some((*window, editor.upgrade()?))).collect()
+}
+
+/// Whether two paths name one file, however they are spelled.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 impl Focusable for Editor {
@@ -627,6 +781,14 @@ impl Editor {
             baseline_ratio: (LINE_HEIGHT - a - d) / 2. + a,
         };
 
+        let this = (window.window_handle(), cx.weak_entity());
+        let windows = cx.default_global::<Windows>();
+        windows.0.retain(|(_, editor)| editor.upgrade().is_some());
+        windows.0.push(this);
+        // Closing the window asks first if that would lose changes.
+        let editor = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| editor.update(cx, |this, cx| this.may_close(window, cx)).unwrap_or(true));
+
         Self {
             focus,
             doc: None,
@@ -644,6 +806,8 @@ impl Editor {
             recents: recents::load(),
             password_prompt: None,
             import_prompt: None,
+            find: None,
+            text_task: None,
             next_id: 1,
             selected: None,
             editing: None,
@@ -666,6 +830,8 @@ impl Editor {
             date_menu_open: false,
             help_menu_open: false,
             refit: false,
+            shape_tool: Tool::Rectangle,
+            shape_menu_open: false,
             menu_dismissed: false,
             settings: Settings::load(),
             pages_scroll: ScrollHandle::new(),
@@ -676,7 +842,7 @@ impl Editor {
             painted_zoom: Rc::new(Cell::new(0.)),
             pan: None,
             _pinch_task: {
-                let mut pinches = gestures::subscribe();
+                let mut pinches = gestures::subscribe(window);
                 cx.spawn_in(window, async move |this, cx| {
                     while let Some(pinch) = pinches.next().await {
                         let anchor = point(px(pinch.position.0), px(pinch.position.1));
@@ -694,7 +860,10 @@ impl Editor {
             font_size: DEFAULT_FONT_SIZE,
             seen_files: RefCell::new((Instant::now(), HashMap::new())),
             render_task: None,
+            render_budget: RENDER_BUDGET,
+            drawn_around: None,
             open_task: None,
+            opening: None,
             fonts_task: None,
             thumb_task: None,
             _appearance_observer: appearance_observer,
@@ -703,7 +872,60 @@ impl Editor {
                 .iter()
                 .flat_map(|u| [cx.observe(u, |_, _, cx| cx.notify()), cx.subscribe_in(u, window, Self::on_update_event)])
                 .collect(),
+            asked_for_updates: false,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows
+    // -----------------------------------------------------------------------
+
+    /// The other windows and their editors.
+    fn others(&self, cx: &Context<Self>) -> Vec<(AnyWindowHandle, Entity<Editor>)> {
+        let me = cx.entity_id();
+        editor_windows(cx).into_iter().filter(|(_, editor)| editor.entity_id() != me).collect()
+    }
+
+    /// Hand the other windows the signatures, Recents and settings, after one of
+    /// them changed here: they are the same in every window.
+    fn share(&self, cx: &mut Context<Self>) {
+        for (_, editor) in self.others(cx) {
+            editor.update(cx, |other, cx| {
+                other.signatures = self.signatures.clone();
+                other.recents = self.recents.clone();
+                // Except which sidebars are shown, which is each window's own business.
+                let sidebars = (other.settings.show_left_sidebar, other.settings.show_right_sidebar);
+                other.settings = self.settings.clone();
+                (other.settings.show_left_sidebar, other.settings.show_right_sidebar) = sidebars;
+                cx.notify();
+            });
+        }
+    }
+
+    /// Whether the window may close now. With unsaved changes it asks first, and
+    /// closes when the answer is to discard them.
+    fn may_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.finish_editing(cx);
+        let Some(confirm) = self.confirm_discard(window, cx) else { return true };
+        cx.spawn_in(window, async move |_, cx| {
+            if confirm.await.ok() == Some(0) {
+                cx.update(|window, _| window.remove_window()).ok();
+            }
+        })
+        .detach();
+        false
+    }
+
+    /// Whether this window has the document open, or is about to.
+    fn shows(&self, path: &Path) -> bool {
+        let open = self.doc.as_ref().map(|doc| &doc.path);
+        let asked = self.password_prompt.as_ref().filter(|p| matches!(p.purpose, PasswordPurpose::Open { .. })).map(|p| &p.path);
+        [open, self.opening.as_ref(), asked].into_iter().flatten().any(|shown| same_file(shown, path))
+    }
+
+    /// Whether this window has nothing in it, so a document can open here.
+    fn is_free(&self) -> bool {
+        self.doc.is_none() && self.opening.is_none() && self.password_prompt.is_none()
     }
 
     // -----------------------------------------------------------------------
@@ -723,35 +945,28 @@ impl Editor {
         })
     }
 
+    /// Open a PDF: the one given, or those picked in the file dialog. Each opens in
+    /// this window if nothing is open here, and in a window of its own otherwise.
     pub fn request_open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let confirm = self.confirm_discard(window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if let Some(answer) = confirm {
-                if answer.await.ok() != Some(0) {
-                    return;
+        let here = window.window_handle();
+        if let Some(path) = path {
+            open_document(cx, path, Some(here));
+            return;
+        }
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Open PDF".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = picker.await else { return };
+            cx.update(|cx| {
+                for path in paths {
+                    open_document(cx, path, Some(here));
                 }
-            }
-            let path = match path {
-                Some(p) => p,
-                None => {
-                    let picker = cx
-                        .update(|_, cx| {
-                            cx.prompt_for_paths(PathPromptOptions {
-                                files: true,
-                                directories: false,
-                                multiple: false,
-                                prompt: Some("Open PDF".into()),
-                            })
-                        })
-                        .ok();
-                    let Some(picker) = picker else { return };
-                    match picker.await {
-                        Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.remove(0),
-                        _ => return,
-                    }
-                }
-            };
-            this.update_in(cx, |this, window, cx| this.open_path(path, window, cx)).ok();
+            })
+            .ok();
         })
         .detach();
     }
@@ -772,6 +987,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.status = format!("Opening {}…", file_name(&path)).into();
+        self.opening = Some(path.clone());
         cx.notify();
         let tried_password = password.is_some();
         // Reopened with its edits: the pages added from other PDFs are added again first.
@@ -782,7 +998,7 @@ impl Editor {
         let read = cx.background_executor().spawn({
             let path = path.clone();
             async move {
-                let loaded = pdf::open_for_editing(std::fs::read(&path)?, password.as_deref())?;
+                let loaded = pdf::open_for_editing(read_document(&path)?, password.as_deref())?;
                 with_imports(loaded, &imports.unwrap_or_default())
             }
         });
@@ -803,13 +1019,14 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.opening = None;
         let loaded = match loaded {
             Ok(l) => l,
             Err(e) if e.downcast_ref::<ImportGone>().is_some() => {
                 self.password_prompt = None;
                 let source = e.downcast_ref::<ImportGone>().map(|gone| gone.0.clone()).unwrap_or_default();
                 let saved = match &then {
-                    Some(AfterOpen::Restore(id)) => self.recents.iter().find(|e| e.id == *id).map(|e| e.output.clone()),
+                    Some(AfterOpen::Restore(id)) => self.recents.iter().find(|e| e.id == *id).and_then(|e| e.saved_copy()).map(Path::to_path_buf),
                     _ => None,
                 };
                 match saved.filter(|saved| saved.exists()) {
@@ -852,6 +1069,7 @@ impl Editor {
                 image: None,
                 thumb: None,
                 rendered_scale: 0.0,
+                requested_scale: 0.0,
             })
             .collect();
         let field_count = loaded.form.len();
@@ -860,9 +1078,12 @@ impl Editor {
             self.load_fonts(cx);
         }
         self.status = format!(
-            "Opened {} ({} pages){}{}",
+            "Opened {} ({}){}{}",
             file_name(&path),
-            loaded.pages.len(),
+            match loaded.pages.len() {
+                1 => "1 page".to_string(),
+                n => format!("{n} pages"),
+            },
             match field_count {
                 0 => String::new(),
                 1 => " · 1 form field to fill in".into(),
@@ -880,6 +1101,7 @@ impl Editor {
             path,
             widgets: forms::widgets_by_page(&loaded.form, loaded.pages.len()),
             layouts: RefCell::default(),
+            text: loaded.pages.iter().map(|_| None).collect(),
             loaded,
             imports: Vec::new(),
             pages,
@@ -978,13 +1200,19 @@ impl Editor {
             cx.drop_image(image, Some(window));
         }
         self.import_prompt = None;
+        self.find = None;
+        self.text_task = None;
         self.render_task = None;
         self.thumb_task = None;
     }
 
     /// Close the document and go back to the gallery (asking first if there are unsaved changes).
+    /// From the gallery there is nothing to go back to: the window closes, unless it is the last.
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.doc.is_none() {
+            if !self.others(cx).is_empty() {
+                window.remove_window();
+            }
             return;
         }
         self.finish_editing(cx);
@@ -1062,7 +1290,8 @@ impl Editor {
                 let (path, password) = (prompt.path.clone(), prompt.text.clone());
                 self.read_pages_from(path, Some(password), window, cx);
             }
-            PasswordPurpose::NewPassword { first } => {
+            PasswordPurpose::NewPassword { first, to } => {
+                let to = *to;
                 let typed = std::mem::take(&mut prompt.text);
                 match first.take() {
                     // Now type it again.
@@ -1072,7 +1301,7 @@ impl Editor {
                     }
                     Some(first) if first == typed => {
                         self.password_prompt = None;
-                        self.save_with_password(Some(first), window, cx);
+                        self.save_with_password(Some(first), to, window, cx);
                     }
                     // Didn't match: start over.
                     Some(_) => prompt.wrong = true,
@@ -1090,21 +1319,21 @@ impl Editor {
     /// Reopen a document from the gallery with its fields still editable.
     fn open_recent(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.recents.iter().find(|e| e.id == id).cloned() else { return };
+        // Open in another window already: show that one.
+        if let Some((other, _)) = self.others(cx).into_iter().find(|(_, editor)| editor.read(cx).shows(&entry.original)) {
+            let _ = other.update(cx, |_, window, _| window.activate_window());
+            return;
+        }
         if entry.original.exists() {
             self.open_with_password(entry.original, None, Some(AfterOpen::Restore(entry.id)), window, cx);
-        } else if entry.output.exists() {
-            self.open_with_password(entry.output, None, Some(AfterOpen::NoteMoved(entry.original)), window, cx);
+        } else if let Some(saved) = entry.saved_copy().filter(|saved| saved.exists()).map(Path::to_path_buf) {
+            self.open_with_password(saved, None, Some(AfterOpen::NoteMoved(entry.original)), window, cx);
         } else {
-            self.show_error(
-                "Couldn't find this document",
-                &format!(
-                    "Neither {} nor the saved copy {} exists any more. You can remove it from Recents.",
-                    entry.original.display(),
-                    entry.output.display()
-                ),
-                window,
-                cx,
-            );
+            let gone = match entry.saved_copy() {
+                Some(saved) => format!("Neither {} nor the saved copy {} exists", entry.original.display(), saved.display()),
+                None => format!("{} doesn't exist", entry.original.display()),
+            };
+            self.show_error("Couldn't find this document", &format!("{gone} any more. You can remove it from Recents."), window, cx);
         }
     }
 
@@ -1132,7 +1361,7 @@ impl Editor {
         self.next_id = next_id + 1;
         self.watermark = entry.watermark.clone();
         if let Some(doc) = &mut self.doc {
-            doc.last_output = Some(entry.output.clone());
+            doc.last_output = entry.saved_copy().map(Path::to_path_buf);
         }
         // Form values, matched by field name (the original may have changed since).
         let form = self.form();
@@ -1187,6 +1416,7 @@ impl Editor {
                 this.recents.clear();
                 this.recents_query.clear();
                 this.recents_search_focused = false;
+                this.share(cx);
                 cx.notify();
             })
             .ok();
@@ -1199,7 +1429,251 @@ impl Editor {
             Ok(entries) => self.recents = entries,
             Err(e) => self.status = format!("Couldn't update recents: {e:#}").into(),
         }
+        self.share(cx);
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Find
+    // -----------------------------------------------------------------------
+
+    /// Whether typing goes into the find bar.
+    fn find_focused(&self) -> bool {
+        self.doc.is_some() && self.editing.is_none() && self.field_editing.is_none() && self.find.as_ref().is_some_and(|f| f.focused)
+    }
+
+    /// ⌘F: look for text in the document, or among the recent documents when none is open.
+    fn start_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.is_none() {
+            if !self.recents.is_empty() {
+                self.start_recents_search(window, cx);
+            }
+            return;
+        }
+        self.finish_editing(cx);
+        self.close_menus();
+        window.focus(&self.focus);
+        self.find.get_or_insert_default().focused = true;
+        self.ime_marked = None;
+        self.read_text(cx);
+        cx.notify();
+    }
+
+    /// The find bar stays open, but typing goes elsewhere.
+    fn unfocus_find(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
+    }
+
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find = None;
+        self.ime_marked = None;
+        cx.notify();
+    }
+
+    /// Read the text of the pages that haven't been read, in the background,
+    /// looking through each as it arrives.
+    fn read_text(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
+        let unread: Vec<usize> = (0..doc.text.len()).filter(|&i| doc.text[i].is_none()).collect();
+        if unread.is_empty() || self.text_task.is_some() {
+            return;
+        }
+        let (pdf, path) = (doc.loaded.pdf.clone(), doc.path.clone());
+        let (done, mut read) = mpsc::unbounded();
+        let reading = cx
+            .background_executor()
+            .spawn(async move { search::read_pages(&pdf, unread, |index, text| done.unbounded_send((index, text)).is_ok()) });
+        self.text_task = Some(cx.spawn(async move |this, cx| {
+            // Kept for as long as this task: once it goes, the reading stops at the next page.
+            let _reading = reading;
+            while let Some((index, text)) = read.next().await {
+                let kept = this.update(cx, |this, cx| {
+                    // Unless another document was opened meanwhile.
+                    let Some(slot) = this.doc.as_mut().filter(|d| d.path == path).and_then(|d| d.text.get_mut(index)) else {
+                        return false;
+                    };
+                    *slot = Some(text);
+                    this.look_through(Some(index), cx);
+                    true
+                });
+                if !kept.unwrap_or(false) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Whether some of the document's text is still to be read.
+    fn reading_text(&self) -> bool {
+        self.doc.as_ref().is_some_and(|doc| doc.text.iter().any(Option::is_none))
+    }
+
+    /// Find where the phrase occurs on one page (it has just been read), or on
+    /// all of them (the phrase changed), and show the first if none is shown.
+    fn look_through(&mut self, page: Option<usize>, cx: &mut Context<Self>) {
+        let (Some(find), Some(doc)) = (&mut self.find, &self.doc) else { return };
+        let phrase = search::fold(&find.query);
+        find.hits.resize(doc.text.len(), Vec::new());
+        for index in page.map_or(0..doc.text.len(), |index| index..index + 1) {
+            find.hits[index] = doc.text[index].as_ref().map(|text| text.find(&phrase)).unwrap_or_default();
+        }
+        if find.current.is_none() {
+            // The first from the page in view on; from the top again once they have all been read.
+            let from = self.current_page().unwrap_or(0);
+            let hits = self.find_hits();
+            let first = hits.iter().find(|hit| hit.0 >= from).or_else(|| hits.first().filter(|_| !self.reading_text())).copied();
+            if let Some(hit) = first {
+                self.show_hit(hit, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        find.query = query;
+        find.current = None;
+        self.look_through(None, cx);
+    }
+
+    /// Every occurrence, in the order the pages are shown: the page's position,
+    /// its original index, and which occurrence on the page.
+    fn find_hits(&self) -> Vec<(usize, usize, usize)> {
+        let (Some(find), Some(doc)) = (&self.find, &self.doc) else { return Vec::new() };
+        doc.order
+            .iter()
+            .enumerate()
+            .flat_map(|(position, &source)| (0..find.hits.get(source).map_or(0, Vec::len)).map(move |which| (position, source, which)))
+            .collect()
+    }
+
+    /// Which of `hits` is the one being shown.
+    fn current_hit(&self, hits: &[(usize, usize, usize)]) -> Option<usize> {
+        let current = self.find.as_ref()?.current?;
+        hits.iter().position(|&(_, source, which)| (source, which) == current)
+    }
+
+    /// Go to the next occurrence, or the one before, around the ends.
+    fn find_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            return self.start_find(window, cx);
+        }
+        let hits = self.find_hits();
+        if hits.is_empty() {
+            return;
+        }
+        let next = match (self.current_hit(&hits), forward) {
+            (Some(at), true) => (at + 1) % hits.len(),
+            (Some(at), false) => (at + hits.len() - 1) % hits.len(),
+            (None, true) => 0,
+            (None, false) => hits.len() - 1,
+        };
+        self.show_hit(hits[next], cx);
+    }
+
+    /// Make an occurrence the current one and bring it into view.
+    fn show_hit(&mut self, (position, source, which): (usize, usize, usize), cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        find.current = Some((source, which));
+        let area = find.hits.get(source).and_then(|hits| hits.get(which)).and_then(|areas| areas.first()).copied();
+        if let (Some([x, y, w, h]), Some(page)) = (area, self.live_page_bounds(position)) {
+            let z = self.zoom;
+            let hit = Bounds::new(page.origin + point(px(x * z), px(y * z)), size(px(w * z), px(h * z)));
+            let viewport = self.pages_scroll.bounds();
+            let mut offset = self.pages_scroll.offset();
+            // Clear of the viewport's edges, and of the find bar at its top.
+            if hit.top() < viewport.top() + px(64.) || hit.bottom() > viewport.bottom() - px(32.) {
+                offset.y -= hit.top() - (viewport.top() + viewport.size.height / 3.);
+            }
+            if hit.left() < viewport.left() + px(32.) || hit.right() > viewport.right() - px(32.) {
+                offset.x -= hit.center().x - viewport.center().x;
+            }
+            let max = self.pages_scroll.max_offset();
+            offset = point(offset.x.clamp(-max.width, px(0.)), offset.y.clamp(-max.height, px(0.)));
+            self.pages_scroll.set_offset(offset);
+        }
+        cx.notify();
+    }
+
+    /// The find bar, floating over the top right of the pages.
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self.find.as_ref()?;
+        let focused = self.find_focused();
+        let hits = self.find_hits();
+        let count: SharedString = match (find.query.trim().is_empty(), hits.len(), self.current_hit(&hits)) {
+            (true, ..) => "".into(),
+            (_, 0, _) if self.reading_text() => "Searching…".into(),
+            (_, 0, _) => "No matches".into(),
+            (_, 1, None) => "1 match".into(),
+            (_, n, None) => format!("{n} matches").into(),
+            (_, n, Some(at)) => format!("{} of {n}", at + 1).into(),
+        };
+        let caret = focused.then(|| ui::caret(px(15.)).relative().flex_none().child(self.input_anchor(cx)));
+        let step = |id: &'static str, icon_name: &'static str, label: &'static str, keys: &'static str, forward: bool| {
+            ui::icon_button(id, icon_name)
+                .size(px(24.))
+                .flex_none()
+                .tooltip(ui::tooltip(label, Some(keys)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.find_step(forward, window, cx)))
+        };
+        let bar = ui::text_field(if focused { ui::accent() } else { ui::border_strong() })
+            .id("find-bar")
+            .gap_1()
+            .w(px(340.))
+            .h(px(36.))
+            .shadow(if focused { ui::ring() } else { ui::lifted_shadow() })
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.start_find(window, cx);
+                }),
+            )
+            .child(ui::icon("search", ui::text_tertiary()).size(px(15.)).flex_none())
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .ml_1()
+                    .items_center()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(ui::text_primary())
+                    .when(!find.query.is_empty(), |d| d.child(find.query.clone()))
+                    .children(caret)
+                    .when(find.query.is_empty(), |d| d.child(div().text_color(ui::text_tertiary()).child("Find in document"))),
+            )
+            .child(div().flex_none().px_1().text_xs().text_color(ui::text_tertiary()).child(count))
+            .child(step("find-previous", "chevron-up", "Previous match", "⇧⌘G", false))
+            .child(step("find-next", "chevron-down", "Next match", "⌘G", true))
+            .child(
+                ui::icon_button("find-close", "close")
+                    .size(px(24.))
+                    .flex_none()
+                    .tooltip(ui::tooltip("Close", Some("Esc")))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_find(cx))),
+            );
+        Some(div().absolute().top(px(12.)).right(px(20.)).child(bar).into_any_element())
+    }
+
+    /// The occurrences on a page, marked over it: the current one stands out.
+    fn render_find_marks(&self, source: usize) -> Vec<gpui::Div> {
+        let Some(find) = &self.find else { return Vec::new() };
+        let z = self.zoom;
+        let mut marks = Vec::new();
+        for (which, areas) in find.hits.get(source).into_iter().flatten().enumerate() {
+            let color = if find.current == Some((source, which)) { rgba(0xff8c00a0) } else { rgba(0xffd60a70) };
+            for &[x, y, w, h] in areas {
+                marks.push(div().absolute().left(px(x * z - 1.)).top(px(y * z - 1.)).w(px(w * z + 2.)).h(px(h * z + 2.)).rounded_xs().bg(color));
+            }
+        }
+        marks
     }
 
     /// Render the small page images for the thumbnail rail: once per document,
@@ -1235,29 +1709,43 @@ impl Editor {
 
     /// (Re-)render pages whose bitmap is too low-resolution for the current zoom.
     fn ensure_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(doc) = &self.doc else { return };
         let wanted = (self.zoom * window.scale_factor()).clamp(1.0, MAX_RENDER_SCALE);
-        // Original page indices, for the displayed pages only.
-        let mut stale: Vec<usize> = doc
-            .order
-            .iter()
-            .copied()
-            .filter(|&i| doc.pages[i].rendered_scale < wanted * 0.95)
-            .collect();
-        if stale.is_empty() {
+        // Render a bit above what's needed so small zoom steps don't re-render.
+        let scale = (wanted * 1.25).min(MAX_RENDER_SCALE);
+        let current = self.current_page().unwrap_or(0);
+        let budget = self.render_budget;
+        let Some(doc) = &mut self.doc else { return };
+        // The displayed pages to have drawn (original indices): the page in view
+        // first, then outwards, for as far as the budget goes.
+        let sizes: Vec<(f32, f32)> = doc.geoms().map(|g| (g.width, g.height)).collect();
+        let near = pages_in_budget(&sizes, current, scale, budget);
+        self.drawn_around =
+            (near.len() < doc.order.len()).then(|| DrawnAround { page: current, slack: (near.len() / 4).max(1), order: doc.order.clone() });
+        let near: Vec<usize> = near.into_iter().map(|position| doc.order[position]).collect();
+        if self.drawn_around.is_some() {
+            // The others give up their bitmaps.
+            let mut keep = vec![false; doc.pages.len()];
+            near.iter().for_each(|&i| keep[i] = true);
+            for (page, _) in doc.pages.iter_mut().zip(keep).filter(|(_, keep)| !keep) {
+                if let Some(old) = page.image.take() {
+                    cx.drop_image(old, Some(window));
+                }
+                (page.rendered_scale, page.requested_scale) = (0., 0.);
+            }
+        }
+        let stale: Vec<usize> = near.into_iter().filter(|&i| doc.pages[i].rendered_scale < wanted * 0.95).collect();
+        // Nothing to do, either, if the render under way is drawing them sharply
+        // enough: when a document opens, the zoom that fits the window is only
+        // known a frame after its pages were first asked for.
+        if stale.iter().all(|&i| doc.pages[i].requested_scale >= wanted * 0.95) {
             return;
         }
-        // The page in view first, then outwards.
-        let current = self.current_page().unwrap_or(0);
-        let position = |source: usize| doc.order.iter().position(|&i| i == source).unwrap_or(0);
-        stale.sort_by_key(|&i| position(i).abs_diff(current));
+        stale.iter().for_each(|&i| doc.pages[i].requested_scale = scale);
         // While zooming continuously (pinch, wheel), the stretched bitmaps are fine
         // for a moment; wait for the zoom to settle rather than re-render every step.
         // (Each call replaces `render_task`, cancelling the previous wait.) A
         // page with nothing on screen yet renders at once.
         let settle = stale.iter().all(|&i| doc.pages[i].image.is_some());
-        // Render a bit above what's needed so small zoom steps don't re-render.
-        let scale = (wanted * 1.25).min(MAX_RENDER_SCALE);
         let pdf = doc.loaded.pdf.clone();
         let path = doc.path.clone();
         self.render_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1285,7 +1773,8 @@ impl Editor {
         }));
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Make a copy of the document with everything added to it: a file, or on the clipboard.
+    fn save(&mut self, to: SaveTo, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_editing(cx);
         let Some(doc) = &self.doc else {
             self.status = "Nothing to save — open a PDF first.".into();
@@ -1293,7 +1782,7 @@ impl Editor {
             return;
         };
         let Some(password) = doc.loaded.password.clone() else {
-            self.save_with_password(None, window, cx);
+            self.save_with_password(None, to, window, cx);
             return;
         };
         // A protected document: ask how to protect the copy.
@@ -1307,9 +1796,9 @@ impl Editor {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(answer) = answer.await else { return };
             this.update_in(cx, |this, window, cx| match answer {
-                0 => this.save_with_password(Some(password), window, cx),
-                1 => this.save_with_new_password(window, cx),
-                2 => this.save_with_password(None, window, cx),
+                0 => this.save_with_password(Some(password), to, window, cx),
+                1 => this.save_with_new_password(to, window, cx),
+                2 => this.save_with_password(None, to, window, cx),
                 _ => {}
             })
             .ok();
@@ -1318,7 +1807,7 @@ impl Editor {
     }
 
     /// Ask for a password (typed twice), then save a copy that needs it to open.
-    fn save_with_new_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_with_new_password(&mut self, to: SaveTo, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_editing(cx);
         self.close_menus();
         let Some(doc) = &self.doc else {
@@ -1330,14 +1819,15 @@ impl Editor {
             path: doc.path.clone(),
             text: String::new(),
             wrong: false,
-            purpose: PasswordPurpose::NewPassword { first: None },
+            purpose: PasswordPurpose::NewPassword { first: None, to },
         });
         window.focus(&self.focus);
         cx.notify();
     }
 
-    /// Ask where to save, then save a copy, encrypted with `password` if set.
-    fn save_with_password(&mut self, password: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Make a copy, encrypted with `password` if set: saved where the user
+    /// says, or put on the clipboard.
+    fn save_with_password(&mut self, password: Option<String>, to: SaveTo, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
         // Suggest the previous output if there is one, otherwise "<name>-signed.pdf" next to the original.
         let (dir, suggested) = match &doc.last_output {
@@ -1350,9 +1840,10 @@ impl Editor {
                 format!("{}-signed.pdf", doc.path.file_stem().and_then(|s| s.to_str()).unwrap_or("document")),
             ),
         };
-        let picker = cx.prompt_for_new_path(&dir, Some(&suggested));
+        let picker = (to == SaveTo::File).then(|| cx.prompt_for_new_path(&dir, Some(&suggested)));
 
         let original = doc.path.clone();
+        let last_output = doc.last_output.clone();
         let loaded = doc.loaded.clone();
         let imports = doc.imports_in_use();
         let order = doc.order.clone();
@@ -1379,8 +1870,13 @@ impl Editor {
         let protected = password.is_some();
 
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(path))) = picker.await else { return };
-            let target = path.clone();
+            let target = match picker {
+                Some(picker) => {
+                    let Ok(Ok(Some(path))) = picker.await else { return };
+                    Some(path)
+                }
+                None => None,
+            };
             let saved = Snapshot {
                 items: items.clone(),
                 watermark: watermark.clone(),
@@ -1403,15 +1899,34 @@ impl Editor {
                         values: &values,
                     };
                     let written = loaded.save(&edits)?;
-                    std::fs::write(&target, &written.bytes)?;
+                    // What goes on the clipboard is a file too: one in the app's own folder.
+                    let path = match target {
+                        Some(path) => {
+                            std::fs::write(&path, &written.bytes)?;
+                            path
+                        }
+                        None => clipboard::keep(&suggested, &written.bytes)?,
+                    };
                     // No thumbnail of a protected document: it would be an unprotected
                     // picture of its first page.
                     let thumbnail = if protected { None } else { recents::make_thumbnail(written.bytes) };
-                    anyhow::Ok((thumbnail, written.missing))
+                    anyhow::Ok((path, thumbnail, written.missing))
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match result {
-                Ok((thumbnail, missing)) => {
+                Ok((path, thumbnail, missing)) => {
+                    if to == SaveTo::Clipboard {
+                        if let Err(e) = clipboard::put(&path, cx) {
+                            this.show_error("Couldn't copy the PDF to the clipboard", &format!("{e:#}"), window, cx);
+                            return;
+                        }
+                    }
+                    // What Recents has as the saved copy is a file the user chose
+                    // (the one on the clipboard is not theirs to keep).
+                    let output = match to {
+                        SaveTo::File => path.clone(),
+                        SaveTo::Clipboard => last_output.unwrap_or_else(|| original.clone()),
+                    };
                     // Recents are stored unencrypted, so for a protected document they
                     // remember only where it is, not what was typed into it.
                     let contents = (!protected).then(|| recents::Contents {
@@ -1421,24 +1936,36 @@ impl Editor {
                         thumbnail,
                     });
                     let reordered = Some(saved.order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p));
-                    match recents::record(this.recents.clone(), &original, &path, page_count, reordered, &imports, contents) {
-                        Ok(entries) => this.recents = entries,
+                    match recents::record(this.recents.clone(), &original, &output, page_count, reordered, &imports, contents) {
+                        Ok(entries) => {
+                            this.recents = entries;
+                            this.share(cx);
+                        }
                         Err(e) => eprintln!("could not update recents: {e:#}"),
                     }
                     // Unless another document was opened while the save was running.
                     if let Some(doc) = this.doc.as_mut().filter(|d| d.path == original) {
-                        doc.last_output = Some(path.clone());
-                        this.saved = saved;
-                        // Only clear "Edited" if nothing changed meanwhile.
-                        if this.revision == revision {
-                            this.dirty = false;
+                        if to == SaveTo::File {
+                            doc.last_output = Some(path.clone());
+                        }
+                        // A protected copy on the clipboard is all there is of the
+                        // work (Recents doesn't remember it): it still counts as unsaved.
+                        if to == SaveTo::File || !protected {
+                            this.saved = saved;
+                            // Only clear "Edited" if nothing changed meanwhile.
+                            if this.revision == revision {
+                                this.dirty = false;
+                            }
                         }
                     }
+                    let done = match to {
+                        SaveTo::File => format!("Saved {}{protection_note}", path.display()),
+                        SaveTo::Clipboard => format!("Copied {}{protection_note} to the clipboard, ready to paste", file_name(&path)),
+                    };
                     this.status = match redacted_pages {
-                        0 => format!("Saved {}{protection_note}", path.display()),
+                        0 => done,
                         n => format!(
-                            "Saved {}{protection_note} · {n} redacted page{} saved as image{} (their text is no longer selectable)",
-                            path.display(),
+                            "{done} · {n} redacted page{} saved as image{} (their text is no longer selectable)",
                             if n == 1 { "" } else { "s" },
                             if n == 1 { "" } else { "s" },
                         ),
@@ -1459,7 +1986,10 @@ impl Editor {
                     }
                     cx.notify();
                 }
-                Err(e) => this.show_error("Couldn't save the PDF", &format!("{e:#}"), window, cx),
+                Err(e) => {
+                    let title = if to == SaveTo::File { "Couldn't save the PDF" } else { "Couldn't copy the PDF" };
+                    this.show_error(title, &format!("{e:#}"), window, cx)
+                }
             })
             .ok();
         })
@@ -1504,6 +2034,7 @@ impl Editor {
             Ok(sig) => {
                 self.signatures.push(sig.clone());
                 self.status = "Signature added — drag it onto the page.".into();
+                self.share(cx);
                 cx.notify();
                 Some(sig)
             }
@@ -1518,14 +2049,13 @@ impl Editor {
         if index < self.signatures.len() {
             let sig = self.signatures.remove(index);
             // Placed copies keep working until saved; the file is only needed at save time,
-            // so only delete it if nothing on the page uses it.
-            let in_use = self
-                .items
-                .iter()
-                .any(|i| matches!(&i.kind, ItemKind::Image { sig: s } if Arc::ptr_eq(s, &sig)));
+            // so only delete it if no page uses it, in this window or another.
+            let placed = |editor: &Editor| editor.items.iter().any(|i| matches!(&i.kind, ItemKind::Image { sig: s } if s.path == sig.path));
+            let in_use = placed(self) || self.others(cx).iter().any(|(_, editor)| placed(editor.read(cx)));
             if !in_use {
                 signatures::delete(&sig);
             }
+            self.share(cx);
             cx.notify();
         }
     }
@@ -1561,8 +2091,11 @@ impl Editor {
 
     fn handle_external_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         let position = window.mouse_position();
-        if let Some(pdf_path) = paths.paths().iter().find(|p| signatures::is_pdf(p)) {
-            self.request_open(Some(pdf_path.clone()), window, cx);
+        let pdfs: Vec<_> = paths.paths().iter().filter(|p| signatures::is_pdf(p)).cloned().collect();
+        if !pdfs.is_empty() {
+            for pdf in pdfs {
+                self.request_open(Some(pdf), window, cx);
+            }
             return;
         }
         for path in paths.paths() {
@@ -1802,15 +2335,14 @@ impl Editor {
 
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         if let Some(updater) = &self.updater {
+            self.asked_for_updates = true;
             updater.update(cx, |u, cx| u.check(true, cx));
         }
     }
 
     fn set_automatic_updates(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.check_for_updates = on;
-        if let Err(e) = self.settings.save() {
-            self.status = format!("Couldn't save settings: {e}").into();
-        }
+        self.save_settings(cx);
         if let Some(updater) = &self.updater {
             updater.update(cx, |u, cx| u.set_enabled(on, cx));
         }
@@ -1825,6 +2357,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         match event {
+            // Found by the daily check: the status bar offers it, without interrupting.
+            updater::Event::Ready { manual: false } => {}
+            // Every window hears the answer to "Check for Updates"; the one it was asked in gives it.
+            _ if !std::mem::take(&mut self.asked_for_updates) => {}
             updater::Event::UpToDate => {
                 let detail = format!("PatraPDF {} is the newest version.", crate::about::VERSION);
                 let _ = window.prompt(PromptLevel::Info, "You're up to date", Some(&detail), &["OK"], cx);
@@ -1833,8 +2369,6 @@ impl Editor {
                 self.show_update_error("Couldn't check for updates", message, window, cx);
             }
             updater::Event::Ready { manual: true } => self.prompt_install_update(window, cx),
-            // Found by the daily check: the status bar offers it, without interrupting.
-            updater::Event::Ready { manual: false } => {}
         }
     }
 
@@ -1856,12 +2390,13 @@ impl Editor {
         if !detail.is_empty() {
             detail.push_str("\n\n");
         }
-        detail.push_str(if self.dirty {
+        let dirty = self.dirty || self.others(cx).iter().any(|(_, editor)| editor.read(cx).dirty);
+        detail.push_str(if dirty {
             "Restarting now discards your unsaved changes. Choose Later to save them first; the update is installed when you quit."
         } else {
             "PatraPDF restarts to finish. Choose Later to install it when you quit."
         });
-        let restart = if self.dirty { "Discard Changes and Restart" } else { "Restart Now" };
+        let restart = if dirty { "Discard Changes and Restart" } else { "Restart Now" };
         let title = format!("PatraPDF {} is ready to install", release.version);
         let answer = window.prompt(PromptLevel::Info, &title, Some(&detail), &[restart, "Later", "Skip This Version"], cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -1985,7 +2520,7 @@ impl Editor {
         let tried_password = password.is_some();
         let read = cx.background_executor().spawn({
             let path = path.clone();
-            async move { pdf::open_as_source(std::fs::read(&path)?, password.as_deref()) }
+            async move { pdf::open_as_source(read_document(&path)?, password.as_deref()) }
         });
         cx.spawn_in(window, async move |this, cx| {
             let source = read.await;
@@ -2091,7 +2626,8 @@ impl Editor {
         self.checkpoint();
         let Some(doc) = &mut self.doc else { return };
         let (first, count) = (doc.loaded.pages.len(), merged.pages.len());
-        doc.pages.extend((first..count).map(|_| PageView { image: None, thumb: None, rendered_scale: 0.0 }));
+        doc.pages.extend((first..count).map(|_| PageView { image: None, thumb: None, rendered_scale: 0.0, requested_scale: 0.0 }));
+        doc.text.extend((first..count).map(|_| None));
         doc.widgets = forms::widgets_by_page(&merged.form, count);
         doc.loaded = merged;
         // The pages stay in the document from here on; undo only takes them out of `order`.
@@ -2115,6 +2651,11 @@ impl Editor {
         self.selected = None;
         self.ensure_rendered(window, cx);
         self.render_thumbnails(window, cx);
+        // The find bar looks through the new pages too.
+        self.text_task = None;
+        if self.find.is_some() {
+            self.read_text(cx);
+        }
         self.scroll_to_page(position, cx);
         self.thumbs_scroll.scroll_to_bottom();
         cx.notify();
@@ -2395,9 +2936,7 @@ impl Editor {
     fn set_date_format(&mut self, format: &str, cx: &mut Context<Self>) {
         self.settings.date_format = format.to_string();
         self.date_menu_open = false;
-        if let Err(e) = self.settings.save() {
-            self.status = format!("Couldn't save settings: {e:#}").into();
-        }
+        self.save_settings(cx);
         cx.notify();
     }
 
@@ -2528,6 +3067,7 @@ impl Editor {
         window.focus(&self.focus);
         self.finish_editing(cx);
         self.close_menus();
+        self.unfocus_find();
         let Some((page, x, y)) = self.page_at(event.position) else { return };
         match self.tool {
             // Let the press reach the canvas, which starts panning.
@@ -2545,12 +3085,71 @@ impl Editor {
                     start: (x, y, 0., 0.),
                     snapshot: self.snapshot(),
                     moved: false,
+                    points: Vec::new(),
                 });
+            }
+            // Annotations are drawn by dragging too.
+            tool if tool.draws() => {
+                cx.stop_propagation();
+                if let Some((kind, mode)) = self.new_annotation(tool) {
+                    // It becomes an undo step when the drag ends, if that drew anything.
+                    let snapshot = self.snapshot();
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.items.push(Item { id, page, x, y, w: 0., h: 0., kind });
+                    self.selected = None;
+                    self.drag = Some(DragState {
+                        id,
+                        mode,
+                        start_mouse: event.position,
+                        start: (x, y, 0., 0.),
+                        snapshot,
+                        moved: false,
+                        points: vec![(x, y)],
+                    });
+                }
             }
             tool => {
                 cx.stop_propagation();
                 self.place_tool(tool, page, x, y, cx);
                 self.tool = Tool::Select;
+            }
+        }
+        cx.notify();
+    }
+
+    /// What a drawing tool starts where it is pressed on the page, and how the drag shapes it.
+    fn new_annotation(&self, tool: Tool) -> Option<(ItemKind, DragMode)> {
+        let (color, width) = (self.settings.pen_color, self.settings.pen_width);
+        let stroke = |arrow| ItemKind::Stroke { points: Arc::default(), color, width, arrow };
+        Some(match tool {
+            Tool::Highlight => (ItemKind::Highlight { color: self.settings.highlight_color }, DragMode::Draw),
+            Tool::Rectangle | Tool::Oval => (ItemKind::Outline { oval: tool == Tool::Oval, color, width }, DragMode::Draw),
+            Tool::Pen => (stroke(false), DragMode::Ink),
+            Tool::Line | Tool::Arrow => (stroke(tool == Tool::Arrow), DragMode::Line),
+            _ => return None,
+        })
+    }
+
+    /// Choose the highlighter's colour (`highlight`) or the pen's: for what is
+    /// drawn next, and for the selected item if it is drawn with that.
+    fn set_pen_color(&mut self, highlight: bool, color: u32, cx: &mut Context<Self>) {
+        *(if highlight { &mut self.settings.highlight_color } else { &mut self.settings.pen_color }) = color;
+        self.pen_changed(cx, |item| item.color().is_some_and(|(h, c)| h == highlight && c != color), |item| item.set_color(color));
+    }
+
+    fn set_pen_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.settings.pen_width = width;
+        self.pen_changed(cx, |item| item.pen_width().is_some_and(|w| w != width), |item| item.set_pen_width(width));
+    }
+
+    /// Keep a new pen setting, and apply it to the selected item if it `differs` there.
+    fn pen_changed(&mut self, cx: &mut Context<Self>, differs: impl Fn(&Item) -> bool, apply: impl FnOnce(&mut Item)) {
+        self.save_settings(cx);
+        if let Some(id) = self.selected.filter(|id| self.items.iter().any(|i| i.id == *id && differs(i))) {
+            self.checkpoint();
+            if let Some(item) = self.item_mut(id) {
+                apply(item);
             }
         }
         cx.notify();
@@ -2579,6 +3178,8 @@ impl Editor {
                 let (w, h) = DEFAULT_REDACTION;
                 self.add_item(page, x - w / 2., y - h / 2., w, h, ItemKind::Redact { fill: self.redact_fill }, cx);
             }
+            // Drawn by dragging over the page (see `page_mouse_down`).
+            Tool::Highlight | Tool::Pen | Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => {}
         }
     }
 
@@ -2597,6 +3198,7 @@ impl Editor {
     fn close_menus(&mut self) {
         self.zoom_menu_open = false;
         self.date_menu_open = false;
+        self.shape_menu_open = false;
         self.help_menu_open = false;
         self.watermark_menu_open = false;
         self.watermark_editing = false;
@@ -2604,7 +3206,7 @@ impl Editor {
     }
 
     fn any_menu_open(&self) -> bool {
-        self.zoom_menu_open || self.date_menu_open || self.help_menu_open || self.watermark_menu_open || self.choice_open.is_some()
+        self.zoom_menu_open || self.date_menu_open || self.shape_menu_open || self.help_menu_open || self.watermark_menu_open || self.choice_open.is_some()
     }
 
     fn toggle_help_menu(&mut self, cx: &mut Context<Self>) {
@@ -2630,17 +3232,29 @@ impl Editor {
         self.sidebars_changed(cx);
     }
 
-    fn sidebars_changed(&mut self, cx: &mut Context<Self>) {
+    /// Keep the settings for the next time, and for the other windows (which
+    /// keep their own sidebars).
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
         if let Err(e) = self.settings.save() {
             self.status = format!("Couldn't save settings: {e:#}").into();
         }
+        self.share(cx);
+    }
+
+    fn sidebars_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_settings(cx);
         self.refit = true;
         cx.notify();
     }
 
     fn item_mouse_down(&mut self, id: u64, mode: DragMode, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // With a drawing tool in hand, the press goes on to the page: it draws over the item.
+        if self.tool.draws() {
+            return;
+        }
         cx.stop_propagation();
         window.focus(&self.focus);
+        self.unfocus_find();
         if self.editing != Some(id) {
             self.finish_editing(cx);
         }
@@ -2653,6 +3267,7 @@ impl Editor {
             start: (item.x, item.y, item.w, item.h),
             snapshot: self.snapshot(),
             moved: false,
+            points: Vec::new(),
         });
         self.selected = Some(id);
         if is_text && self.editing != Some(id) {
@@ -2675,6 +3290,8 @@ impl Editor {
         }
         let Some(drag) = &mut self.drag else { return };
         if event.pressed_button != Some(MouseButton::Left) {
+            // The button was let go where that wasn't seen (outside the window).
+            self.finish_drag(cx);
             return;
         }
         let delta = event.position - drag.start_mouse;
@@ -2685,24 +3302,30 @@ impl Editor {
         drag.moved = true;
         let (id, mode, (x0, y0, w0, h0)) = (drag.id, drag.mode, drag.start);
         let Some(mut item) = self.items.iter().find(|i| i.id == id).cloned() else { return };
+        // Where a drag that draws has got to: no further than the page's edge.
+        let (mut x, mut y) = (x0 + dx, y0 + dy);
+        if let Some(g) = self.page_geom(item.page) {
+            (x, y) = (x.clamp(0., g.width), y.clamp(0., g.height));
+        }
         match mode {
             DragMode::Move => {
                 item.x = x0 + dx;
                 item.y = y0 + dy;
             }
-            DragMode::Draw => {
-                item.x = x0.min(x0 + dx);
-                item.y = y0.min(y0 + dy);
-                item.w = dx.abs();
-                item.h = dy.abs();
-                if let Some(g) = self.page_geom(item.page) {
-                    item.x = item.x.max(0.);
-                    item.y = item.y.max(0.);
-                    item.w = item.w.min(g.width - item.x);
-                    item.h = item.h.min(g.height - item.y);
+            DragMode::Draw => (item.x, item.y, item.w, item.h) = (x0.min(x), y0.min(y), (x - x0).abs(), (y - y0).abs()),
+            DragMode::Line | DragMode::Ink => {
+                if let Some(drag) = &mut self.drag {
+                    if mode == DragMode::Line {
+                        drag.points.truncate(1);
+                        drag.points.push((x, y));
+                    } else if drag.points.last().is_none_or(|last| (x - last.0).hypot(y - last.1) * self.zoom >= 1.5) {
+                        // A new point for every pixel and a half the pointer has moved.
+                        drag.points.push((x, y));
+                    }
+                    item.fit_stroke(&drag.points);
                 }
             }
-            DragMode::Resize if item.is_redaction() => {
+            DragMode::Resize if item.stretches() => {
                 item.w = (w0 + dx).max(4.);
                 item.h = (h0 + dy).max(4.);
                 if let Some(g) = self.page_geom(item.page) {
@@ -2724,7 +3347,10 @@ impl Editor {
                 }
             }
         }
-        self.clamp_item(&mut item);
+        // A line's points are on the page already; the box around a thin one may reach over its edge.
+        if !matches!(mode, DragMode::Line | DragMode::Ink) {
+            self.clamp_item(&mut item);
+        }
         if let Some(slot) = self.item_mut(id) {
             *slot = item;
         }
@@ -2739,8 +3365,30 @@ impl Editor {
         if self.pan.take().is_some() {
             cx.notify();
         }
+        self.finish_drag(cx);
+    }
+
+    /// The mouse button was let go: what was being dragged or drawn is settled.
+    fn finish_drag(&mut self, cx: &mut Context<Self>) {
         if let Some(drag) = self.drag.take() {
-            if drag.mode == DragMode::Draw {
+            let drawn = self.items.iter().find(|i| i.id == drag.id).filter(|i| drag.mode.draws() && !i.is_redaction()).map(|i| (i.w, i.h));
+            if let Some((w, h)) = drawn {
+                let reaches = |far: f32| drag.points.iter().any(|p| (p.0 - drag.points[0].0).hypot(p.1 - drag.points[0].1) >= far);
+                // Nothing was drawn (a click, or a twitch): no item, and nothing to undo.
+                let empty = match drag.mode {
+                    DragMode::Draw => w < 4. || h < 4.,
+                    DragMode::Line => !reaches(4.),
+                    // The pen leaves small marks too (the dot on an i): anything that shows on screen.
+                    _ => !reaches(2. / self.zoom),
+                };
+                if empty {
+                    self.items.retain(|i| i.id != drag.id);
+                } else {
+                    self.push_history(drag.snapshot);
+                }
+                // Left unselected: the tool is still in hand, for the next one.
+                self.selected = None;
+            } else if drag.mode == DragMode::Draw {
                 // `add_item` already recorded the undo step. A click (or a tiny drag)
                 // places a default-sized box instead.
                 let (x0, y0, _, _) = drag.start;
@@ -2819,6 +3467,18 @@ impl Editor {
             return;
         }
 
+        // The find bar: Return goes to the next occurrence (with Shift, the one before).
+        if self.find_focused() {
+            match ks.key.as_str() {
+                "escape" => self.close_find(cx),
+                "enter" => self.find_step(!ks.modifiers.shift, window, cx),
+                // Characters arrive through the input handler.
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         // The Recents gallery: typing anywhere searches it.
         if self.doc.is_none() && !self.recents.is_empty() {
             if self.searching_recents() {
@@ -2837,11 +3497,6 @@ impl Editor {
                 self.ime_marked = None;
                 cx.stop_propagation();
                 cx.notify();
-                return;
-            }
-            if shortcut && ks.key == "f" {
-                self.start_recents_search(window, cx);
-                cx.stop_propagation();
                 return;
             }
             let typed = ks.key_char.clone().filter(|c| !c.trim().is_empty() && !c.chars().any(char::is_control));
@@ -2909,6 +3564,10 @@ impl Editor {
         }
         let Some(id) = self.selected else {
             if ks.key == "escape" {
+                // Put the tool down; with none in hand, close the find bar.
+                if self.tool == Tool::Select {
+                    self.find = None;
+                }
                 self.tool = Tool::Select;
                 cx.notify();
             }
@@ -3153,9 +3812,15 @@ impl Editor {
                             )
                         })
                         .child(
+                            ui::icon_button("copy-pdf", "clipboard")
+                                .tooltip(ui::tooltip("Copy the finished PDF to the clipboard, to paste into an email, a chat or a folder", Some("⇧⌘C")))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(SaveTo::Clipboard, window, cx))),
+                        )
+                        .child(div().w(px(4.)))
+                        .child(
                             ui::primary_button("save", "save", "Save PDF")
                                 .tooltip(ui::tooltip("Save a filled copy", Some("⌘S")))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx))),
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(SaveTo::File, window, cx))),
                         )
                         .child(div().w(px(4.)))
                     })
@@ -3208,7 +3873,11 @@ impl Editor {
                             control("win-maximize", if maximized { "window-restore" } else { "window-maximize" })
                                 .on_click(|_, window, _| window.zoom_window()),
                         )
-                        .child(control("win-close", "close").on_click(|_, window, _| window.remove_window())),
+                        .child(control("win-close", "close").on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            if this.may_close(window, cx) {
+                                window.remove_window();
+                            }
+                        }))),
                 )
             })
     }
@@ -3355,6 +4024,7 @@ impl Editor {
 
     fn start_watermark_typing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_editing(cx);
+        self.unfocus_find();
         self.selected = None;
         self.watermark_editing = true;
         self.watermark_replace = true;
@@ -3566,6 +4236,77 @@ impl Editor {
             .into_any_element()
     }
 
+    /// "Annotate": the highlighter, the pen, and a shape.
+    fn render_annotate_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = [Tool::Highlight, Tool::Pen, self.shape_tool].map(|tool| self.render_tool_row(tool, cx));
+        Self::sidebar_section("Annotate", rows.into())
+    }
+
+    fn render_shape_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = ui::menu_panel().child(div().px_2().pt_1().pb_1p5().text_xs().text_color(ui::text_tertiary()).child("Shape"));
+        for (i, tool) in [Tool::Rectangle, Tool::Oval, Tool::Line, Tool::Arrow].into_iter().enumerate() {
+            panel = panel.child(ui::menu_item(("shape", i), tool_label(tool).1, self.shape_tool == tool, None).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    this.finish_editing(cx);
+                    this.close_menus();
+                    (this.shape_tool, this.tool) = (tool, tool);
+                    window.focus(&this.focus);
+                    cx.notify();
+                },
+            )));
+        }
+        self.floating_menu(panel, false, cx)
+    }
+
+    /// The colours (and, for the pen, the line widths) to choose from, as
+    /// buttons on a dark bar: for the tool in hand, or for the selected item.
+    fn render_pen_options(&self, key: usize, highlight: bool, color: u32, width: Option<f32>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let button = |id: (&'static str, usize)| {
+            div()
+                .id(id)
+                .size(px(26.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor(CursorStyle::PointingHand)
+                .hover(|s| s.bg(rgba(0xffffff1f)))
+        };
+        let colors = if highlight { model::HIGHLIGHT_COLORS } else { model::PEN_COLORS };
+        let mut options: Vec<AnyElement> = colors
+            .iter()
+            .enumerate()
+            .map(|(i, &(label, choice))| {
+                button(("pen-color", key * 16 + i))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .rounded_full()
+                            .bg(rgb(choice))
+                            .border_1()
+                            .border_color(rgba(0xffffff8c))
+                            .when(choice == color, |d| d.border_2().border_color(gpui::white())),
+                    )
+                    .tooltip(ui::tooltip(label, None))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pen_color(highlight, choice, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        if let Some(width) = width {
+            options.push(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgba(0xffffff26)).into_any_element());
+            options.extend(model::PEN_WIDTHS.iter().enumerate().map(|(i, &(label, choice))| {
+                button(("pen-width", key * 16 + i))
+                    .when(choice == width, |d| d.bg(rgba(0xffffff33)))
+                    .child(div().size(px(4. + 3. * i as f32)).rounded_full().bg(gpui::white()))
+                    .tooltip(ui::tooltip(label, None))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pen_width(choice, cx)))
+                    .into_any_element()
+            }));
+        }
+        options
+    }
+
     /// "Protect": redaction and the watermark.
     fn render_protect_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_doc = self.doc.is_some();
@@ -3605,7 +4346,7 @@ impl Editor {
         .when(has_doc, |d| {
             d.cursor(CursorStyle::PointingHand)
                 .tooltip(ui::tooltip("Save with a password", Some("⌥⌘S")))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_with_new_password(window, cx)))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_with_new_password(SaveTo::File, window, cx)))
         })
         .into_any_element();
         Self::sidebar_section("Protect", vec![self.render_tool_row(Tool::Redact, cx), watermark_row, password_row])
@@ -3671,7 +4412,10 @@ impl Editor {
                 Tool::Date => self.settings.today().into(),
                 Tool::Text => "Type anywhere on the page".into(),
                 Tool::Redact => "Cover & remove for good".into(),
-                _ => "Tick a box".into(),
+                Tool::Highlight => "Drag over text".into(),
+                Tool::Pen => "Write or draw freehand".into(),
+                Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => "Drag to draw one".into(),
+                Tool::Check | Tool::Select => "Tick a box".into(),
             };
             let id = match tool {
                 Tool::Text => "fill-Text",
@@ -3679,6 +4423,14 @@ impl Editor {
                 Tool::Check => "fill-Checkmark",
                 Tool::Redact => "protect-Redact",
                 Tool::Select => "fill-Select",
+                Tool::Highlight => "annotate-Highlight",
+                Tool::Pen => "annotate-Draw",
+                Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => "annotate-Shape",
+            };
+            let how = if tool.draws() {
+                "Click, then drag on the page. It stays in hand until you press Esc".to_string()
+            } else {
+                format!("Click, then click the page — or drag {} onto the page", label.to_lowercase())
             };
             let row = Self::sidebar_row(id, icon_name, label, sublabel, active, has_doc)
                 .when(tool == Tool::Date, |d| {
@@ -3714,16 +4466,49 @@ impl Editor {
                             .when(self.date_menu_open, |d| d.child(self.render_date_menu(cx))),
                     )
                 })
+                .when(tool.is_shape(), |d| {
+                    d.child(
+                        div()
+                            .id("shape-trigger")
+                            .relative()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_0p5()
+                            .px_1p5()
+                            .h(px(22.))
+                            .rounded(px(5.))
+                            .text_xs()
+                            .text_color(ui::text_secondary())
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(ui::hover_bg()).text_color(ui::text_primary()))
+                            .tooltip(ui::tooltip("Which shape to draw", None))
+                            .child("Shape")
+                            .child(ui::icon("chevron-down", ui::text_tertiary()).size(px(11.)))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                if std::mem::take(&mut this.menu_dismissed) {
+                                    return;
+                                }
+                                let open = !this.shape_menu_open;
+                                this.close_menus();
+                                this.shape_menu_open = open;
+                                cx.notify();
+                            }))
+                            .when(self.shape_menu_open, |d| d.child(self.render_shape_menu(cx))),
+                    )
+                })
                 .when(has_doc, |d| {
                     d.cursor(CursorStyle::PointingHand)
-                        .tooltip(ui::tooltip(format!("Click, then click the page — or drag {} onto the page", label.to_lowercase()), None))
+                        .tooltip(ui::tooltip(how, None))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.finish_editing(cx);
                             this.tool = if this.tool == tool { Tool::Select } else { tool };
                             window.focus(&this.focus);
                             cx.notify();
                         }))
-                        .on_drag(ToolDrag(tool), |drag: &ToolDrag, _, _, cx| cx.new(|_| *drag))
+                        .when(!tool.draws(), |d| d.on_drag(ToolDrag(tool), |drag: &ToolDrag, _, _, cx| cx.new(|_| *drag)))
                 });
             row.into_any_element()
         }
@@ -3799,6 +4584,8 @@ impl Editor {
             .border_r_1()
             .border_color(ui::border())
             .child(self.render_fill_section(cx))
+            .child(div().mx_4().h(px(1.)).bg(ui::border()))
+            .child(self.render_annotate_section(cx))
             .child(div().mx_4().h(px(1.)).bg(ui::border()))
             .child(self.render_protect_section(cx))
             .child(div().mx_4().h(px(1.)).bg(ui::border()))
@@ -3968,6 +4755,38 @@ impl Editor {
                 .when(*fill == RedactFill::White, |d| d.border_1().border_dashed().border_color(rgba(0x0000004d)))
                 .when(selected, |d| d.opacity(0.6))
                 .into_any_element(),
+            // On screen the colour is see-through; in the file it darkens what's under it.
+            ItemKind::Highlight { color } => {
+                div().w(px(item.w * z)).h(px(item.h * z)).rounded(px(1.)).bg(rgba((color << 8) | 0x66)).into_any_element()
+            }
+            ItemKind::Outline { oval, color, width } => {
+                let (oval, color, line) = (*oval, *color, width * z);
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        if let Some(path) = outline_path(bounds, oval, line) {
+                            window.paint_path(path, rgb(color));
+                        }
+                    },
+                )
+                .w(px(item.w * z))
+                .h(px(item.h * z))
+                .into_any_element()
+            }
+            ItemKind::Stroke { points, color, width, arrow } => {
+                let (points, color, line, arrow) = (points.clone(), *color, width * z, *arrow);
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        if let Some(path) = stroke_path(bounds, &points, line, arrow.then_some(z)) {
+                            window.paint_path(path, rgb(color));
+                        }
+                    },
+                )
+                .w(px(item.w * z))
+                .h(px(item.h * z))
+                .into_any_element()
+            }
             ItemKind::Check => {
                 let s = item.w * z;
                 div()
@@ -4037,6 +4856,10 @@ impl Editor {
                     .child(swatch(RedactFill::White, "redact-white", "White", cx))
                     .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgba(0xffffff26)))
             })
+            .when_some(item.color(), |h, (highlight, color)| {
+                h.children(self.render_pen_options(id as usize + 1, highlight, color, item.pen_width(), cx))
+                    .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgba(0xffffff26)))
+            })
             .when(is_text, |h| {
                 h.child(
                     ui::hud_button(("smaller", id as usize), "text-smaller")
@@ -4088,7 +4911,13 @@ impl Editor {
             .border_color(if selected { ui::accent() } else { gpui::transparent_black() })
             .when(!selected, |d| d.hover(|s| s.border_color(ui::accent().opacity(0.35)).bg(ui::accent().opacity(0.03))))
             .when(editing, |d| d.bg(ui::accent().opacity(0.04)))
-            .cursor(if editing { CursorStyle::IBeam } else { CursorStyle::OpenHand })
+            .cursor(if editing {
+                CursorStyle::IBeam
+            } else if self.tool.draws() {
+                CursorStyle::Crosshair
+            } else {
+                CursorStyle::OpenHand
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| this.item_mouse_down(id, DragMode::Move, e, window, cx)),
@@ -4205,7 +5034,7 @@ impl Editor {
                 let remove_id = entry.id.clone();
                 let output = entry.output.clone();
                 let original_missing = !self.file_exists(&entry.original);
-                let output_exists = self.file_exists(&entry.output);
+                let output_exists = entry.saved_copy().is_some_and(|saved| self.file_exists(saved));
                 let fields = entry.items.len();
 
                 let thumb = match &entry.thumbnail {
@@ -4796,7 +5625,7 @@ impl Editor {
                 "Continue",
                 "open",
             ),
-            PasswordPurpose::NewPassword { first: None } => (
+            PasswordPurpose::NewPassword { first: None, .. } => (
                 copy_title,
                 if had_password {
                     "The copy you save will need this password to open. The original keeps its own."
@@ -4808,7 +5637,7 @@ impl Editor {
                 "Next",
                 "lock",
             ),
-            PasswordPurpose::NewPassword { first: Some(_) } => (
+            PasswordPurpose::NewPassword { first: Some(_), .. } => (
                 copy_title,
                 "Type the password again to make sure.",
                 "Repeat the password",
@@ -4934,6 +5763,7 @@ impl Editor {
             on_page.sort_by_key(|i| i.is_redaction());
             let items: Vec<_> = on_page.into_iter().map(|item| self.render_item(item, cx)).collect();
             let widgets = self.render_widgets(source, cx);
+            let found = self.render_find_marks(source);
             let watermark_image = self
                 .watermark
                 .as_ref()
@@ -4989,7 +5819,8 @@ impl Editor {
                 .when_some(watermark_image, |d, image| {
                     d.child(img(image).absolute().size_full().object_fit(ObjectFit::Fill))
                 })
-                // The document's own fields, then the items placed on top.
+                // What was looked for, the document's own fields, then the items placed on top.
+                .children(found)
                 .children(widgets)
                 .children(items);
 
@@ -5018,6 +5849,17 @@ impl Editor {
             Tool::Date => Some(("calendar", "Click on the page to add today's date")),
             Tool::Check => Some(("check", "Click on the page to add a checkmark")),
             Tool::Redact => Some(("redact", "Drag over anything to cover it in black or white. It's removed from the file when you save")),
+            Tool::Highlight => Some(("highlight", "Drag over text to highlight it")),
+            Tool::Pen => Some(("pen", "Draw on the page")),
+            Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => Some((tool_label(self.tool).0, "Drag on the page to draw")),
+        };
+        // A drawing tool's colours (and line widths) are chosen here, and it is put down with Esc.
+        let (options, done) = if self.tool.draws() {
+            let highlight = self.tool == Tool::Highlight;
+            let color = if highlight { self.settings.highlight_color } else { self.settings.pen_color };
+            (self.render_pen_options(0, highlight, color, (!highlight).then_some(self.settings.pen_width), cx), "Esc when done")
+        } else {
+            (Vec::new(), "Esc to cancel")
         };
 
         // ⌘/Ctrl + wheel zooms around the pointer. Listening in the capture phase
@@ -5078,6 +5920,7 @@ impl Editor {
                             .children(page_elements),
                     ),
             )
+            .children(self.render_find_bar(cx))
             .when_some(hint, |d, (icon_name, text)| {
                 d.child(
                     div().absolute().bottom(px(20.)).left_0().right_0().flex().justify_center().child(
@@ -5093,15 +5936,18 @@ impl Editor {
                             .text_color(gpui::white())
                             .text_xs()
                             .shadow(ui::lifted_shadow())
+                            .cursor(CursorStyle::Arrow)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(ui::icon(icon_name, gpui::white()).size(px(14.)))
                             .child(text)
+                            .children(options)
                             .child(
                                 div()
                                     .px_1p5()
                                     .rounded_full()
                                     .bg(rgba(0xffffff1f))
                                     .text_color(ui::hud_muted())
-                                    .child("Esc to cancel"),
+                                    .child(done),
                             ),
                     ),
                 )
@@ -5123,6 +5969,12 @@ impl Render for Editor {
                 }
                 None => cx.on_next_frame(window, |_, _, cx| cx.notify()),
                 _ => {}
+            }
+        }
+        // A long document's drawn pages follow the view, and the pages as they come and go.
+        if let (Some(drawn), Some(doc)) = (&self.drawn_around, &self.doc) {
+            if doc.order != drawn.order || self.current_page().is_some_and(|page| page.abs_diff(drawn.page) >= drawn.slack) {
+                self.ensure_rendered(window, cx);
             }
         }
         // A sidebar came or went: this frame lays the page view out at its new
@@ -5147,14 +5999,18 @@ impl Render for Editor {
             .text_color(ui::text_primary())
             .font_family(".SystemUIFont")
             .on_action(cx.listener(|this, _: &Open, window, cx| this.request_open(None, window, cx)))
-            .on_action(cx.listener(|this, _: &Save, window, cx| this.save(window, cx)))
-            .on_action(cx.listener(|this, _: &SaveWithPassword, window, cx| this.save_with_new_password(window, cx)))
+            .on_action(cx.listener(|this, _: &Save, window, cx| this.save(SaveTo::File, window, cx)))
+            .on_action(cx.listener(|this, _: &SaveWithPassword, window, cx| this.save_with_new_password(SaveTo::File, window, cx)))
+            .on_action(cx.listener(|this, _: &CopyPdf, window, cx| this.save(SaveTo::Clipboard, window, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo(cx)))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &Cut, _, cx| this.cut(cx)))
             .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &Duplicate, _, cx| this.duplicate(cx)))
+            .on_action(cx.listener(|this, _: &Find, window, cx| this.start_find(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, window, cx| this.find_step(true, window, cx)))
+            .on_action(cx.listener(|this, _: &FindPrevious, window, cx| this.find_step(false, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitWidth, window, cx| this.set_zoom_mode(ZoomMode::FitWidth, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitPage, window, cx| this.set_zoom_mode(ZoomMode::FitPage, window, cx)))
             .on_action(cx.listener(|this, _: &AddSignature, window, cx| this.add_signature_dialog(window, cx)))
@@ -5163,6 +6019,8 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.set_zoom(this.zoom / 1.2, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.set_zoom(1.0, window, cx)))
             .on_action(cx.listener(|this, _: &CloseDocument, window, cx| this.request_close(window, cx)))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
             .on_action(cx.listener(|this, _: &DiscardChanges, window, cx| this.request_discard(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _, cx| this.toggle_left_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _, cx| this.toggle_right_sidebar(cx)))
@@ -5316,18 +6174,67 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// The outline of a box, or of the oval that fills it, just inside `bounds` and `line` wide.
+fn outline_path(bounds: Bounds<Pixels>, oval: bool, line: f32) -> Option<gpui::Path<Pixels>> {
+    let inset = px(line / 2.).min(bounds.size.width / 2.).min(bounds.size.height / 2.);
+    let (left, top, right, bottom) = (bounds.left() + inset, bounds.top() + inset, bounds.right() - inset, bounds.bottom() - inset);
+    let mut builder = gpui::PathBuilder::stroke(px(line));
+    if oval {
+        let (rx, ry) = ((right - left) / 2., (bottom - top) / 2.);
+        for i in 0..64 {
+            let angle = i as f32 / 64. * std::f32::consts::TAU;
+            let at = point(left + rx + rx * angle.cos(), top + ry + ry * angle.sin());
+            if i == 0 { builder.move_to(at) } else { builder.line_to(at) }
+        }
+    } else {
+        builder.move_to(point(left, top));
+        for corner in [point(right, top), point(right, bottom), point(left, bottom)] {
+            builder.line_to(corner);
+        }
+    }
+    builder.close();
+    builder.build().ok()
+}
+
+/// A line `line` wide through `points` (fractions of `bounds`), with an arrow
+/// head at its end if `arrow` (which is how long a point is on screen).
+fn stroke_path(bounds: Bounds<Pixels>, points: &[[f32; 2]], line: f32, arrow: Option<f32>) -> Option<gpui::Path<Pixels>> {
+    let at = |[x, y]: [f32; 2]| bounds.origin + point(bounds.size.width * x, bounds.size.height * y);
+    let [.., from, to] = points else { return None };
+    let mut builder = gpui::PathBuilder::stroke(px(line));
+    for (i, &fraction) in points.iter().enumerate() {
+        if i == 0 { builder.move_to(at(fraction)) } else { builder.line_to(at(fraction)) }
+    }
+    if let Some(unit) = arrow {
+        let (from, to) = (at(*from), at(*to));
+        let xy = |p: Point<Pixels>| (p.x / px(1.), p.y / px(1.));
+        let [left, right] = model::arrow_barbs(xy(from), xy(to), line, unit).map(|(x, y)| point(px(x), px(y)));
+        builder.move_to(left);
+        builder.line_to(to);
+        builder.line_to(right);
+    }
+    builder.build().ok()
+}
+
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
+        KeyBinding::new("secondary-n", NewWindow, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("secondary-o", Open, None),
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-alt-s", SaveWithPassword, None),
+        KeyBinding::new("secondary-shift-c", CopyPdf, None),
         KeyBinding::new("secondary-z", Undo, None),
         KeyBinding::new("secondary-shift-z", Redo, None),
         KeyBinding::new("secondary-c", Copy, None),
         KeyBinding::new("secondary-x", Cut, None),
         KeyBinding::new("secondary-v", Paste, None),
         KeyBinding::new("secondary-d", Duplicate, None),
+        KeyBinding::new("secondary-f", Find, None),
+        KeyBinding::new("secondary-g", FindNext, None),
+        KeyBinding::new("secondary-shift-g", FindPrevious, None),
         KeyBinding::new("secondary-1", ZoomFitWidth, None),
         KeyBinding::new("secondary-2", ZoomFitPage, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -5343,8 +6250,97 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// Open a PDF in a window: the one that already shows it, else one with nothing in
+/// it (`preferred`, or the one in front, before any other), else a new one.
+///
+/// It happens once whatever is running has finished, so it can be asked for from
+/// inside a window.
+pub fn open_document(cx: &mut App, path: PathBuf, preferred: Option<AnyWindowHandle>) {
+    cx.defer(move |cx| {
+        let first = preferred.or_else(|| cx.active_window());
+        let mut windows = editor_windows(cx);
+        windows.sort_by_key(|(window, _)| Some(*window) != first);
+        let target = windows
+            .iter()
+            .find(|(_, editor)| editor.read(cx).shows(&path))
+            .or_else(|| windows.iter().find(|(_, editor)| editor.read(cx).is_free()))
+            .cloned();
+        let opened = match target {
+            Some((window, editor)) => window.update(cx, |_, window, cx| {
+                window.activate_window();
+                editor.update(cx, |editor, cx| {
+                    if !editor.shows(&path) {
+                        editor.open_path(path, window, cx);
+                    }
+                });
+            }),
+            None => open_editor(cx, Some(path)).map(|_| ()),
+        };
+        if let Err(e) = opened {
+            eprintln!("failed to open a window: {e:#}");
+        }
+    });
+}
+
+/// Quit, asking first if a window has unsaved changes.
+pub fn request_quit(cx: &mut App) {
+    cx.defer(|cx| {
+        let unsaved: Vec<_> = editor_windows(cx).into_iter().filter(|(_, editor)| editor.read(cx).dirty).collect();
+        let Some((window, _)) = unsaved.first() else { return cx.quit() };
+        let detail = match unsaved.len() {
+            1 => "Fields you added or changed since the last save will be lost.".to_string(),
+            n => format!("{n} documents have changes since they were last saved, which will be lost."),
+        };
+        let answer = window.update(cx, |_, window, cx| {
+            window.activate_window();
+            window.prompt(PromptLevel::Warning, "Quit and discard unsaved changes?", Some(&detail), &["Quit", "Cancel"], cx)
+        });
+        let Ok(answer) = answer else { return cx.quit() };
+        cx.spawn(async move |cx| {
+            if answer.await.ok() == Some(0) {
+                cx.update(|cx| cx.quit()).ok();
+            }
+        })
+        .detach();
+    });
+}
+
+/// Where a new window goes: a step down and to the right of the one in front, so
+/// that neither hides the other, or the middle of the screen for the first.
+fn new_window_bounds(cx: &mut App) -> Bounds<Pixels> {
+    const STEP: Pixels = px(28.);
+    // At launch no window is in front yet: the newest one stands in.
+    let front = cx.active_window().or_else(|| editor_windows(cx).last().map(|(window, _)| *window)).and_then(|window| {
+        window
+            .update(cx, |_, window, cx| {
+                let windowed = !window.is_fullscreen() && !window.is_maximized();
+                windowed.then(|| (window.bounds(), window.display(cx).map(|display| display.bounds())))
+            })
+            .ok()
+            .flatten()
+    });
+    let Some((front, display)) = front else {
+        return Bounds::centered(None, size(px(1240.), px(900.)), cx);
+    };
+    let taken: Vec<Point<Pixels>> =
+        cx.windows().into_iter().filter_map(|window| window.update(cx, |_, window, _| window.bounds().origin).ok()).collect();
+    let is_taken = |origin: Point<Pixels>| taken.iter().any(|t| (t.x - origin.x).abs() < px(4.) && (t.y - origin.y).abs() < px(4.));
+    let mut origin = front.origin + point(STEP, STEP);
+    // Off the bottom or the right of the screen: start again from its top left.
+    if let Some(display) = display.filter(|d| origin.x + front.size.width > d.right() || origin.y + front.size.height > d.bottom()) {
+        origin = display.origin + point(STEP, STEP * 2.);
+    }
+    for _ in 0..20 {
+        if !is_taken(origin) {
+            break;
+        }
+        origin += point(STEP, STEP);
+    }
+    Bounds { origin, size: front.size }
+}
+
 pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpui::WindowHandle<Editor>> {
-    let bounds = Bounds::centered(None, size(px(1240.), px(900.)), cx);
+    let bounds = new_window_bounds(cx);
     let window = cx.open_window(
         gpui::WindowOptions {
             window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
@@ -5651,13 +6647,393 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_finished_pdf_can_go_to_the_clipboard(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+        let (original, name) = editor.read_with(cx, |e, _| {
+            let path = e.doc.as_ref().unwrap().path.clone();
+            let name = format!("{}-signed.pdf", path.file_stem().unwrap().to_str().unwrap());
+            (path, name)
+        });
+        editor.update(cx, |e, _| e.tool = Tool::Check);
+        cx.simulate_click(origin + point(px(300.), px(400.)), Modifiers::none());
+        editor.read_with(cx, |e, _| assert!(e.dirty));
+
+        // Copied without asking where to save: the copy is a file of the app's own.
+        cx.simulate_keystrokes("secondary-shift-c");
+        cx.run_until_parked();
+        assert!(!cx.did_prompt_for_new_path());
+        let copy = clipboard::last_put().expect("a copy on the clipboard");
+        assert_eq!(copy.file_name().unwrap().to_str(), Some(name.as_str()));
+        assert!(!copy.starts_with(original.parent().unwrap()), "not beside the original");
+        let written = crate::pdf::load(std::fs::read(&copy).unwrap()).unwrap();
+        assert_eq!(written.pages.len(), 2);
+        let page = crate::pdf::render_page(&written.pdf, 0, 1.0).unwrap();
+        let dark = |x: u32, y: u32| page.bgra[((y * page.width + x) * 4) as usize] < 100;
+        assert!((290..310).any(|x| (390..410).any(|y| dark(x, y))), "with the checkmark on it");
+
+        // It counts as saved, and Recents can bring it back to work on; but there is no saved file.
+        editor.read_with(cx, |e, _| {
+            assert!(!e.dirty);
+            assert!(e.status.contains(&format!("Copied {name} to the clipboard")), "{}", e.status);
+            assert_eq!(e.doc.as_ref().unwrap().last_output, None);
+            assert_eq!((e.recents.len(), e.recents[0].items.len()), (1, 1));
+            assert_eq!(e.recents[0].saved_copy(), None);
+        });
+        let id = editor.read_with(cx, |e, _| e.recents[0].id.clone());
+        editor.update_in(cx, |e, window, cx| {
+            e.close_document(window, cx);
+            e.open_recent(&id, window, cx);
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 1);
+            assert_eq!(e.doc.as_ref().unwrap().last_output, None, "the next save is not offered the original's name");
+        });
+
+        // After a save to a file, a copy to the clipboard leaves that file as the saved one.
+        let out = test_dir().join("clipboard-then-file.pdf");
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("secondary-shift-c");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.recents[0].saved_copy(), Some(out.as_path()));
+            assert_eq!(e.doc.as_ref().unwrap().last_output.as_deref(), Some(out.as_path()));
+        });
+        // The copy is named like the saved file, and takes the place of the one before.
+        let second = clipboard::last_put().unwrap();
+        assert_eq!(second.file_name(), out.file_name());
+        assert!(second.exists() && !copy.exists());
+
+        // With nothing open there is nothing to copy.
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        cx.simulate_keystrokes("secondary-shift-c");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(e.status.contains("Nothing to save"), "{}", e.status));
+        assert_eq!(clipboard::last_put(), Some(second));
+    }
+
+    #[gpui::test]
+    fn annotations_are_drawn_by_dragging(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+        let at = |x: f32, y: f32| origin + point(px(x), px(y));
+        let drag = |cx: &mut VisualTestContext, through: &[Point<Pixels>]| {
+            cx.simulate_mouse_down(through[0], MouseButton::Left, Modifiers::none());
+            for &position in &through[1..] {
+                cx.simulate_mouse_move(position, MouseButton::Left, Modifiers::none());
+            }
+            cx.simulate_mouse_up(*through.last().unwrap(), MouseButton::Left, Modifiers::none());
+        };
+        let geometry = |editor: &Entity<Editor>, cx: &mut VisualTestContext, i: usize| {
+            editor.read_with(cx, |e, _| (e.items[i].x, e.items[i].y, e.items[i].w, e.items[i].h))
+        };
+
+        // The highlighter marks where it is dragged, in the colour chosen for it.
+        editor.update(cx, |e, cx| {
+            e.tool = Tool::Highlight;
+            e.set_pen_color(true, model::HIGHLIGHT_COLORS[2].1, cx);
+        });
+        drag(cx, &[at(60., 70.), at(260., 96.)]);
+        editor.read_with(cx, |e, _| {
+            assert!(matches!(e.items[0].kind, ItemKind::Highlight { color } if color == model::HIGHLIGHT_COLORS[2].1));
+            assert_eq!(e.tool, Tool::Highlight, "still in hand, for the next");
+            assert_eq!(e.selected, None);
+            assert!(e.dirty);
+        });
+        assert_eq!(geometry(&editor, cx, 0), (60., 70., 200., 26.));
+        drag(cx, &[at(60., 120.), at(260., 146.)]);
+        editor.read_with(cx, |e, _| assert_eq!((e.items.len(), e.history.len()), (2, 2), "one undo step for each"));
+        cx.simulate_keystrokes("secondary-z");
+
+        // A click draws nothing, and leaves nothing to undo or save.
+        cx.simulate_click(at(300., 300.), Modifiers::none());
+        editor.read_with(cx, |e, _| assert_eq!((e.items.len(), e.history.len()), (1, 1)));
+        cx.simulate_keystrokes("secondary-z");
+        editor.update(cx, |e, _| e.dirty = false);
+        cx.simulate_click(at(300., 300.), Modifiers::none());
+        editor.read_with(cx, |e, _| assert!(e.items.is_empty() && e.history.is_empty() && !e.dirty));
+        cx.simulate_keystrokes("secondary-shift-z");
+
+        // The pen draws through wherever the pointer goes, over other items too.
+        editor.update(cx, |e, cx| {
+            e.tool = Tool::Pen;
+            e.set_pen_color(false, model::PEN_COLORS[1].1, cx);
+            e.set_pen_width(model::PEN_WIDTHS[2].1, cx);
+        });
+        drag(cx, &[at(100., 80.), at(150., 180.), at(200., 80.)]);
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 2, "a new item, though it starts on the highlight");
+            assert_eq!(e.items[1].stroke_points(), vec![(100., 80.), (150., 180.), (200., 80.)]);
+            let ItemKind::Stroke { color, width, arrow, .. } = &e.items[1].kind else { panic!("not a stroke") };
+            assert_eq!((*color, *width, *arrow), (model::PEN_COLORS[1].1, model::PEN_WIDTHS[2].1, false));
+        });
+        assert_eq!(geometry(&editor, cx, 1), (100., 80., 100., 100.));
+
+        // A line is straight from where it starts to where it ends, however the pointer got there;
+        // a level one gets a box thick enough to take hold of.
+        editor.update(cx, |e, _| e.tool = Tool::Arrow);
+        drag(cx, &[at(300., 400.), at(350., 300.), at(500., 400.)]);
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items[2].stroke_points(), vec![(300., 400.), (500., 400.)]);
+            assert!(matches!(e.items[2].kind, ItemKind::Stroke { arrow: true, .. }));
+        });
+        assert_eq!(geometry(&editor, cx, 2), (300., 396., 200., 8.));
+
+        // Shapes are outlines of the box dragged out.
+        editor.update(cx, |e, _| e.tool = Tool::Oval);
+        drag(cx, &[at(400., 200.), at(300., 100.)]);
+        editor.read_with(cx, |e, _| assert!(matches!(e.items[3].kind, ItemKind::Outline { oval: true, .. })));
+        assert_eq!(geometry(&editor, cx, 3), (300., 100., 100., 100.));
+
+        // A box dragged past the page's edge stops there, and reaches back to where it began.
+        editor.update(cx, |e, _| e.tool = Tool::Rectangle);
+        drag(cx, &[at(50., 600.), at(-30., 640.)]);
+        assert_eq!(geometry(&editor, cx, 4), (0., 600., 50., 40.));
+        // A line along the edge stays on it, though the box around it reaches over.
+        editor.update(cx, |e, _| e.tool = Tool::Line);
+        drag(cx, &[at(100., 2.), at(200., 2.)]);
+        editor.read_with(cx, |e, _| assert_eq!(e.items[5].stroke_points(), vec![(100., 2.), (200., 2.)]));
+        // The pen leaves small marks (a line that short is a slip); a release that isn't seen ends the stroke.
+        drag(cx, &[at(400., 500.), at(403., 500.)]);
+        editor.update(cx, |e, _| e.tool = Tool::Pen);
+        drag(cx, &[at(400., 500.), at(403., 500.)]);
+        editor.read_with(cx, |e, _| assert_eq!(e.items.len(), 7));
+        cx.simulate_mouse_down(at(420., 520.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at(440., 540.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at(460., 560.), None, Modifiers::none());
+        editor.read_with(cx, |e, _| {
+            assert!(e.drag.is_none());
+            assert_eq!(e.items[7].stroke_points(), vec![(420., 520.), (440., 540.)]);
+            assert_eq!(e.history.len(), 8, "one step for each of the eight");
+        });
+        cx.simulate_keystrokes("secondary-z secondary-z secondary-z secondary-z");
+
+        // Escape puts the tool down. Then items are selected, recoloured, resized and moved as usual.
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |e, _| assert_eq!(e.tool, Tool::Select));
+        cx.simulate_click(at(350., 150.), Modifiers::none());
+        let oval = editor.read_with(cx, |e, _| e.items[3].id);
+        editor.read_with(cx, |e, _| assert_eq!(e.selected, Some(oval)));
+        editor.update(cx, |e, cx| {
+            e.set_pen_color(false, model::PEN_COLORS[3].1, cx);
+            e.set_pen_width(model::PEN_WIDTHS[0].1, cx);
+            // The highlighter's colour is not the oval's to take.
+            e.set_pen_color(true, model::HIGHLIGHT_COLORS[1].1, cx);
+        });
+        editor.read_with(cx, |e, _| {
+            assert!(matches!(e.items[3].kind, ItemKind::Outline { color, width, .. } if color == model::PEN_COLORS[3].1 && width == model::PEN_WIDTHS[0].1));
+            assert!(matches!(e.items[1].kind, ItemKind::Stroke { color, .. } if color == model::PEN_COLORS[1].1), "others keep theirs");
+        });
+        cx.simulate_keystrokes("secondary-z secondary-z");
+        editor.read_with(cx, |e, _| assert!(matches!(e.items[3].kind, ItemKind::Outline { color, width, .. } if color == model::PEN_COLORS[1].1 && width == model::PEN_WIDTHS[2].1)));
+        let stroke = editor.read_with(cx, |e, _| e.items[1].id);
+        editor.update_in(cx, |e, window, cx| {
+            let down = MouseDownEvent { button: MouseButton::Left, position: at(200., 180.), modifiers: Modifiers::none(), click_count: 1, first_mouse: false };
+            e.item_mouse_down(stroke, DragMode::Resize, &down, window, cx);
+        });
+        cx.simulate_mouse_move(at(300., 130.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at(300., 130.), MouseButton::Left, Modifiers::none());
+        assert_eq!(geometry(&editor, cx, 1), (100., 80., 200., 50.), "its width and height change separately");
+        editor.read_with(cx, |e, _| assert_eq!(e.items[1].stroke_points(), vec![(100., 80.), (200., 130.), (300., 80.)], "and the line with them"));
+
+        // The choices are kept for the next time.
+        let saved = Settings::load();
+        assert_eq!((saved.highlight_color, saved.pen_color, saved.pen_width), (model::HIGHLIGHT_COLORS[1].1, model::PEN_COLORS[3].1, model::PEN_WIDTHS[0].1));
+
+        // What was drawn is saved into the file, and comes back from Recents.
+        let out = test_dir().join("annotated.pdf");
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        let written = crate::pdf::load(std::fs::read(&out).unwrap()).unwrap();
+        let page = crate::pdf::render_page(&written.pdf, 0, 1.0).unwrap();
+        let blue = |x: u32, y: u32| {
+            let i = ((y * page.width + x) * 4) as usize;
+            page.bgra[i] > 180 && page.bgra[i + 2] < 80
+        };
+        assert!(blue(400, 400), "the arrow's line is on the saved page");
+        let id = editor.read_with(cx, |e, _| e.recents[0].id.clone());
+        editor.update_in(cx, |e, window, cx| {
+            e.close_document(window, cx);
+            e.open_recent(&id, window, cx);
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 4);
+            assert_eq!(e.items[1].stroke_points(), vec![(100., 80.), (200., 130.), (300., 80.)]);
+        });
+    }
+
+    #[gpui::test]
+    fn text_is_found_in_the_document(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        // (which occurrence is shown, how many there are, the page position of each)
+        let found = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| {
+                let hits = e.find_hits();
+                (e.current_hit(&hits), hits.len(), hits.iter().map(|hit| hit.0).collect::<Vec<_>>())
+            })
+        };
+
+        // Both pages say "Page N - Name:".
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("NAME");
+        assert_eq!(found(cx), (Some(0), 2, vec![0, 1]), "found whatever its case, and the first is shown");
+        editor.read_with(cx, |e, _| assert!(!e.reading_text(), "every page has been read"));
+
+        // Return and ⌘G step forward, Shift steps back, around the ends.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(found(cx).0, Some(1));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(found(cx).0, Some(0));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(found(cx).0, Some(1));
+        cx.simulate_keystrokes("secondary-g");
+        assert_eq!(found(cx).0, Some(0));
+        cx.simulate_keystrokes("secondary-shift-g");
+        assert_eq!(found(cx).0, Some(1));
+
+        // The phrase is edited like any text, and looked for again as it changes.
+        cx.simulate_keystrokes("backspace backspace backspace backspace");
+        cx.simulate_input("page  2");
+        assert_eq!(found(cx), (Some(0), 1, vec![1]));
+        editor.read_with(cx, |e, _| assert_eq!(e.find.as_ref().unwrap().query, "page  2"));
+        cx.simulate_input("x");
+        assert_eq!(found(cx), (None, 0, vec![]));
+        cx.simulate_keystrokes("backspace backspace backspace");
+        assert_eq!(found(cx), (Some(1), 2, vec![0, 1]), "\"page\" is on both; the one on the page in view is shown");
+
+        // Pages that are moved or deleted are looked through where they now are.
+        editor.update(cx, |e, cx| e.move_page(1, 0, cx));
+        cx.simulate_keystrokes("enter");
+        let (current, count, _) = found(cx);
+        assert_eq!((current.is_some(), count), (true, 2));
+        editor.update(cx, |e, cx| e.delete_page(0, cx));
+        assert_eq!(found(cx).1, 1);
+        cx.simulate_keystrokes("secondary-z secondary-z");
+
+        // A click on the page takes the keyboard back; the bar stays, and ⌘F returns to it.
+        let origin = page_origin(&editor, cx, 0);
+        cx.simulate_click(origin + point(px(300.), px(300.)), Modifiers::none());
+        editor.read_with(cx, |e, _| assert!(e.find.is_some() && !e.find_focused()));
+        cx.simulate_keystrokes("secondary-f");
+        editor.read_with(cx, |e, _| assert!(e.find_focused()));
+
+        // So does taking up an item: the keys are for it, not for the phrase.
+        let query = |editor: &Entity<Editor>, cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.find.as_ref().unwrap().query.clone());
+        let phrase = query(&editor, cx);
+        let spot = origin + point(px(300.), px(500.));
+        editor.update(cx, |e, _| e.tool = Tool::Check);
+        cx.simulate_click(spot, Modifiers::none());
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_click(spot, Modifiers::none());
+        editor.read_with(cx, |e, _| assert!(e.selected.is_some() && e.find.is_some() && !e.find_focused()));
+        cx.simulate_keystrokes("backspace");
+        editor.read_with(cx, |e, _| assert!(e.items.is_empty(), "the checkmark is deleted"));
+        assert_eq!(query(&editor, cx), phrase);
+
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |e, _| assert!(e.find.is_none()));
+        assert_eq!(found(cx).1, 0);
+    }
+
+    #[gpui::test]
+    fn each_document_has_its_own_window(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let first = editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().path.clone());
+        let pdf = |name: &str| {
+            let path = test_dir().join(name);
+            std::fs::write(&path, crate::pdf::tests::sample_pdf()).unwrap();
+            path
+        };
+        let (second, third) = (pdf("second.pdf"), pdf("third.pdf"));
+        let others = |cx: &mut VisualTestContext| -> Vec<(AnyWindowHandle, Entity<Editor>)> {
+            cx.update(|_, cx| editor_windows(cx)).into_iter().filter(|(_, e)| *e != editor).collect()
+        };
+
+        // A second document doesn't replace the first.
+        editor.update_in(cx, |e, window, cx| e.request_open(Some(second.clone()), window, cx));
+        cx.run_until_parked();
+        let (other_window, other) = match others(cx).as_slice() {
+            [one] => one.clone(),
+            windows => panic!("expected one more window, found {}", windows.len()),
+        };
+        editor.read_with(cx, |e, _| assert_eq!(e.doc.as_ref().unwrap().path, first, "the first stays where it was"));
+        other.read_with(cx, |e, _| assert_eq!(e.doc.as_ref().unwrap().path, second));
+
+        // Asked for again, from either window, it isn't opened again.
+        editor.update_in(cx, |e, window, cx| e.request_open(Some(second.clone()), window, cx));
+        cx.update(|_, cx| open_document(cx, first.clone(), None));
+        cx.run_until_parked();
+        assert_eq!(others(cx).len(), 1);
+
+        // What every window shows is changed in every window.
+        editor.update(cx, |e, cx| e.set_date_format("%Y-%m-%d", cx));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(test_dir().join("first-signed.pdf")));
+        cx.run_until_parked();
+        other.read_with(cx, |e, _| {
+            assert_eq!(e.settings.date_format, "%Y-%m-%d");
+            assert_eq!(e.recents.len(), 1, "the copy saved in the first window is in the second's Recents");
+        });
+        editor.update(cx, |e, cx| e.toggle_left_sidebar(cx));
+        other.read_with(cx, |e, _| assert!(e.settings.show_left_sidebar, "but each window has its own sidebars"));
+
+        // A window with nothing in it takes the next document...
+        other_window.update(cx, |_, window, cx| other.update(cx, |e, cx| e.close_document(window, cx))).unwrap();
+        editor.update_in(cx, |e, window, cx| e.request_open(Some(third.clone()), window, cx));
+        cx.run_until_parked();
+        assert_eq!(others(cx).len(), 1);
+        other.read_with(cx, |e, _| assert_eq!(e.doc.as_ref().unwrap().path, third));
+
+        // Closing a window with unsaved changes asks first.
+        other.update(cx, |e, cx| e.add_item(0, 40., 40., 80., 20., ItemKind::Check, cx));
+        let mut other_cx = VisualTestContext::from_window(other_window, cx);
+        assert!(!other_cx.simulate_close(), "not closed until the answer is to discard");
+        other_cx.run_until_parked();
+        other_cx.simulate_prompt_answer("Cancel");
+        other_cx.run_until_parked();
+        assert_eq!(others(cx).len(), 1);
+        assert!(!other_cx.simulate_close());
+        other_cx.run_until_parked();
+        other_cx.simulate_prompt_answer("Discard");
+        other_cx.run_until_parked();
+        assert!(others(cx).is_empty());
+
+        // A window with nothing in it closes when asked to go back, unless it is the last.
+        cx.update(|_, cx| open_editor(cx, None)).unwrap();
+        let (empty_window, empty) = others(cx).pop().unwrap();
+        empty_window.update(cx, |_, window, cx| empty.update(cx, |e, cx| e.request_close(window, cx))).unwrap();
+        cx.run_until_parked();
+        assert!(others(cx).is_empty());
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        editor.update_in(cx, |e, window, cx| e.request_close(window, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
     fn protected_pdfs_ask_for_their_password(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
         let dir = test_dir();
         let path = dir.join("protected.pdf");
         std::fs::write(&path, crate::pdf::tests::encrypted(&crate::pdf::tests::sample_pdf(), "sesame", "owner")).unwrap();
 
-        editor.update_in(cx, |e, window, cx| e.request_open(Some(path.clone()), window, cx));
+        editor.update_in(cx, |e, window, cx| e.open_path(path.clone(), window, cx));
         cx.run_until_parked();
         editor.read_with(cx, |e, _| {
             assert!(e.password_prompt.is_some(), "asks for the password");
@@ -5703,7 +7079,7 @@ mod tests {
         };
 
         // A new password, typed twice. A repeat that doesn't match starts over.
-        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
         cx.run_until_parked();
         assert!(cx.has_pending_prompt());
         cx.simulate_prompt_answer("Change Password…");
@@ -5715,7 +7091,7 @@ mod tests {
         editor.read_with(cx, |e, _| {
             let prompt = e.password_prompt.as_ref().expect("still asking");
             assert!(prompt.wrong);
-            assert!(prompt.purpose == PasswordPurpose::NewPassword { first: None });
+            assert!(prompt.purpose == PasswordPurpose::NewPassword { first: None, to: SaveTo::File });
         });
         cx.simulate_input("new-1");
         cx.simulate_keystrokes("enter");
@@ -5733,7 +7109,7 @@ mod tests {
         assert!(!thumbnail(&editor, cx), "no picture of a protected document");
 
         // No password at all.
-        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
         cx.run_until_parked();
         cx.simulate_prompt_answer("Remove Password");
         let open = dir.join("protected-removed.pdf");
@@ -5743,13 +7119,36 @@ mod tests {
         assert!(thumbnail(&editor, cx), "a copy without a password gets its thumbnail");
 
         // The same password as the original.
-        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
         cx.run_until_parked();
         cx.simulate_prompt_answer("Keep Password");
         let kept = dir.join("protected-kept.pdf");
         save_as(cx, kept.clone());
         assert_eq!(opens(&kept, Some("sesame")), Ok(()));
         assert!(!thumbnail(&editor, cx));
+
+        // A copy for the clipboard is protected in the same ways. It is not a
+        // save: Recents couldn't bring the work back.
+        editor.update(cx, |e, _| e.mark_dirty());
+        cx.simulate_keystrokes("secondary-shift-c");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Keep Password");
+        cx.run_until_parked();
+        let copy = clipboard::last_put().expect("a copy on the clipboard");
+        assert_eq!(opens(&copy, None).unwrap_err(), "this PDF is password protected");
+        assert_eq!(opens(&copy, Some("sesame")), Ok(()));
+        editor.read_with(cx, |e, _| assert!(e.dirty && e.status.contains("to the clipboard"), "{}", e.status));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::Clipboard, window, cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Change Password…");
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.simulate_input("new-2");
+            cx.simulate_keystrokes("enter");
+        }
+        cx.run_until_parked();
+        assert_eq!(opens(&clipboard::last_put().unwrap(), Some("new-2")), Ok(()));
+        editor.read_with(cx, |e, _| assert!(e.status.contains("with the new password to the clipboard"), "{}", e.status));
     }
 
     #[gpui::test]
@@ -5922,6 +7321,63 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn the_pages_kept_drawn_fit_the_budget() {
+        // Ten pages that take 40,000 bytes each at 100%.
+        let sizes = vec![(100., 100.); 10];
+        assert_eq!(pages_in_budget(&sizes, 4, 1., 5 * 40_000), vec![4, 3, 5, 2, 6], "the nearest, nearest first");
+        assert_eq!(pages_in_budget(&sizes, 4, 2., 5 * 40_000), vec![4, 3, 5], "fewer at a larger scale, but never under three");
+        assert_eq!(pages_in_budget(&sizes, 9, 1., 0), vec![9, 8, 7]);
+        assert_eq!(pages_in_budget(&sizes, 0, 1., usize::MAX).len(), 10);
+        assert!(pages_in_budget(&[], 0, 1., 0).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_long_document_keeps_the_pages_around_the_view_drawn(cx: &mut TestAppContext) {
+        const PAGES: usize = 12;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-budget.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        // Room for no more than the least: three pages.
+        editor.update_in(cx, |e, window, cx| {
+            e.render_budget = 0;
+            e.open_path(path, window, cx);
+        });
+        cx.run_until_parked();
+        let drawn = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| {
+                let doc = e.doc.as_ref().unwrap();
+                doc.order.iter().enumerate().filter(|&(_, &i)| doc.pages[i].image.is_some()).map(|(position, _)| position).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(drawn(&editor, cx), vec![0, 1, 2]);
+
+        // They follow the view, the others giving up their bitmaps...
+        editor.update(cx, |e, cx| e.scroll_to_page(8, cx));
+        cx.run_until_parked();
+        assert_eq!(drawn(&editor, cx), vec![7, 8, 9]);
+        // ...and the pages, as they go and come back.
+        editor.update(cx, |e, cx| e.delete_page(8, cx));
+        cx.run_until_parked();
+        assert_eq!(drawn(&editor, cx).len(), 3);
+        cx.simulate_keystrokes("secondary-z");
+        cx.run_until_parked();
+        assert_eq!(drawn(&editor, cx).len(), 3);
+        editor.read_with(cx, |e, _| {
+            let (doc, current) = (e.doc.as_ref().unwrap(), e.current_page().unwrap());
+            assert!(doc.pages[doc.order[current]].image.is_some(), "the page in view is drawn");
+        });
+
+        // With room for all of them, all are drawn.
+        editor.update_in(cx, |e, window, cx| {
+            e.render_budget = RENDER_BUDGET;
+            e.ensure_rendered(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(drawn(&editor, cx).len(), PAGES);
+        editor.read_with(cx, |e, _| assert!(e.drawn_around.is_none()));
+    }
+
     #[gpui::test]
     fn only_pages_near_the_viewport_are_drawn(cx: &mut TestAppContext) {
         const PAGES: usize = 40;
@@ -6078,7 +7534,7 @@ mod tests {
         // Something on the added page, then save.
         editor.update(cx, |e, cx| e.place_tool(Tool::Check, 0, 100., 100., cx));
         let out = test_dir().join(format!("merged-{}", file_name(&original)));
-        editor.update_in(cx, |e, window, cx| e.save(window, cx));
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
         cx.run_until_parked();
         cx.simulate_new_path_selection({
             let out = out.clone();

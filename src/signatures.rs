@@ -33,10 +33,10 @@ pub fn app_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PATRAPDF_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // The home directory, from the system's own records if the environment
+    // doesn't say (a shared temporary directory is no place for this).
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_else(std::env::temp_dir);
     let base = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
@@ -49,6 +49,18 @@ pub fn app_data_dir() -> PathBuf {
             .unwrap_or_else(|| home.join(".local/share"))
     };
     base.join("patrapdf")
+}
+
+/// Keep the data directory for the user alone: it holds what was typed into
+/// documents, signatures, and updates waiting to be installed.
+pub fn secure_data_dir() {
+    let dir = app_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
 }
 
 /// Tests must never touch the user's real library or recents. Each test

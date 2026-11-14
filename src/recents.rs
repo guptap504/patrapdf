@@ -57,6 +57,14 @@ pub struct RecentEntry {
     pub imports: Vec<PageImport>,
 }
 
+impl RecentEntry {
+    /// The copy last saved to a file, if one was: a copy can go to the
+    /// clipboard instead, and then `output` is just the original.
+    pub fn saved_copy(&self) -> Option<&Path> {
+        Some(self.output.as_path()).filter(|output| *output != self.original)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedItem {
     pub page: usize,
@@ -78,6 +86,9 @@ pub enum SavedKind {
         #[serde(default)]
         fill: RedactFill,
     },
+    Highlight { color: u32 },
+    Outline { oval: bool, color: u32, width: f32 },
+    Stroke { points: Vec<[f32; 2]>, color: u32, width: f32, arrow: bool },
 }
 
 /// A rendered first-page thumbnail, ready to be written to disk.
@@ -192,6 +203,11 @@ pub fn record(
                 },
                 ItemKind::Check => SavedKind::Check,
                 ItemKind::Redact { fill } => SavedKind::Redact { fill: *fill },
+                ItemKind::Highlight { color } => SavedKind::Highlight { color: *color },
+                ItemKind::Outline { oval, color, width } => SavedKind::Outline { oval: *oval, color: *color, width: *width },
+                ItemKind::Stroke { points, color, width, arrow } => {
+                    SavedKind::Stroke { points: points.to_vec(), color: *color, width: *width, arrow: *arrow }
+                }
             };
             Some(SavedItem {
                 page: item.page,
@@ -296,6 +312,11 @@ pub fn restore_items(entry: &RecentEntry, page_count: usize, mut next_id: impl F
                 }
                 SavedKind::Check => ItemKind::Check,
                 SavedKind::Redact { fill } => ItemKind::Redact { fill: *fill },
+                SavedKind::Highlight { color } => ItemKind::Highlight { color: *color },
+                SavedKind::Outline { oval, color, width } => ItemKind::Outline { oval: *oval, color: *color, width: *width },
+                SavedKind::Stroke { points, color, width, arrow } => {
+                    ItemKind::Stroke { points: points.as_slice().into(), color: *color, width: *width, arrow: *arrow }
+                }
             };
             Some(Item {
                 id: next_id(),
@@ -354,6 +375,17 @@ mod tests {
             Item { id: 2, page: 1, x: 30., y: 40., w: 80., h: 40., kind: ItemKind::Image { sig } },
             Item { id: 3, page: 5, x: 1., y: 1., w: 9., h: 9., kind: ItemKind::Check },
             Item { id: 4, page: 0, x: 5., y: 5., w: 90., h: 12., kind: ItemKind::Redact { fill: RedactFill::White } },
+            Item { id: 5, page: 0, x: 5., y: 30., w: 90., h: 12., kind: ItemKind::Highlight { color: 0x8ce99a } },
+            Item { id: 6, page: 0, x: 5., y: 50., w: 90., h: 40., kind: ItemKind::Outline { oval: true, color: 0xe5484d, width: 3. } },
+            Item {
+                id: 7,
+                page: 1,
+                x: 5.,
+                y: 5.,
+                w: 60.,
+                h: 20.,
+                kind: ItemKind::Stroke { points: [[0., 1.], [0.5, 0.], [1., 1.]].as_slice().into(), color: 0x1e4fd6, width: 1.5, arrow: true },
+            },
         ];
         let watermark = Watermark { text: "COPY".into(), ..Watermark::default() };
         let thumb = make_thumbnail(pdf::tests::sample_pdf()).expect("thumbnail");
@@ -379,7 +411,10 @@ mod tests {
             n
         });
         // The item on page 5 no longer fits a 2-page document.
-        assert_eq!(restored.len(), 3);
+        assert_eq!(restored.len(), 6);
+        assert!(matches!(restored[3].kind, ItemKind::Highlight { color: 0x8ce99a }));
+        assert!(matches!(restored[4].kind, ItemKind::Outline { oval: true, color: 0xe5484d, width } if width == 3.));
+        assert!(matches!(&restored[5].kind, ItemKind::Stroke { points, arrow: true, .. } if **points == [[0., 1.], [0.5, 0.], [1., 1.]]));
         assert!(matches!(&restored[0].kind, ItemKind::Text { text, .. } if text == "Hi"));
         assert!(matches!(&restored[1].kind, ItemKind::Image { .. }));
         assert!(matches!(restored[2].kind, ItemKind::Redact { fill: RedactFill::White }));

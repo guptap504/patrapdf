@@ -11,10 +11,16 @@ tools="$root/target/appimage-tools"
 mkdir -p "$tools" "$out"
 out=$(cd "$out" && pwd)
 
-linuxdeploy="$tools/linuxdeploy-x86_64.AppImage"
+# A tagged release of linuxdeploy, checked against its checksum: what it puts
+# in the AppImage is signed and installed by the updater like the rest of it.
+linuxdeploy_version=1-alpha-20251107-1
+linuxdeploy_sha256=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+linuxdeploy="$tools/linuxdeploy-$linuxdeploy_version-x86_64.AppImage"
 if [ ! -x "$linuxdeploy" ]; then
-  curl -fsSL -o "$linuxdeploy" \
-    https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+  curl -fsSL -o "$linuxdeploy.part" \
+    "https://github.com/linuxdeploy/linuxdeploy/releases/download/$linuxdeploy_version/linuxdeploy-x86_64.AppImage"
+  echo "$linuxdeploy_sha256  $linuxdeploy.part" | sha256sum -c -
+  mv "$linuxdeploy.part" "$linuxdeploy"
   chmod +x "$linuxdeploy"
 fi
 

@@ -1,6 +1,6 @@
 [package]
 name = "patrapdf"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fill in, sign, redact and watermark PDFs on your own computer."
@@ -32,17 +32,25 @@ rustybuzz = "0.20"
 subsetter = "0.2.6"
 unicode-bidi = "0.3"
 getrandom = "0.3"
+arboard = { version = "3.7.0", default-features = false }
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 
-# Trackpad pinch-to-zoom: GPUI already uses objc 0.2, so this adds no new crate.
+# Trackpad pinch-to-zoom, sent to the window it was made over. GPUI already uses
+# objc 0.2 and raw-window-handle 0.6, so these add no new crate.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
+raw-window-handle = "0.6"
 
 # Windows: icon and version info in the .exe (see build.rs).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.20"
+
+# Debug builds: the app's own code stays quick to rebuild, but what it is built
+# on is optimised. Unoptimised, the PDF renderer takes most of a second a page.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

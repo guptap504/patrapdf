@@ -276,8 +276,22 @@ pub fn render_first_page(bytes: Vec<u8>, width_px: f32) -> Option<RenderedPage> 
     render_page(&pdf, 0, width_px / width.max(1.))
 }
 
+/// The most pixels a page is drawn with (they take four bytes each), and the
+/// most along either side. A page too large for its scale is drawn at a
+/// smaller one: a file can declare a page of any size.
+pub const MAX_PAGE_PIXELS: f32 = 48e6;
+const MAX_PAGE_SIDE: f32 = 32000.;
+
+/// The scale a `width` × `height` point page is drawn at when `scale` is asked for.
+pub fn render_scale(width: f32, height: f32, scale: f32) -> f32 {
+    let (width, height) = (width.max(1.), height.max(1.));
+    scale.min((MAX_PAGE_PIXELS / (width * height)).sqrt()).min(MAX_PAGE_SIDE / width.max(height))
+}
+
 fn render<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, index: usize, scale: f32, transparent: bool) -> Option<RenderedPage> {
     let page = pdf.pages().get(index)?;
+    let (width, height) = page.render_dimensions();
+    let scale = render_scale(width, height, scale);
     let pixmap = hayro::render(
         page,
         cache,
@@ -347,6 +361,8 @@ pub fn render_watermark(width: f32, height: f32, watermark: &Watermark, scale: f
 const HELV: &str = "PatraPDFHelv";
 const HELV_BOLD: &str = "PatraPDFHelvBold";
 const WM_GS: &str = "PatraPDFWmGS";
+/// The graphics state highlights are drawn with: like ink, they darken what is under them.
+const HIGHLIGHT_GS: &str = "PatraPDFHlGS";
 const PAGE_IMAGE: &str = "PatraPDFPage";
 /// Resolution of redacted pages, which are rebuilt as images: 3 × 72 = 216 dpi.
 const REDACT_SCALE: f32 = 3.0;
@@ -447,6 +463,7 @@ fn write_overlays(
     fill_form(doc, filled, metrics, &mut fonts)?;
     let watermark = watermark.map(|w| (w, watermark_state(doc, w)));
     let mut images: HashMap<PathBuf, (ObjectId, String)> = HashMap::new();
+    let mut highlight_state: Option<ObjectId> = None;
 
     for (page_index, (&page_id, geom)) in page_ids.iter().zip(pages).enumerate() {
         let page_items: Vec<&Item> = items.iter().filter(|i| i.page == page_index).collect();
@@ -504,6 +521,35 @@ fn write_overlays(
                 }
                 // Applied afterwards by `redact`, on top of everything else.
                 ItemKind::Redact { .. } => {}
+                // Annotations are drawn in view space (y down), which `v` takes to the page's.
+                ItemKind::Highlight { color } => {
+                    let state = *highlight_state.get_or_insert_with(|| doc.add_object(dictionary! { "Type" => "ExtGState", "BM" => "Multiply" }));
+                    PageResources::add(&mut resources.states, HIGHLIGHT_GS, state);
+                    let area = [item.x, item.y, item.w, item.h].map(|n| num(n as f64)).join(" ");
+                    ops.push_str(&format!("q {} cm /{HIGHLIGHT_GS} gs {} rg {area} re f Q\n", fmt_m(v), rgb(*color)));
+                }
+                ItemKind::Outline { oval, color, width } => {
+                    // The line's outer edge runs along the box.
+                    let inset = (width / 2.).min(item.w / 2.).min(item.h / 2.);
+                    let [x, y, w, h] = [item.x + inset, item.y + inset, item.w - 2. * inset, item.h - 2. * inset].map(f64::from);
+                    let outline = if *oval { oval_ops(x, y, w, h) } else { format!("{} {} {} {} re", num(x), num(y), num(w), num(h)) };
+                    ops.push_str(&format!("q {} cm {} RG {} w {outline} S Q\n", fmt_m(v), rgb(*color), num(*width as f64)));
+                }
+                ItemKind::Stroke { color, width, arrow, .. } => {
+                    let points = item.stroke_points();
+                    let [.., from, to] = points.as_slice() else { continue };
+                    let trace = |points: &[(f32, f32)]| -> String {
+                        let ops = points.iter().enumerate().map(|(i, p)| format!("{} {} {} ", num(p.0 as f64), num(p.1 as f64), if i == 0 { "m" } else { "l" }));
+                        ops.collect::<String>() + "S "
+                    };
+                    let mut lines = trace(&points);
+                    if *arrow {
+                        let [left, right] = crate::model::arrow_barbs(*from, *to, *width, 1.);
+                        lines.push_str(&trace(&[left, *to, right]));
+                    }
+                    // Round ends and corners, as a pen leaves.
+                    ops.push_str(&format!("q {} cm {} RG {} w 1 J 1 j {lines}Q\n", fmt_m(v), rgb(*color), num(*width as f64)));
+                }
             }
         }
 
@@ -784,6 +830,13 @@ fn append_pages(doc: &mut Document, source: &Document, pages: &[usize]) -> Resul
                 }
             }
             page.remove(b"StructParents");
+        }
+        // A form field's widget comes as it looks. The field it belongs to
+        // stays behind: it holds the values of all its widgets, on other pages too.
+        if let Object::Dictionary(annotation) = &mut object {
+            if annotation.get(b"Subtype").and_then(Object::as_name).is_ok_and(|subtype| subtype == b"Widget") {
+                annotation.remove(b"Parent");
+            }
         }
         copier.rewrite(&mut object, doc);
         if let (true, Object::Dictionary(page)) = (is_page, &mut object) {
@@ -1254,6 +1307,25 @@ fn appearance_frame(widget: &Widget) -> (Dictionary, String) {
     (dict, ops)
 }
 
+/// `0xRRGGBB` as the operands of a colour operator.
+fn rgb(value: u32) -> String {
+    color([16, 8, 0].map(|shift| ((value >> shift) & 0xff) as f32 / 255.))
+}
+
+/// The path of the oval that fills a box, from four Bézier curves.
+fn oval_ops(x: f64, y: f64, w: f64, h: f64) -> String {
+    let (rx, ry) = (w / 2., h / 2.);
+    let (cx, cy, kx, ky) = (x + rx, y + ry, rx * 0.5523, ry * 0.5523);
+    let curves = [
+        [cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry],
+        [cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy],
+        [cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry],
+        [cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy],
+    ];
+    let curves: String = curves.iter().map(|curve| curve.map(num).join(" ") + " c ").collect();
+    format!("{} {} m {curves}h", num(cx + rx), num(cy))
+}
+
 fn color([r, g, b]: [f32; 3]) -> String {
     format!("{} {} {}", num(r as f64), num(g as f64), num(b as f64))
 }
@@ -1327,17 +1399,8 @@ fn mark_ops(mark: &forms::Mark, (x0, y0): (f32, f32), d: f32) -> String {
         }
         forms::Mark::Polygon(points) => trace(points) + "h f\n",
         forms::Mark::Disc(r) => {
-            // A circle from four Bézier curves.
             let (cx, cy, r) = ((x0 + d / 2.) as f64, (y0 + d / 2.) as f64, (r * d) as f64);
-            let k = r * 0.5523;
-            format!(
-                "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c f\n",
-                num(cx + r), num(cy),
-                num(cx + r), num(cy + k), num(cx + k), num(cy + r), num(cx), num(cy + r),
-                num(cx - k), num(cy + r), num(cx - r), num(cy + k), num(cx - r), num(cy),
-                num(cx - r), num(cy - k), num(cx - k), num(cy - r), num(cx), num(cy - r),
-                num(cx + k), num(cy - r), num(cx + r), num(cy - k), num(cx + r), num(cy),
-            )
+            oval_ops(cx - r, cy - r, 2. * r, 2. * r) + " f\n"
         }
     }
 }
@@ -1455,36 +1518,55 @@ fn strip_document_text(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
     strip_form_fields(doc, removed_annots);
 }
 
-/// Drop form fields that are (or whose widgets all are) among `removed_annots`.
+/// Drop form fields that are (or whose widgets all are) among `removed_annots`,
+/// and the form's other records of what fields hold: the XFA form (a second
+/// copy of every value) and the calculation order (which refers to fields).
 fn strip_form_fields(doc: &mut Document, removed_annots: &HashSet<ObjectId>) {
-    let Some(Ok(Object::Array(fields))) = acroform_mut(doc).map(|form| form.get(b"Fields").cloned()) else { return };
-    let kept: Vec<Object> = fields.into_iter().filter(|f| keep_field(doc, f, removed_annots, 0)).collect();
+    let Some(form) = acroform_mut(doc) else { return };
+    form.remove(b"XFA");
+    form.remove(b"CO");
+    let Some(fields) = form.get(b"Fields").ok().cloned().and_then(|fields| array_of(doc, &fields)) else { return };
+    let mut decided = HashMap::new();
+    let kept: Vec<Object> = fields.into_iter().filter(|f| keep_field(doc, f, removed_annots, &mut decided, 0)).collect();
     if let Some(form) = acroform_mut(doc) {
         form.set("Fields", kept);
     }
 }
 
+/// The array `object` is, or refers to.
+fn array_of(doc: &Document, object: &Object) -> Option<Vec<Object>> {
+    match doc.dereference(object).ok()?.1 {
+        Object::Array(items) => Some(items.clone()),
+        _ => None,
+    }
+}
+
 /// Whether a form field survives redaction: not if it is (or all of its
 /// widgets are) on a redacted page. Prunes removed kids from `/Kids`.
-fn keep_field(doc: &mut Document, field: &Object, removed: &HashSet<ObjectId>, depth: usize) -> bool {
+///
+/// `decided` holds the answer for each field looked at: a damaged (or crafted)
+/// file can list one under many parents, and it is looked at once.
+fn keep_field(doc: &mut Document, field: &Object, removed: &HashSet<ObjectId>, decided: &mut HashMap<ObjectId, bool>, depth: usize) -> bool {
     let Ok(id) = field.as_reference() else { return true };
     if removed.contains(&id) {
         return false;
     }
+    if let Some(&keep) = decided.get(&id) {
+        return keep;
+    }
+    decided.insert(id, true);
     if depth > 32 {
         return true;
     }
-    let Ok(Object::Array(kids)) = doc.get_dictionary(id).and_then(|d| d.get(b"Kids")).cloned() else {
-        return true;
-    };
-    let kept: Vec<Object> = kids.into_iter().filter(|k| keep_field(doc, k, removed, depth + 1)).collect();
-    if kept.is_empty() {
-        return false;
-    }
-    if let Ok(dict) = doc.get_dictionary_mut(id) {
+    let kids = doc.get_dictionary(id).ok().and_then(|d| d.get(b"Kids").ok().cloned()).and_then(|kids| array_of(doc, &kids));
+    let Some(kids) = kids.filter(|kids| !kids.is_empty()) else { return true };
+    let kept: Vec<Object> = kids.into_iter().filter(|k| keep_field(doc, k, removed, decided, depth + 1)).collect();
+    let keep = !kept.is_empty();
+    if let (true, Ok(dict)) = (keep, doc.get_dictionary_mut(id)) {
         dict.set("Kids", kept);
     }
-    true
+    decided.insert(id, keep);
+    keep
 }
 
 #[cfg(test)]
@@ -1621,6 +1703,171 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         doc.save_to(&mut out).unwrap();
         out
+    }
+
+    /// The sample with a form laid out the roundabout ways a file may: a
+    /// field with a widget on each page (through arrays that are objects of
+    /// their own), an XFA copy of its value, and a calculation order.
+    fn sample_with_indirect_form() -> Vec<u8> {
+        let mut doc = Document::load_mem(&sample_pdf()).unwrap();
+        let pages = doc.get_pages();
+        let field = doc.new_object_id();
+        let mut widgets = Vec::new();
+        for page in [pages[&1], pages[&2]] {
+            let widget = doc.add_object(dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Widget",
+                "Parent" => field,
+                "Rect" => vec![300.into(), 600.into(), 500.into(), 620.into()],
+                "P" => page,
+            });
+            doc.get_dictionary_mut(page).unwrap().set("Annots", vec![widget.into()]);
+            widgets.push(Object::Reference(widget));
+        }
+        let kids = doc.add_object(Object::Array(widgets));
+        let value = Object::string_literal("secret-field-value");
+        doc.objects.insert(field, dictionary! { "FT" => "Tx", "T" => Object::string_literal("ssn"), "V" => value, "Kids" => kids }.into());
+        let fields = doc.add_object(Object::Array(vec![field.into()]));
+        let xfa = doc.add_object(Stream::new(dictionary! {}, b"<data><ssn>secret-xfa-value</ssn></data>".to_vec()));
+        let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let form = dictionary! { "Fields" => fields, "XFA" => xfa, "CO" => vec![field.into()] };
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", form);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn removed_fields_leave_nothing_behind_however_the_form_lists_them() {
+        let bytes = sample_with_indirect_form();
+        assert!(all_text(&bytes).contains("secret-field-value") && all_text(&bytes).contains("secret-xfa-value"));
+        let loaded = load(bytes.clone()).unwrap();
+        let gone = |out: &[u8]| !all_text(out).contains("secret-field-value") && !all_text(out).contains("secret-xfa-value");
+
+        // The field has a widget on each page: redacting one page leaves it its other widget...
+        let redaction = |page| Item { id: 1, page, x: 290., y: 160., w: 220., h: 40., kind: ItemKind::Redact { fill: RedactFill::Black } };
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[redaction(0)], None, TextMetrics::default()).unwrap();
+        assert!(all_text(&out).contains("secret-field-value"), "the field is still on page 2");
+        assert!(!all_text(&out).contains("secret-xfa-value"), "but the form's second copy of every value is gone");
+        // ...and redacting both, or deleting both pages it is on, removes it.
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[redaction(0), redaction(1)], None, TextMetrics::default()).unwrap();
+        assert!(gone(&out));
+        let other = load(sample_pdf()).unwrap();
+        let merged = loaded.with_pages(&[(&other, &[0])]).unwrap();
+        let out = write(&merged.bytes, &merged.pages, &[2], &[], None, TextMetrics::default()).unwrap();
+        assert!(gone(&out));
+        assert_eq!(load(out).unwrap().pages.len(), 1);
+
+        // A page added from this file looks the same, without the field's values behind it.
+        let merged = other.with_pages(&[(&loaded, &[1])]).unwrap();
+        assert_eq!(merged.pages.len(), 3);
+        assert!(!all_text(&merged.bytes).contains("secret-field-value"));
+    }
+
+    #[test]
+    fn a_form_that_lists_fields_many_times_over_still_opens() {
+        // Each field has the next one as both of its kids: followed blindly, that is 2^40 visits.
+        let mut doc = Document::load_mem(&sample_pdf()).unwrap();
+        let page1 = doc.get_pages()[&1];
+        let ids: Vec<ObjectId> = (0..40).map(|_| doc.new_object_id()).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            let mut field = dictionary! { "T" => Object::string_literal(format!("f{i}")) };
+            match ids.get(i + 1) {
+                Some(&next) => field.set("Kids", vec![next.into(), next.into()]),
+                None => {
+                    field.set("FT", "Tx");
+                    field.set("Subtype", "Widget");
+                    field.set("Rect", vec![300.into(), 600.into(), 500.into(), 620.into()]);
+                }
+            }
+            doc.objects.insert(id, field.into());
+        }
+        doc.get_dictionary_mut(page1).unwrap().set("Annots", vec![ids[39].into()]);
+        let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", dictionary! { "Fields" => vec![ids[0].into()] });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let loaded = load(bytes.clone()).unwrap();
+        let redaction = Item { id: 1, page: 0, x: 60., y: 60., w: 300., h: 90., kind: ItemKind::Redact { fill: RedactFill::Black } };
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[redaction], None, TextMetrics::default()).unwrap();
+        assert_eq!(load(out).unwrap().pages.len(), 2);
+    }
+
+    #[test]
+    fn a_page_is_never_drawn_with_more_pixels_than_the_limit() {
+        assert_eq!(render_scale(612., 792., 6.), 6., "ordinary pages are drawn as asked");
+        // A page the file says is 70 metres square, and one 70 metres long.
+        let scale = render_scale(200000., 200000., 2.);
+        assert!((200000. * scale).powi(2) <= MAX_PAGE_PIXELS * 1.01, "{scale}");
+        let mut doc = Document::load_mem(&sample_pdf()).unwrap();
+        let page1 = doc.get_pages()[&1];
+        doc.get_dictionary_mut(page1).unwrap().set("MediaBox", vec![0.into(), 0.into(), 200000.into(), 2000.into()]);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let loaded = load(bytes.clone()).unwrap();
+        let page = render_page(&loaded.pdf, 0, 2.).unwrap();
+        assert!(page.width as f32 <= MAX_PAGE_SIDE + 1. && page.width > 30000, "{} x {}", page.width, page.height);
+        assert_eq!(page.bgra.len(), (page.width * page.height * 4) as usize);
+        // A redaction still lands where it was drawn: the top half goes black, the rest stays white.
+        let redaction = Item { id: 1, page: 0, x: 0., y: 0., w: 200000., h: 1000., kind: ItemKind::Redact { fill: RedactFill::Black } };
+        let out = write(&bytes, &loaded.pages, &[0, 1], &[redaction], None, TextMetrics::default()).unwrap();
+        let page = render_page(&load(out).unwrap().pdf, 0, 1.).unwrap();
+        let level = |x: u32, y: u32| page.bgra[((y * page.width + x) * 4) as usize];
+        assert_eq!((level(page.width / 2, page.height / 4), level(page.width / 2, page.height * 3 / 4)), (0, 255));
+    }
+
+    #[test]
+    fn annotations_are_drawn_into_the_page() {
+        let bytes = sample_pdf();
+        let loaded = load(bytes.clone()).unwrap();
+        let stroke = |points: &[[f32; 2]], arrow| ItemKind::Stroke { points: points.into(), color: 0x1e4fd6, width: 4., arrow };
+        let items = [
+            // Over "Page 1 - Name:", which is set in 24pt from x = 72 on the baseline at y = 92.
+            Item { id: 1, page: 0, x: 70., y: 70., w: 180., h: 28., kind: ItemKind::Highlight { color: 0xffe14d } },
+            Item { id: 2, page: 0, x: 100., y: 200., w: 200., h: 100., kind: ItemKind::Outline { oval: false, color: 0xe5484d, width: 4. } },
+            Item { id: 3, page: 0, x: 100., y: 350., w: 200., h: 100., kind: ItemKind::Outline { oval: true, color: 0x2b9a66, width: 4. } },
+            Item { id: 4, page: 0, x: 100., y: 500., w: 200., h: 100., kind: stroke(&[[0., 0.], [0.5, 1.], [1., 0.]], false) },
+            Item { id: 5, page: 0, x: 350., y: 500., w: 200., h: 8., kind: stroke(&[[0., 0.5], [1., 0.5]], true) },
+        ];
+        let out = write(&bytes, &loaded.pages, &[0, 1], &items, None, TextMetrics::default()).unwrap();
+        let reloaded = load(out).unwrap();
+        let page = render_page(&reloaded.pdf, 0, 1.0).unwrap();
+        // Whether the pixel at (x, y) is `0xRRGGBB`, give or take rounding.
+        let is = |x: u32, y: u32, color: u32| {
+            let i = ((y * page.width + x) * 4) as usize;
+            [16, 8, 0].iter().zip([2, 1, 0]).all(|(shift, channel)| page.bgra[i + channel].abs_diff((color >> shift) as u8) <= 2)
+        };
+        let (white, red, green, blue) = (0xffffff, 0xe5484d, 0x2b9a66, 0x1e4fd6);
+
+        // A highlight colours the paper and leaves the text under it dark, like ink.
+        assert!(is(245, 75, 0xffe14d), "the paper takes the highlight's colour");
+        assert!((72..200).any(|x| (74..96).any(|y| is(x, y, 0x000000))), "the text under it is still black");
+        assert!(is(260, 75, white), "and it ends at its box");
+
+        // Outlines are drawn inside their boxes.
+        assert!(is(102, 250, red) && is(298, 250, red) && is(200, 202, red) && is(200, 298, red), "the four sides");
+        assert!(is(200, 250, white) && is(98, 250, white), "nothing inside or outside");
+        assert!(is(102, 400, green) && is(200, 352, green) && is(298, 400, green), "the oval touches its box's sides");
+        assert!(is(104, 354, white), "but not its corners");
+
+        // A stroke runs through its points, in order.
+        assert!(is(150, 550, blue) && is(200, 598, blue) && is(250, 550, blue), "down to the middle and up again");
+        assert!(is(200, 520, white));
+        // An arrow: its line, and the two barbs back from its tip.
+        assert!(is(450, 504, blue), "the line");
+        assert!(is(541, 499, blue) && is(541, 509, blue), "the barbs");
+        assert!(is(520, 512, white));
+
+        // Other pages are left alone, and the file's text is still there to be found.
+        let other = render_page(&reloaded.pdf, 1, 1.0).unwrap();
+        assert_eq!(other.bgra, render_page(&loaded.pdf, 1, 1.0).unwrap().bgra);
+        let mut found = 0;
+        crate::search::read_pages(&reloaded.pdf, [0], |_, text| {
+            found = text.find(&crate::search::fold("page 1 - name")).len();
+            true
+        });
+        assert_eq!(found, 1);
     }
 
     #[test]
