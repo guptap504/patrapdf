@@ -16,6 +16,7 @@ A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in, signing, re
 - **Passwords.** Protected PDFs open with their password. A saved copy can keep it, change it or drop it, and any PDF can be saved with a password (AES-256).
 - **Any language.** Text in scripts other than Latin (Chinese, Japanese, Korean, Arabic, Hebrew, Hindi, Thai and more) is written with a font from your computer, and input methods work for typing it.
 - **Find** a word or phrase in the document (⌘F / Ctrl+F) and step through the matches.
+- **Copy text.** Pick the Select text tool, drag over the document's text (or double-click a word), and copy it (⌘C / Ctrl+C).
 - **Several documents at once**, each in its own window.
 - **Copy the finished PDF to the clipboard** instead of saving it, and paste it straight into an email, a chat or a folder.
 - **Recents.** Saved documents appear in a searchable gallery and reopen with everything you placed still editable.
@@ -38,7 +39,7 @@ On Debian/Ubuntu, install the system libraries first with `packaging/linux/insta
 - Digital signatures, and signature, password, file-picker and button form fields.
 - XFA forms. Their AcroForm fields are filled in where the file has them.
 - Filling in form fields on pages added from another PDF. They're kept as they look.
-- Finding text you added yourself or typed into form fields: find looks through the document's own text.
+- Finding or selecting text you added yourself or typed into form fields, or text in a scan: find and Select text read the document's own text.
 - Emoji and other characters that only colour fonts can draw. Saving reports them.
 
 ## License

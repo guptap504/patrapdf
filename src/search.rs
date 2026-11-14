@@ -1,6 +1,8 @@
-//! Finding text in a document: each page's characters with where they are
-//! drawn (read with hayro's interpreter, which the renderer uses too), and
-//! the places a phrase occurs among them.
+//! The text of a document: each page's characters with where they are drawn
+//! (read with hayro's interpreter, which the renderer uses too), the places a
+//! phrase occurs among them, and the stretch of them between two points.
+
+use std::ops::Range;
 
 use hayro::hayro_interpret::font::{Glyph, GlyphRun};
 use hayro::hayro_interpret::hayro_cmap::BfString;
@@ -20,6 +22,9 @@ const ASCENT: f64 = 780.;
 const DESCENT: f64 = -220.;
 /// Characters further apart than this share of the font size are separate words.
 const WORD_GAP: f64 = 0.2;
+/// Characters further apart than this share of the font size, up or down the
+/// page, are on separate lines.
+const LINE_GAP: f64 = 0.5;
 /// A box larger than this (in points) is a mistake, not a character.
 const MAX_SIZE: f64 = 5000.;
 
@@ -31,7 +36,16 @@ pub struct PageText {
     chars: Vec<char>,
     /// Where each is drawn (`None` for the spaces in between).
     areas: Vec<Option<Area>>,
+    /// Each as the page has it, to copy: in its own case, and with a line
+    /// break where a new line starts. (A character that is two in lower case
+    /// stands at the first, with [`NOTHING`] at the second.)
+    source: Vec<char>,
 }
+
+const NOTHING: char = '\0';
+/// Characters this much further (in points) up or down the page from a point
+/// than the nearest one are still on the line nearest it.
+const SAME_LINE: f32 = 1.;
 
 /// A phrase as it is looked for: in lower case, with single spaces.
 pub fn fold(phrase: &str) -> Vec<char> {
@@ -48,7 +62,7 @@ impl PageText {
         let mut start = 0;
         while start + phrase.len() <= self.chars.len() {
             if self.chars[start..start + phrase.len()] == *phrase {
-                let areas = lines(self.areas[start..start + phrase.len()].iter().flatten());
+                let areas = self.boxes(start..start + phrase.len());
                 if !areas.is_empty() {
                     found.push(areas);
                 }
@@ -61,21 +75,67 @@ impl PageText {
         found
     }
 
+    /// The boxes that cover a stretch of the characters, one per line it runs over.
+    pub fn boxes(&self, range: Range<usize>) -> Vec<Area> {
+        lines(self.areas[self.within(range)].iter().flatten())
+    }
+
+    /// A stretch of the characters as the page has them, to copy.
+    pub fn text(&self, range: Range<usize>) -> String {
+        self.source[self.within(range)].iter().filter(|c| **c != NOTHING).collect::<String>().trim().to_string()
+    }
+
+    /// The place between two characters nearest a point on the page (a count
+    /// of the characters before it), if the page has any text.
+    pub fn caret_at(&self, x: f32, y: f32) -> Option<usize> {
+        // The nearest line first (how far up or down the page a character's
+        // box is), then the nearest character along it.
+        let away = |&[left, top, width, height]: &Area| ((top - y).max(y - top - height).max(0.), (left - x).max(x - left - width).max(0.));
+        let drawn = || self.areas.iter().enumerate().filter_map(|(index, area)| Some((index, area.as_ref()?)));
+        let line = drawn().map(|(_, area)| away(area).0).min_by(f32::total_cmp)?;
+        let on_line = drawn().filter(|(_, area)| away(area).0 <= line + SAME_LINE);
+        let (index, area) = on_line.min_by(|a, b| away(a.1).1.total_cmp(&away(b.1).1))?;
+        // After it, from its middle on.
+        Some(if x > area[0] + area[2] / 2. { index + 1 } else { index })
+    }
+
+    /// The word around a place between characters.
+    pub fn word_at(&self, caret: usize) -> Range<usize> {
+        let caret = caret.min(self.chars.len());
+        let in_word = |index: &usize| self.areas[*index].is_some();
+        let start = (0..caret).rev().take_while(in_word).last().unwrap_or(caret);
+        let end = (caret..self.chars.len()).take_while(in_word).last().map_or(caret, |last| last + 1);
+        start..end
+    }
+
+    fn within(&self, range: Range<usize>) -> Range<usize> {
+        let end = range.end.min(self.chars.len());
+        range.start.min(end)..end
+    }
+
     fn push(&mut self, c: char, area: Option<Area>) {
         if c.is_whitespace() || c.is_control() {
-            self.space();
+            self.space(' ');
             return;
         }
-        for c in c.to_lowercase() {
-            self.chars.push(c);
+        for (i, lower) in c.to_lowercase().enumerate() {
+            self.chars.push(lower);
             self.areas.push(area);
+            self.source.push(if i == 0 { c } else { NOTHING });
         }
     }
 
-    fn space(&mut self) {
-        if self.chars.last().is_some_and(|c| *c != ' ') {
-            self.chars.push(' ');
-            self.areas.push(None);
+    /// Words (`' '`) or lines (`'\n'`) are apart here.
+    fn space(&mut self, between: char) {
+        match self.source.last_mut() {
+            // A new line counts for more than a space.
+            Some(last) if last.is_whitespace() => *last = if between == '\n' { between } else { *last },
+            Some(_) => {
+                self.chars.push(' ');
+                self.areas.push(None);
+                self.source.push(between);
+            }
+            None => {}
         }
     }
 }
@@ -147,8 +207,13 @@ impl<'a> Device<'a> for Reader {
             let to_view = props.transform * glyph.transform();
             let (start, end) = (to_view * Point::new(0., 0.), to_view * Point::new(advance, 0.));
             let size = start.distance(to_view * Point::new(0., 1000.));
-            if self.last.is_some_and(|(last, last_size)| last.distance(start) > WORD_GAP * size.max(last_size)) {
-                self.text.space();
+            if let Some((last, last_size)) = self.last {
+                // Further up or down the page than a line is tall: a new line.
+                if (start.y - last.y).abs() > LINE_GAP * size.max(last_size) {
+                    self.text.space('\n');
+                } else if last.distance(start) > WORD_GAP * size.max(last_size) {
+                    self.text.space(' ');
+                }
             }
             self.last = Some((end, size));
 
@@ -211,6 +276,56 @@ mod tests {
         assert_eq!(text.find(&fold("e")).len(), 2, "every occurrence");
         assert!(text.find(&fold("page 2")).is_empty());
         assert!(text.find(&fold("  ")).is_empty(), "nothing to look for");
+    }
+
+    #[test]
+    fn text_is_picked_out_between_two_points() {
+        // Two lines: "Name: Jane" and "Élan", each character 10 wide and 12 tall.
+        let mut text = PageText::default();
+        let put = |text: &mut PageText, line: &str, top: f32| {
+            for (i, c) in line.chars().enumerate() {
+                text.push(c, Some([100. + 10. * i as f32, top, 10., 12.]));
+            }
+        };
+        put(&mut text, "Name: Jane", 50.);
+        text.space('\n');
+        put(&mut text, "Élan", 70.);
+
+        // A point is taken to the nearest gap between characters, on the nearest line.
+        assert_eq!(text.caret_at(101., 55.), Some(0));
+        assert_eq!(text.caret_at(108., 55.), Some(1), "past the middle of a character is after it");
+        assert_eq!(text.caret_at(20., 40.), Some(0), "off to the left, above");
+        assert_eq!(text.caret_at(500., 58.), Some(10), "off to the right: the end of that line");
+        assert_eq!(text.caret_at(500., 75.), Some(15), "and of the one below");
+        assert_eq!(PageText::default().caret_at(0., 0.), None);
+
+        // What is copied is as the page has it, with its line breaks.
+        assert_eq!(text.text(0..4), "Name");
+        assert_eq!(text.text(6..15), "Jane\nÉlan");
+        assert_eq!(text.text(4..7), ": J");
+        assert_eq!(text.text(12..99), "lan", "no further than the text goes");
+        assert_eq!(text.boxes(6..15), vec![[160., 50., 40., 12.], [100., 70., 40., 12.]]);
+        assert_eq!(text.find(&fold("jane élan")).len(), 1, "a line break is a space to look for");
+
+        // A word reaches from one gap to the next.
+        assert_eq!(text.word_at(2), 0..5);
+        assert_eq!(text.word_at(8), 6..10);
+        assert_eq!(text.word_at(10), 6..10, "at its end");
+        assert_eq!(text.word_at(15), 11..15);
+    }
+
+    #[test]
+    fn lines_of_a_page_are_read_as_lines() {
+        let mut doc = lopdf::Document::load_mem(&crate::pdf::tests::sample_pdf()).unwrap();
+        let page = doc.get_pages()[&1];
+        let content = "BT /F1 24 Tf 72 700 Td (First Line) Tj 0 -30 Td (Second) Tj ET";
+        doc.change_page_content(page, content.as_bytes().to_vec()).unwrap();
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let pdf = Pdf::new(bytes).unwrap_or_else(|_| panic!("the sample doesn't open"));
+        let text = read_page(&pdf, &InterpreterCache::new(), 0);
+        assert_eq!(text.text(0..usize::MAX), "First Line\nSecond");
+        assert_eq!(text.find(&fold("line second")).len(), 1);
     }
 
     #[test]

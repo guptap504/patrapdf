@@ -33,6 +33,7 @@ icons! {
     "chevron-down" => r#"<path d="M7 10l5 5 5-5"/>"#,
     "chevron-up" => r#"<path d="M7 14l5-5 5 5"/>"#,
     "highlight" => r#"<path d="M9.5 14.5l6-8 3 2.3-6 8z"/><path d="M9.5 14.5l-1.7 3.6 4.7-1.3"/><path d="M4.5 20.5h15"/>"#,
+    "select-text" => r#"<path d="M9 4.5c1.7 0 3 .8 3 2.5 0-1.7 1.3-2.5 3-2.5M9 19.5c1.7 0 3-.8 3-2.5 0 1.7 1.3 2.5 3 2.5M12 7v10M9.5 12h5"/>"#,
     "pen" => r#"<path d="M4.5 19.5l1-4.5L16 4.5l3.5 3.5L9 18.5z"/><path d="M13.5 7l3.5 3.5"/>"#,
     "square" => r#"<rect x="5" y="5" width="14" height="14" rx="1.5"/>"#,
     "circle" => r#"<circle cx="12" cy="12" r="7.5"/>"#,

@@ -196,9 +196,17 @@ enum Tool {
     Oval,
     Line,
     Arrow,
+    /// Picks out the document's own text, to copy.
+    SelectText,
 }
 
 impl Tool {
+    /// Whether it stays in hand after it is used on the page (until Esc), and
+    /// is used by dragging: over an item as anywhere else.
+    fn stays(self) -> bool {
+        self.draws() || self == Tool::SelectText
+    }
+
     /// Whether it draws an annotation where it is dragged over the page. Such
     /// a tool stays in hand afterwards, to draw the next.
     fn draws(self) -> bool {
@@ -258,6 +266,7 @@ fn tool_label(tool: Tool) -> (&'static str, &'static str) {
         Tool::Oval => ("circle", "Oval"),
         Tool::Line => ("line", "Line"),
         Tool::Arrow => ("arrow", "Arrow"),
+        Tool::SelectText => ("select-text", "Select text"),
     }
 }
 
@@ -514,6 +523,23 @@ fn parse_page_ranges(text: &str, count: usize) -> Result<Vec<usize>, String> {
     Ok(pages)
 }
 
+/// A stretch of a page's own text picked out with the Select text tool.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TextSelection {
+    /// The page, by original index.
+    source: usize,
+    /// Where the drag began and where it has got to: places between the
+    /// page's characters (see `search::PageText::caret_at`).
+    anchor: usize,
+    head: usize,
+}
+
+impl TextSelection {
+    fn range(&self) -> std::ops::Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
 /// Looking for text in the document (⌘F): the find bar is open.
 #[derive(Default)]
 struct FindBar {
@@ -719,6 +745,10 @@ pub struct Editor {
     render_task: Option<Task<()>>,
     render_budget: usize,
     drawn_around: Option<DrawnAround>,
+    /// Text picked out with the Select text tool, and whether the drag that
+    /// picks it out is under way.
+    text_selection: Option<TextSelection>,
+    selecting_text: bool,
     /// The document being read and parsed, to be shown when that's done.
     open_task: Option<Task<()>>,
     /// Which document that is, until it is shown (or can't be).
@@ -862,6 +892,8 @@ impl Editor {
             render_task: None,
             render_budget: RENDER_BUDGET,
             drawn_around: None,
+            text_selection: None,
+            selecting_text: false,
             open_task: None,
             opening: None,
             fonts_task: None,
@@ -1202,6 +1234,7 @@ impl Editor {
         self.import_prompt = None;
         self.find = None;
         self.text_task = None;
+        (self.text_selection, self.selecting_text) = (None, false);
         self.render_task = None;
         self.thumb_task = None;
     }
@@ -1457,6 +1490,51 @@ impl Editor {
         self.ime_marked = None;
         self.read_text(cx);
         cx.notify();
+    }
+
+    /// Take a tool in hand, or put it down if it is the one in hand.
+    fn take_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.tool = if self.tool == tool { Tool::Select } else { tool };
+        self.text_selection = None;
+        if self.tool == Tool::SelectText {
+            // The pages' text is read for it, as for finding.
+            self.selected = None;
+            self.read_text(cx);
+        }
+        cx.notify();
+    }
+
+    /// The place in a page's text nearest a point in the window, if the page's text has been read.
+    fn text_caret_at(&self, position: usize, at: Point<Pixels>) -> Option<(usize, usize)> {
+        let doc = self.doc.as_ref()?;
+        let source = *doc.order.get(position)?;
+        let origin = self.live_page_bounds(position)?.origin;
+        let (x, y) = ((at.x - origin.x) / px(self.zoom), (at.y - origin.y) / px(self.zoom));
+        Some((source, doc.text.get(source)?.as_ref()?.caret_at(x, y)?))
+    }
+
+    /// The text picked out, if any is.
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.text_selection?;
+        let text = self.doc.as_ref()?.text.get(selection.source)?.as_ref()?.text(selection.range());
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Say how much text is picked out, if any is.
+    fn announce_selected_text(&mut self) -> bool {
+        let Some(text) = self.selected_text() else { return false };
+        self.status = format!("{} selected. Press {} to copy.", count(text.chars().count(), "character"), ui::keys("⌘C")).into();
+        true
+    }
+
+    /// The text picked out on a page (by original index), shown as on any screen.
+    fn render_text_selection(&self, source: usize) -> Vec<gpui::Div> {
+        let Some(selection) = self.text_selection.filter(|selection| selection.source == source) else { return Vec::new() };
+        let Some(text) = self.doc.as_ref().and_then(|doc| doc.text.get(source)?.as_ref()) else { return Vec::new() };
+        let z = self.zoom;
+        let mark = |[x, y, w, h]: search::Area| div().absolute().left(px(x * z)).top(px(y * z)).w(px(w * z)).h(px(h * z)).bg(rgba(0x3b82f659));
+        text.boxes(selection.range()).into_iter().map(mark).collect()
     }
 
     /// The find bar stays open, but typing goes elsewhere.
@@ -2192,6 +2270,13 @@ impl Editor {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
+        // Text picked out of the document itself.
+        if let Some(text) = self.selected_text().filter(|_| self.selected.is_none()) {
+            self.status = format!("Copied {}.", count(text.chars().count(), "character")).into();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            cx.notify();
+            return;
+        }
         let Some(item) = self.selected_item().cloned() else { return };
         // Text fields also go to the system clipboard, so they can be pasted elsewhere.
         if let ItemKind::Text { text, .. } = &item.kind {
@@ -3071,7 +3156,7 @@ impl Editor {
         let Some((page, x, y)) = self.page_at(event.position) else { return };
         match self.tool {
             // Let the press reach the canvas, which starts panning.
-            Tool::Select => self.selected = None,
+            Tool::Select => (self.selected, self.text_selection) = (None, None),
             // Draw a box. Like the other tools, it's one box per use (a sticky tool
             // turns the next "click to deselect" into an unwanted box).
             Tool::Redact => {
@@ -3087,6 +3172,24 @@ impl Editor {
                     moved: false,
                     points: Vec::new(),
                 });
+            }
+            // Text is picked out from where the press is to where it is dragged;
+            // a double click picks out a word.
+            Tool::SelectText => {
+                cx.stop_propagation();
+                self.selected = None;
+                self.text_selection = None;
+                match self.text_caret_at(page, event.position) {
+                    Some((source, caret)) => {
+                        let word = (event.click_count == 2).then(|| self.doc.as_ref()?.text[source].as_ref().map(|text| text.word_at(caret))).flatten();
+                        let (anchor, head) = word.map_or((caret, caret), |word| (word.start, word.end));
+                        self.text_selection = Some(TextSelection { source, anchor, head });
+                        self.selecting_text = event.click_count < 2;
+                        self.announce_selected_text();
+                    }
+                    None if self.reading_text() => self.status = "Still reading this document's text…".into(),
+                    None => self.status = "There is no text on this page to select (a scan is a picture of text).".into(),
+                }
             }
             // Annotations are drawn by dragging too.
             tool if tool.draws() => {
@@ -3158,7 +3261,7 @@ impl Editor {
     /// Create the field for `tool` centred (vertically, for text) on page point (x, y).
     fn place_tool(&mut self, tool: Tool, page: usize, x: f32, y: f32, cx: &mut Context<Self>) {
         match tool {
-            Tool::Select => {}
+            Tool::Select | Tool::SelectText => {}
             Tool::Text | Tool::Date => {
                 let text = if tool == Tool::Date { self.settings.today() } else { String::new() };
                 let fs = self.font_size;
@@ -3248,8 +3351,9 @@ impl Editor {
     }
 
     fn item_mouse_down(&mut self, id: u64, mode: DragMode, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // With a drawing tool in hand, the press goes on to the page: it draws over the item.
-        if self.tool.draws() {
+        // With a tool in hand that is dragged over the page, the press goes on
+        // to the page: it draws, or picks out text, over the item.
+        if self.tool.stays() {
             return;
         }
         cx.stop_propagation();
@@ -3284,6 +3388,19 @@ impl Editor {
                 self.pages_scroll.set_offset(offset);
             } else {
                 self.pan = None;
+            }
+            cx.notify();
+            return;
+        }
+        if self.selecting_text {
+            let position = self.text_selection.and_then(|s| self.doc.as_ref()?.order.iter().position(|&source| source == s.source));
+            match position.and_then(|position| self.text_caret_at(position, event.position)) {
+                Some((_, head)) if event.pressed_button == Some(MouseButton::Left) => {
+                    if let Some(selection) = &mut self.text_selection {
+                        selection.head = head;
+                    }
+                }
+                _ => self.selecting_text = false,
             }
             cx.notify();
             return;
@@ -3370,6 +3487,12 @@ impl Editor {
 
     /// The mouse button was let go: what was being dragged or drawn is settled.
     fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.selecting_text) {
+            if !self.announce_selected_text() {
+                self.text_selection = None;
+            }
+            cx.notify();
+        }
         if let Some(drag) = self.drag.take() {
             let drawn = self.items.iter().find(|i| i.id == drag.id).filter(|i| drag.mode.draws() && !i.is_redaction()).map(|i| (i.w, i.h));
             if let Some((w, h)) = drawn {
@@ -3569,6 +3692,7 @@ impl Editor {
                     self.find = None;
                 }
                 self.tool = Tool::Select;
+                self.text_selection = None;
                 cx.notify();
             }
             return;
@@ -4236,9 +4360,9 @@ impl Editor {
             .into_any_element()
     }
 
-    /// "Annotate": the highlighter, the pen, and a shape.
+    /// "Annotate": picking out text, the highlighter, the pen, and a shape.
     fn render_annotate_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let rows = [Tool::Highlight, Tool::Pen, self.shape_tool].map(|tool| self.render_tool_row(tool, cx));
+        let rows = [Tool::SelectText, Tool::Highlight, Tool::Pen, self.shape_tool].map(|tool| self.render_tool_row(tool, cx));
         Self::sidebar_section("Annotate", rows.into())
     }
 
@@ -4415,6 +4539,7 @@ impl Editor {
                 Tool::Highlight => "Drag over text".into(),
                 Tool::Pen => "Write or draw freehand".into(),
                 Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => "Drag to draw one".into(),
+                Tool::SelectText => "Drag over text to copy it".into(),
                 Tool::Check | Tool::Select => "Tick a box".into(),
             };
             let id = match tool {
@@ -4426,8 +4551,9 @@ impl Editor {
                 Tool::Highlight => "annotate-Highlight",
                 Tool::Pen => "annotate-Draw",
                 Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => "annotate-Shape",
+                Tool::SelectText => "annotate-SelectText",
             };
-            let how = if tool.draws() {
+            let how = if tool.stays() {
                 "Click, then drag on the page. It stays in hand until you press Esc".to_string()
             } else {
                 format!("Click, then click the page — or drag {} onto the page", label.to_lowercase())
@@ -4503,12 +4629,10 @@ impl Editor {
                     d.cursor(CursorStyle::PointingHand)
                         .tooltip(ui::tooltip(how, None))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.finish_editing(cx);
-                            this.tool = if this.tool == tool { Tool::Select } else { tool };
+                            this.take_tool(tool, cx);
                             window.focus(&this.focus);
-                            cx.notify();
                         }))
-                        .when(!tool.draws(), |d| d.on_drag(ToolDrag(tool), |drag: &ToolDrag, _, _, cx| cx.new(|_| *drag)))
+                        .when(!tool.stays(), |d| d.on_drag(ToolDrag(tool), |drag: &ToolDrag, _, _, cx| cx.new(|_| *drag)))
                 });
             row.into_any_element()
         }
@@ -4915,6 +5039,8 @@ impl Editor {
                 CursorStyle::IBeam
             } else if self.tool.draws() {
                 CursorStyle::Crosshair
+            } else if self.tool == Tool::SelectText {
+                CursorStyle::IBeam
             } else {
                 CursorStyle::OpenHand
             })
@@ -5738,7 +5864,11 @@ impl Editor {
         } else {
             CursorStyle::Arrow
         };
-        let cursor = if self.tool == Tool::Select { hand } else { CursorStyle::Crosshair };
+        let cursor = match self.tool {
+            Tool::Select => hand,
+            Tool::SelectText => CursorStyle::IBeam,
+            _ => CursorStyle::Crosshair,
+        };
         let drawn = self.drawn_pages();
         let (_, gap) = self.layout_metrics();
         let mut page_elements = Vec::new();
@@ -5763,7 +5893,8 @@ impl Editor {
             on_page.sort_by_key(|i| i.is_redaction());
             let items: Vec<_> = on_page.into_iter().map(|item| self.render_item(item, cx)).collect();
             let widgets = self.render_widgets(source, cx);
-            let found = self.render_find_marks(source);
+            let mut found = self.render_find_marks(source);
+            found.extend(self.render_text_selection(source));
             let watermark_image = self
                 .watermark
                 .as_ref()
@@ -5852,12 +5983,30 @@ impl Editor {
             Tool::Highlight => Some(("highlight", "Drag over text to highlight it")),
             Tool::Pen => Some(("pen", "Draw on the page")),
             Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Arrow => Some((tool_label(self.tool).0, "Drag on the page to draw")),
+            Tool::SelectText => Some(("select-text", "Drag over text to select it, or double-click a word")),
         };
         // A drawing tool's colours (and line widths) are chosen here, and it is put down with Esc.
         let (options, done) = if self.tool.draws() {
             let highlight = self.tool == Tool::Highlight;
             let color = if highlight { self.settings.highlight_color } else { self.settings.pen_color };
             (self.render_pen_options(0, highlight, color, (!highlight).then_some(self.settings.pen_width), cx), "Esc when done")
+        } else if self.tool == Tool::SelectText {
+            // Text picked out can be copied from here, too.
+            let copy = self.selected_text().map(|_| {
+                div()
+                    .id("copy-text")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(ui::accent())
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.opacity(0.85))
+                    .tooltip(ui::tooltip("Copy the selected text", Some("⌘C")))
+                    .child("Copy")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy(cx)))
+                    .into_any_element()
+            });
+            (copy.into_iter().collect(), "Esc when done")
         } else {
             (Vec::new(), "Esc to cancel")
         };
@@ -6166,6 +6315,11 @@ fn render_in_background(
 fn to_render_image(page: pdf::RenderedPage) -> Option<Arc<RenderImage>> {
     let buffer = image::RgbaImage::from_raw(page.width, page.height, page.bgra)?;
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
+}
+
+/// "1 page", "3 pages".
+fn count(n: usize, of: &str) -> String {
+    format!("{n} {of}{}", if n == 1 { "" } else { "s" })
 }
 
 fn file_name(path: &Path) -> String {
@@ -6717,6 +6871,80 @@ mod tests {
         cx.run_until_parked();
         editor.read_with(cx, |e, _| assert!(e.status.contains("Nothing to save"), "{}", e.status));
         assert_eq!(clipboard::last_put(), Some(second));
+    }
+
+    #[gpui::test]
+    fn text_is_selected_by_dragging_and_copied(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let origin = page_origin(&editor, cx, 0);
+        let at = |x: f32, y: f32| origin + point(px(x), px(y));
+        let selected = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.selected_text());
+        let copied = |cx: &mut VisualTestContext| cx.read_from_clipboard().and_then(|c| c.text());
+
+        // The tool reads the pages' text, as finding does.
+        editor.update(cx, |e, cx| e.take_tool(Tool::SelectText, cx));
+        cx.run_until_parked();
+        // The first page says "Page 1 - Name:"; this is where "Name:" is.
+        let [x, y, w, h] = editor.read_with(cx, |e, _| {
+            let text = e.doc.as_ref().unwrap().text[0].as_ref().expect("the page's text was read");
+            assert_eq!(text.text(0..usize::MAX), "Page 1 - Name:");
+            text.find(&search::fold("name:"))[0][0]
+        });
+
+        // Dragged over, from its start to past the end of the line.
+        cx.simulate_mouse_down(at(x + 1., y + h / 2.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at(x + w / 2., y + h / 2.), MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(cx).map(|text| "Name:".starts_with(&text)), Some(true), "as far as the pointer has got");
+        cx.simulate_mouse_move(at(x + w + 80., y + h + 30.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at(x + w + 80., y + h + 30.), MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(cx).as_deref(), Some("Name:"));
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.tool, Tool::SelectText, "still in hand");
+            assert!(e.status.contains("5 characters selected"), "{}", e.status);
+            assert!(e.items.is_empty() && !e.dirty, "the document is as it was");
+        });
+        // ⌘C copies it, as the page has it.
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(copied(cx).as_deref(), Some("Name:"));
+
+        // Backwards is the same, and the whole line is taken from beyond its ends.
+        cx.simulate_mouse_down(at(x + w + 80., y + h / 2.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at(2., y + h / 2.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at(2., y + h / 2.), MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(cx).as_deref(), Some("Page 1 - Name:"));
+
+        // A double click picks out a word.
+        let press = |position, click_count| MouseDownEvent { button: MouseButton::Left, position, modifiers: Modifiers::none(), click_count, first_mouse: false };
+        let release = |position, click_count| MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::none(), click_count };
+        for click_count in [1, 2] {
+            cx.simulate_event(press(at(x + w / 2., y + h / 2.), click_count));
+            cx.simulate_event(release(at(x + w / 2., y + h / 2.), click_count));
+        }
+        assert_eq!(selected(cx).as_deref(), Some("Name:"));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(copied(cx).as_deref(), Some("Name:"));
+
+        // A click that picks nothing out clears what was.
+        cx.simulate_click(at(x + 1., y + h / 2.), Modifiers::none());
+        assert_eq!(selected(cx), None);
+        editor.read_with(cx, |e, _| assert_eq!(e.text_selection, None));
+
+        // Text under a field is picked out through it.
+        editor.update(cx, |e, cx| {
+            e.add_item(0, x, y, w, h, ItemKind::Highlight { color: model::HIGHLIGHT_COLORS[0].1 }, cx);
+            e.selected = None;
+        });
+        cx.simulate_mouse_down(at(x + 1., y + h / 2.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at(x + w + 80., y + h / 2.), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at(x + w + 80., y + h / 2.), MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(cx).as_deref(), Some("Name:"));
+        editor.read_with(cx, |e, _| assert_eq!((e.items.len(), e.selected), (1, None), "the field is left alone"));
+
+        // Esc puts the tool down, and with it what was picked out.
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |e, _| assert_eq!((e.tool, e.text_selection), (Tool::Select, None)));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(copied(cx).as_deref(), Some("Name:"), "nothing new is copied");
     }
 
     #[gpui::test]

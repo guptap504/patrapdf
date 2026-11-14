@@ -17,7 +17,8 @@
       <li>Place your signature from an image; the paper background is removed automatically</li>
       <li>Highlight text, draw freehand, and add shapes and arrows</li>
       <li>Redact: black out content and remove it from the file for good</li>
-      <li>Find text in the document, and work on several documents in windows of their own</li>
+      <li>Find text in the document, and select text to copy it</li>
+      <li>Work on several documents in windows of their own</li>
       <li>Stamp a watermark across every page</li>
       <li>Delete and reorder pages, and add pages from other PDFs</li>
     </ul>
@@ -31,6 +32,11 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.5.1" date="2026-11-14">
+      <description>
+        <p>Select text: drag over the document's text, or double-click a word, and copy it.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-11-14">
       <description>
         <p>Annotate: highlight text, draw freehand, and add rectangles, ovals, lines and arrows.</p>
