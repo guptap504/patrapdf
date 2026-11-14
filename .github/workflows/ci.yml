@@ -1,9 +1,21 @@
 name: CI
 
+# Only run when something that affects the build or the tests changes, so
+# edits to the README, licence, packaging scripts, etc. don't start CI.
 on:
   push:
     branches: [main]
+    paths: &app-files
+      - "src/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "packaging/windows/app.ico" # embedded by build.rs on Windows
+      - "packaging/linux/install-build-deps.sh" # used by this workflow
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths: *app-files
+  workflow_dispatch:
 
 permissions:
   contents: read
