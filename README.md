@@ -6,6 +6,8 @@ A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in, signing, re
 
 *Patra* (पत्र) is Sanskrit for a leaf, and so for a page or a document.
 
+<p align="center"><img src="docs/fill-and-sign.png" width="880" alt="A loan form in PatraPDF, filled in, ticked, highlighted, redacted and signed"></p>
+
 ## Features
 
 - **Fill in forms.** Type into a PDF's own form fields, tick its check boxes and pick from its lists. The saved copy is still a fillable form.
@@ -13,6 +15,7 @@ A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in, signing, re
 - **Annotate.** Highlight text, draw freehand, and add rectangles, ovals, lines and arrows, in a choice of colours and line widths.
 - **Redact.** Cover anything with a black or white box; what's underneath is removed from the saved file.
 - **Watermark** every page, **delete, reorder or rotate** pages, and **add pages** from another PDF.
+- **Clean up scans and photos of pages**, as a phone's scanner does. Crop a page by dragging its four corners (⌘K / Ctrl+K): what is between them is pulled straight, so a page photographed at an angle comes out square. Then choose its colours: enhanced (the paper made white, shadows taken off it), grayscale, or black and white. A page this is done to is saved as a picture of itself, so its own text can no longer be selected; what was cropped off is not in the saved file.
 - **Passwords.** Protected PDFs open with their password. A saved copy can keep it, change it or drop it, and any PDF can be saved with a password (AES-256).
 - **Any language.** Text in scripts other than Latin (Chinese, Japanese, Korean, Arabic, Hebrew, Hindi, Thai and more) is written with a font from your computer, and input methods work for typing it.
 - **Find** a word or phrase in the document (⌘F / Ctrl+F) and step through the matches.
@@ -24,6 +27,13 @@ A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in, signing, re
 - **Menus** for everything: in the menu bar on macOS, and in a menu bar at the top of each window on Windows and Linux (F10 opens it).
 - **Recents.** Saved documents appear in a searchable gallery and reopen with everything you placed still editable.
 - **Automatic updates** on macOS, Windows and the AppImage, verified against the project's signing key.
+
+A photographed page, cropped by its corners, then straightened and enhanced:
+
+<p align="center">
+  <img src="docs/scan-crop.png" width="49%" alt="Cropping a photo of a page: handles on its four corners and sides">
+  <img src="docs/scan-cleaned.png" width="49%" alt="The same page pulled straight, its paper white and its shadow gone">
+</p>
 
 ## Install
 

@@ -16,6 +16,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 use crate::fonts::{self, Embedder, FontBook};
 use crate::forms::{self, Field, FieldKind, FieldValue, Widget};
 use crate::model::{Item, ItemKind, LINE_HEIGHT, PageGeom, RedactFill, TextMetrics, Watermark};
+use crate::scan::{self, Fix, Look};
 
 // ---------------------------------------------------------------------------
 // Loading & rendering
@@ -29,8 +30,14 @@ pub struct LoadedPdf {
     /// needed (to open the file, or to save it), so they're parsed only once.
     parsed: Arc<OnceLock<Document>>,
     pub pdf: Arc<Pdf>,
-    /// The pages as they are shown: as the file has them, turned by `turns`.
+    /// The pages as the file has them.
+    own_pages: Arc<Vec<PageGeom>>,
+    /// The pages as they are shown: as the file has them, cropped as `fixes`
+    /// says and then turned by `turns`.
     pub pages: Vec<PageGeom>,
+    /// What has been done to each page since it was opened: cropped, or its
+    /// colours cleaned up. Such a page is a picture of itself, shown and saved.
+    pub fixes: Vec<Fix>,
     /// The quarter turns clockwise each page has been given since it was
     /// opened (0 to 3). Saved copies have their pages turned the same.
     pub turns: Vec<u8>,
@@ -53,7 +60,41 @@ impl LoadedPdf {
 
     /// Produce the edited copy of this document (see [`apply`]).
     pub fn save(&self, edits: &Edits) -> Result<Written> {
-        apply(self.document()?, &self.pages, &self.turns, edits)
+        apply(self.document()?, &self.pages, &self.turns, Some((&self.pdf, &self.fixes)), edits)
+    }
+
+    /// How a page is shown, for drawing it (see [`render_pages`]).
+    pub fn shown(&self, page: usize) -> Shown {
+        Shown { turns: self.turns.get(page).copied().unwrap_or(0), fix: self.fixes.get(page).copied().unwrap_or_default() }
+    }
+
+    /// Whether a page can be cropped or have its colours cleaned up: not one
+    /// with form fields to fill in, which a picture of it would not have.
+    pub fn can_fix(&self, page: usize) -> bool {
+        page < self.pages.len() && !self.form.iter().flat_map(|field| &field.widgets).any(|widget| widget.page == page)
+    }
+
+    /// Have a page cropped and coloured as `fix` says, in place of what was
+    /// done to it before. It stays turned as it is.
+    pub fn fix(&mut self, page: usize, fix: Fix) {
+        if !self.can_fix(page) || self.fixes[page] == fix {
+            return;
+        }
+        self.fixes[page] = fix;
+        let own = &self.own_pages[page];
+        let unturned = match fix.crop {
+            Some(crop) => picture_geom(crop.width, crop.height),
+            None if fix.is_none() => own.clone(),
+            None => picture_geom(own.width, own.height),
+        };
+        self.pages[page] = unturned.turned(self.turns[page]);
+    }
+
+    /// Have every page cropped and coloured as `fixes` says (pages it doesn't reach: not at all).
+    pub fn set_fixes(&mut self, fixes: &[Fix]) {
+        for page in 0..self.pages.len() {
+            self.fix(page, fixes.get(page).copied().unwrap_or_default());
+        }
     }
 
     /// Turn a page `quarters` quarter turns clockwise (3 is one the other
@@ -100,6 +141,7 @@ impl LoadedPdf {
             bail!("the pages could not be added to this PDF");
         }
         merged.password = self.password.clone();
+        merged.set_fixes(&self.fixes);
         merged.set_turns(&self.turns);
         Ok(merged)
     }
@@ -213,6 +255,8 @@ fn load_inner(bytes: Vec<u8>, password: Option<&str>, hide_fields: bool) -> Resu
         parsed: Arc::new(parsed.map(OnceLock::from).unwrap_or_default()),
         pdf: Arc::new(pdf),
         turns: vec![0; pages.len()],
+        fixes: vec![Fix::default(); pages.len()],
+        own_pages: Arc::new(pages.clone()),
         pages,
         password,
         form: Arc::new(form),
@@ -311,21 +355,53 @@ pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Option<RenderedPage> 
     render(pdf, &RenderCache::new(), index, scale, false)
 }
 
-/// Render several pages of a document (index, scale, and the quarter turns
-/// clockwise to show it with), handing each to `each` as it's done; `each`
-/// says whether to go on. What drawing one page works out (the document's
-/// fonts, glyph shapes and bitmaps, colour profiles) is kept for the rest of them.
+/// How a page is shown: what has been done to it (see [`Fix`]), and then the
+/// quarter turns clockwise it has been given.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shown {
+    pub turns: u8,
+    pub fix: Fix,
+}
+
+/// Render several pages of a document (index, scale, and how to show it),
+/// handing each to `each` as it's done; `each` says whether to go on. What
+/// drawing one page works out (the document's fonts, glyph shapes and
+/// bitmaps, colour profiles) is kept for the rest of them.
 pub fn render_pages(
     pdf: &Pdf,
-    pages: impl IntoIterator<Item = (usize, f32, u8)>,
+    pages: impl IntoIterator<Item = (usize, f32, Shown)>,
     mut each: impl FnMut(usize, Option<RenderedPage>) -> bool,
 ) {
     let cache = RenderCache::new();
-    for (index, scale, turns) in pages {
-        if !each(index, render(pdf, &cache, index, scale, false).map(|page| page.turned(turns))) {
+    for (index, scale, shown) in pages {
+        if !each(index, render_fixed(pdf, &cache, index, scale, &shown.fix).map(|page| page.turned(shown.turns))) {
             break;
         }
     }
+}
+
+/// The geometry of a page that is a picture of itself, `width` × `height`
+/// points: as it is written by [`fix_pages`].
+fn picture_geom(width: f32, height: f32) -> PageGeom {
+    PageGeom { width, height, view_to_user: [1., 0., 0., -1., 0., height as f64] }
+}
+
+/// Render a page as the file has it, cropped and coloured as `fix` says:
+/// `scale` pixels to a point of the page that makes.
+fn render_fixed<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, index: usize, scale: f32, fix: &Fix) -> Option<RenderedPage> {
+    let mut page = render(pdf, cache, index, scale, false)?;
+    if let Some(crop) = fix.crop {
+        let (width, height) = pdf.pages().get(index)?.render_dimensions();
+        // The corners in the picture's pixels.
+        let (across, down) = (page.width as f32 / width.max(1.), page.height as f32 / height.max(1.));
+        let quad = crop.quad.map(|(x, y)| (x * across, y * down));
+        let scale = render_scale(crop.width, crop.height, scale);
+        let (w, h) = (((crop.width * scale).round() as u32).max(1), ((crop.height * scale).round() as u32).max(1));
+        let bgra = scan::straighten(&page.bgra, page.width as usize, page.height as usize, quad, w as usize, h as usize)?;
+        page = RenderedPage { width: w, height: h, bgra };
+    }
+    scan::recolour(&mut page.bgra, page.width as usize, page.height as usize, fix.look);
+    Some(page)
 }
 
 /// Render the first page of a PDF (one that opens without a password),
@@ -426,6 +502,13 @@ const HIGHLIGHT_GS: &str = "PatraPDFHlGS";
 const PAGE_IMAGE: &str = "PatraPDFPage";
 /// Resolution of redacted pages, which are rebuilt as images: 3 × 72 = 216 dpi.
 const REDACT_SCALE: f32 = 3.0;
+/// Cropped and recoloured pages are pictures too: at the resolution of the
+/// largest picture already on them (a scan is one picture), between that of
+/// redacted pages and 300 dpi. In black and white, where every pixel is ink
+/// or paper, always 300 dpi.
+const SHARPEST_PICTURE: f32 = 300. / 72.;
+/// How closely such a picture is kept (JPEG quality, of 100).
+const PICTURE_QUALITY: u8 = 85;
 
 /// [`save`] with just pages, items and a watermark, for tests.
 #[cfg(test)]
@@ -465,7 +548,7 @@ pub struct Written {
 /// [`apply`] to a file's bytes, for tests (the app saves a [`LoadedPdf`]).
 #[cfg(test)]
 pub fn save(original: &[u8], source_pages: &[PageGeom], edits: &Edits) -> Result<Written> {
-    apply(open_document(original)?, source_pages, &[], edits)
+    apply(open_document(original)?, source_pages, &[], None, edits)
 }
 
 /// Produce the edited copy of a document: a new PDF with the form filled in,
@@ -473,12 +556,17 @@ pub fn save(original: &[u8], source_pages: &[PageGeom], edits: &Edits) -> Result
 /// any redactions applied.
 ///
 /// `source_pages` are the original document's pages as they are shown, which
-/// is turned by `turns` (quarter turns clockwise, for each that has been
-/// turned); `edits.order` lists, for each page of the output, which original
-/// page it is (pages left out are deleted). Item page numbers refer to
-/// positions in `order`.
-fn apply(mut doc: Document, source_pages: &[PageGeom], turns: &[u8], edits: &Edits) -> Result<Written> {
+/// is cropped and coloured as `fixes` says (for each page that has been, with
+/// the document as the renderer reads it, to draw them from) and then turned
+/// by `turns` (quarter turns clockwise, for each that has been turned);
+/// `edits.order` lists, for each page of the output, which original page it
+/// is (pages left out are deleted). Item page numbers refer to positions in
+/// `order`.
+fn apply(mut doc: Document, source_pages: &[PageGeom], turns: &[u8], fixes: Option<(&Pdf, &[Fix])>, edits: &Edits) -> Result<Written> {
     let Edits { order, items, watermark, metrics, password, form, values } = *edits;
+    if let Some((pdf, fixes)) = fixes {
+        fix_pages(&mut doc, pdf, fixes)?;
+    }
     turn_pages(&mut doc, turns)?;
     let identity = order.len() == source_pages.len() && order.iter().enumerate().all(|(i, &p)| i == p);
     let pages: Vec<PageGeom> = if identity {
@@ -1568,25 +1656,127 @@ fn redact(doc: &mut Document, written: Vec<u8>, pages: &[PageGeom], redactions: 
             * Affine::translate((0., geom.height as f64))
             * Affine::FLIP_Y
             * Affine::scale_non_uniform(geom.width as f64, geom.height as f64);
-        let mut content = Stream::new(dictionary! {}, format!("q {} cm /{PAGE_IMAGE} Do Q\n", fmt_m(m)).into_bytes());
-        let _ = content.compress();
-        let content_id = doc.add_object(content);
-
-        removed_annots.extend(page_annotations(doc, page_id));
-
-        let page = doc.get_dictionary_mut(page_id)?;
-        // Anything else on the page that could carry the original content.
-        for key in ["Annots", "Thumb", "Metadata", "PieceInfo", "StructParents", "Group", "AA", "B"] {
-            page.remove(key.as_bytes());
-        }
-        page.set("Contents", content_id);
-        // An explicit dictionary also stops resources being inherited from the page tree.
-        page.set("Resources", dictionary! { "XObject" => dictionary! { PAGE_IMAGE => image_id } });
+        removed_annots.extend(show_only_picture(doc, page_id, image_id, m)?);
     }
 
     strip_document_text(doc, &removed_annots);
     doc.prune_objects();
     Ok(())
+}
+
+/// Have a page show one picture (placed by `m`, which takes the unit square
+/// to where it goes on the page) and nothing else: its own content and
+/// whatever else could carry that are taken off it. Returns the annotations
+/// it had, which go with them.
+fn show_only_picture(doc: &mut Document, page_id: ObjectId, image_id: ObjectId, m: Affine) -> Result<Vec<ObjectId>> {
+    let mut content = Stream::new(dictionary! {}, format!("q {} cm /{PAGE_IMAGE} Do Q\n", fmt_m(m)).into_bytes());
+    let _ = content.compress();
+    let content_id = doc.add_object(content);
+    let annotations = page_annotations(doc, page_id);
+    let page = doc.get_dictionary_mut(page_id)?;
+    // Anything else on the page that could carry the original content.
+    for key in ["Annots", "Thumb", "Metadata", "PieceInfo", "StructParents", "Group", "AA", "B"] {
+        page.remove(key.as_bytes());
+    }
+    page.set("Contents", content_id);
+    // An explicit dictionary also stops resources being inherited from the page tree.
+    page.set("Resources", dictionary! { "XObject" => dictionary! { PAGE_IMAGE => image_id } });
+    Ok(annotations)
+}
+
+// ---------------------------------------------------------------------------
+// Cropped and recoloured pages
+// ---------------------------------------------------------------------------
+
+/// Rebuild each page that was cropped or had its colours cleaned up (see
+/// [`Fix`]) as a picture of itself: just what is left of it, as it is shown
+/// (before it is turned). Like a redacted page, it keeps nothing of what it
+/// was drawn with, so what was cropped off it is not in the file any more.
+///
+/// `pdf` is the document as the renderer reads it; `fixes[i]` is for page `i`.
+fn fix_pages(doc: &mut Document, pdf: &Pdf, fixes: &[Fix]) -> Result<()> {
+    if fixes.iter().all(Fix::is_none) {
+        return Ok(());
+    }
+    let cache = RenderCache::new();
+    let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
+    let mut removed_annots: HashSet<ObjectId> = HashSet::new();
+    for (index, (&page_id, fix)) in page_ids.iter().zip(fixes).enumerate().filter(|(_, (_, fix))| !fix.is_none()) {
+        let own = pdf.pages().get(index).map(|page| page.render_dimensions()).ok_or_else(|| anyhow!("page {} does not exist", index + 1))?;
+        let (width, height) = fix.crop.map_or(own, |crop| (crop.width, crop.height));
+        let scale = if fix.look == Look::Mono { SHARPEST_PICTURE } else { picture_scale(doc, page_id, own) };
+        let rendered =
+            render_fixed(pdf, &cache, index, scale, fix).ok_or_else(|| anyhow!("could not draw page {} to crop or recolour it", index + 1))?;
+        let image_id = doc.add_object(picture(&rendered, fix.look)?);
+        let m = Affine::scale_non_uniform(width as f64, height as f64);
+        removed_annots.extend(show_only_picture(doc, page_id, image_id, m)?);
+        // The page is just as large as the picture, the right way up. (Set
+        // outright, as a page inherits these from the page tree otherwise.)
+        let page = doc.get_dictionary_mut(page_id)?;
+        for key in ["BleedBox", "TrimBox", "ArtBox"] {
+            page.remove(key.as_bytes());
+        }
+        let area: Vec<Object> = vec![0.into(), 0.into(), width.into(), height.into()];
+        page.set("MediaBox", area.clone());
+        page.set("CropBox", area);
+        page.set("Rotate", 0);
+    }
+    strip_document_text(doc, &removed_annots);
+    doc.prune_objects();
+    Ok(())
+}
+
+/// How many pixels to a point a page is drawn with to be kept as a picture:
+/// as many as the largest picture on it has, if it filled the page (`width`
+/// × `height` points), within what a picture of a page is ever kept at.
+fn picture_scale(doc: &Document, page_id: ObjectId, (width, height): (f32, f32)) -> f32 {
+    let resources = effective_resources(doc, page_id);
+    let pictures = resources.get(b"XObject").ok().and_then(|pictures| resolve_dict(doc, pictures));
+    let pixels = |object: &Object| {
+        let stream = doc.dereference(object).ok()?.1.as_stream().ok()?;
+        stream.dict.get(b"Subtype").and_then(Object::as_name).ok().filter(|kind| *kind == b"Image")?;
+        let side = |key: &[u8]| stream.dict.get(key).and_then(Object::as_i64).ok();
+        Some(side(b"Width")? as f32 * side(b"Height")? as f32)
+    };
+    let most = pictures.iter().flat_map(|pictures| pictures.iter()).filter_map(|(_, object)| pixels(object)).fold(0., f32::max);
+    (most / (width * height).max(1.)).sqrt().clamp(REDACT_SCALE, SHARPEST_PICTURE)
+}
+
+/// A drawn page as a picture in the file: a JPEG in colour or in grays, or,
+/// in black and white, one bit a pixel.
+fn picture(page: &RenderedPage, look: Look) -> Result<Stream> {
+    let (width, height) = (page.width as usize, page.height as usize);
+    let mut about = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => width as i64,
+        "Height" => height as i64,
+        "ColorSpace" => if look == Look::Original || look == Look::Enhanced { "DeviceRGB" } else { "DeviceGray" },
+        "BitsPerComponent" => if look == Look::Mono { 1 } else { 8 },
+    };
+    if look == Look::Mono {
+        // Each row starts a new byte; a set bit is paper.
+        let across = width.div_ceil(8);
+        let mut bits = vec![0u8; across * height];
+        for (y, row) in page.bgra.chunks_exact(width * 4).enumerate() {
+            for (x, pixel) in row.chunks_exact(4).enumerate() {
+                bits[y * across + x / 8] |= u8::from(pixel[0] >= 128) << (7 - x % 8);
+            }
+        }
+        let mut stream = Stream::new(about, bits);
+        let _ = stream.compress();
+        return Ok(stream);
+    }
+    let (pixels, kind): (Vec<u8>, _) = match look {
+        Look::Gray => (page.bgra.chunks_exact(4).map(|p| p[0]).collect(), image::ExtendedColorType::L8),
+        _ => (page.bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect(), image::ExtendedColorType::Rgb8),
+    };
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, PICTURE_QUALITY)
+        .encode(&pixels, page.width, page.height, kind)
+        .context("could not keep a page as a picture")?;
+    about.set("Filter", "DCTDecode");
+    Ok(Stream::new(about, jpeg))
 }
 
 /// Remove document-level copies of redacted content: form fields whose
@@ -2563,5 +2753,110 @@ pub(crate) mod tests {
         assert!(base.with_pages(&[(&other, &[2])]).is_err());
         assert!(base.with_pages(&[(&other, &[0, 0])]).is_err());
         assert!(base.with_pages(&[(&other, &[])]).is_err());
+    }
+
+    /// Whether a phrase is in the text of a page.
+    fn reads(pdf: &Pdf, page: usize, phrase: &str) -> bool {
+        let mut found = false;
+        crate::search::read_pages(pdf, [(page, 0)], |_, text| {
+            found = !text.find(&crate::search::fold(phrase)).is_empty();
+            true
+        });
+        found
+    }
+
+    #[test]
+    fn a_cropped_or_recoloured_page_is_saved_as_the_picture_it_is_shown_as() {
+        let original = load(sample_pdf()).unwrap();
+        let cache = RenderCache::new();
+        // (The second page is one the file already shows turned, and cropped.)
+        for page in 0..2 {
+            let own = original.pages[page].clone();
+            // Corners that make no rectangle, about the line of text on the page.
+            let (w, h) = (own.width, own.height);
+            let quad = [(w * 0.05, h * 0.04), (w * 0.9, h * 0.08), (w * 0.95, h * 0.6), (w * 0.1, h * 0.55)];
+            let (width, height) = scan::size_of(&quad);
+            let (width, height) = (width.round(), height.round());
+            let crop = scan::Crop { quad, width, height };
+            for (fix, turns) in [
+                (Fix { crop: Some(crop), look: Look::Original }, 0),
+                (Fix { crop: Some(crop), look: Look::Enhanced }, 1),
+                (Fix { crop: None, look: Look::Gray }, 3),
+                (Fix { crop: Some(crop), look: Look::Mono }, 2),
+            ] {
+                let what = format!("page {page}, {fix:?}, turned {turns}");
+                let mut loaded = original.clone();
+                loaded.turn(page, turns);
+                loaded.fix(page, fix);
+                assert_eq!((loaded.fixes[page], loaded.turns[page]), (fix, turns));
+                // It is as large as what is kept of it, turned as it was.
+                let kept = if fix.crop.is_some() { (width, height) } else { (w, h) };
+                let sides = if turns % 2 == 1 { (kept.1, kept.0) } else { kept };
+                let shown = loaded.pages[page].clone();
+                assert_eq!((shown.width, shown.height), sides, "{what}");
+                let picture = render_fixed(&original.pdf, &cache, page, 1.0, &fix).unwrap().turned(turns);
+                assert_eq!((picture.width, picture.height), (sides.0.round() as u32, sides.1.round() as u32), "{what}");
+
+                // Saved, the page is in the file the way it was shown: its
+                // size, where everything on it is, and how it looks.
+                let bytes = loaded.save(&Edits { order: &[0, 1], ..Edits::default() }).unwrap().bytes;
+                let saved = load(bytes.clone()).unwrap();
+                assert!((saved.pages[page].width - sides.0).abs() < 0.01 && (saved.pages[page].height - sides.1).abs() < 0.01, "{what}");
+                for (saved, shown) in saved.pages[page].view_to_user.iter().zip(shown.view_to_user) {
+                    assert!((saved - shown).abs() < 0.01, "{what}: {saved:?} for {shown:?}");
+                }
+                assert_eq!(saved.pages[1 - page], original.pages[1 - page], "the other page is as it was");
+                let again = render_page(&saved.pdf, page, sides.0.round() / saved.pages[page].width).unwrap();
+                let d = difference(&again, &picture);
+                assert!(d < 0.02, "{what} looks different saved: {d}");
+
+                // It is a picture: one image, and none of the text it had.
+                // The other page still has its own.
+                assert!(reads(&original.pdf, page, "name") && !reads(&saved.pdf, page, "name"), "{what}");
+                assert!(reads(&saved.pdf, 1 - page, "name"), "{what}");
+                let doc = Document::load_mem(&bytes).unwrap();
+                let id = doc.get_pages().into_values().nth(page).unwrap();
+                let resources = effective_resources(&doc, id);
+                assert_eq!(resources.len(), 1, "{what}");
+                let image = doc.get_object(resolve_dict(&doc, resources.get(b"XObject").unwrap()).unwrap().get(PAGE_IMAGE.as_bytes()).unwrap().as_reference().unwrap());
+                let about = &image.unwrap().as_stream().unwrap().dict;
+                let name = |key: &[u8]| String::from_utf8_lossy(about.get(key).and_then(Object::as_name).unwrap()).into_owned();
+                let (space, filter, bits) = match fix.look {
+                    Look::Mono => ("DeviceGray", "FlateDecode", 1),
+                    Look::Gray => ("DeviceGray", "DCTDecode", 8),
+                    _ => ("DeviceRGB", "DCTDecode", 8),
+                };
+                assert_eq!((name(b"ColorSpace"), name(b"Filter"), about.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap()), (space.to_string(), filter.to_string(), bits), "{what}");
+                // As sharp as a redacted page is at least; in black and white, as a fax.
+                let sharp = about.get(b"Width").and_then(Object::as_i64).unwrap() as f32 / kept.0;
+                assert!((sharp - if fix.look == Look::Mono { SHARPEST_PICTURE } else { REDACT_SCALE }).abs() < 0.02, "{what}: {sharp} pixels a point");
+
+                // What is put on it goes where it was put, over the picture.
+                let (x, y) = (shown.width * 0.5, shown.height * 0.75);
+                let outline = Item { id: 1, page, x: x - 20., y: y - 10., w: 40., h: 20., kind: ItemKind::Outline { oval: false, color: 0x0000ff, width: 6. } };
+                let saved = load(loaded.save(&Edits { order: &[0, 1], items: &[outline], ..Edits::default() }).unwrap().bytes).unwrap();
+                let with = render_page(&saved.pdf, page, 1.0).unwrap();
+                for (dx, dy) in [(-18., 0.), (18., 0.), (0., -8.), (0., 8.)] {
+                    let i = (((y + dy) as u32 * with.width + (x + dx) as u32) * 4) as usize;
+                    assert_eq!([with.bgra[i + 2], with.bgra[i + 1], with.bgra[i]], [0, 0, 255], "{what}: side {dx} {dy}");
+                }
+            }
+        }
+
+        // Nothing done to a page: it is saved as it is, text and all.
+        let mut loaded = original.clone();
+        loaded.fix(0, Fix { crop: None, look: Look::Mono });
+        loaded.fix(0, Fix::default());
+        assert_eq!(loaded.pages, original.pages);
+        let saved = load(loaded.save(&Edits { order: &[0, 1], ..Edits::default() }).unwrap().bytes).unwrap();
+        assert!(reads(&saved.pdf, 0, "name"));
+
+        // A page with form fields to fill in stays as it is: a picture of it would have none.
+        let mut form = load(sample_form()).unwrap();
+        let with_fields = form.form.iter().flat_map(|field| &field.widgets).map(|widget| widget.page).next().unwrap();
+        assert!(!form.can_fix(with_fields));
+        let before = form.pages.clone();
+        form.fix(with_fields, Fix { crop: None, look: Look::Gray });
+        assert!(form.fixes.iter().all(Fix::is_none) && form.pages == before);
     }
 }

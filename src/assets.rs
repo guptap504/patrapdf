@@ -42,6 +42,8 @@ icons! {
     "redo" => r#"<path d="M15 13.5l4.5-4.5L15 4.5"/><path d="M19.5 9H10a5.5 5.5 0 0 0 0 11h3"/>"#,
     "clipboard" => r#"<rect x="6" y="5.5" width="12" height="15" rx="2"/><path d="M9.5 5.5v-.5a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v.5"/><path d="M9.5 11h5M9.5 14.5h5"/>"#,
     "rotate-left" => r#"<path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"/><path d="M4.5 4.5v4h4"/>"#,
+    "crop" => r#"<path d="M7.5 3.5v13h13"/><path d="M3.5 7.5h13v13"/>"#,
+    "colours" => r#"<circle cx="12" cy="12" r="8"/><path d="M12 4v16M12 8h6.9M12 12h8M12 16h6.9"/>"#,
     "rotate-right" => r#"<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4h-4"/>"#,
     "copy" => r#"<rect x="8.5" y="8.5" width="11" height="11" rx="2"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/>"#,
     "layers" => r#"<path d="M12 4l8.5 4.5L12 13 3.5 8.5z"/><path d="M3.5 12.5L12 17l8.5-4.5"/><path d="M3.5 16.5L12 21l8.5-4.5"/>"#,

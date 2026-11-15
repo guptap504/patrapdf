@@ -182,6 +182,19 @@ impl Item {
         (self.w, self.h) = ((corner.0 - opposite.0).abs(), (corner.1 - opposite.1).abs());
     }
 
+    /// Follow its page as that is cropped or straightened: `to` says where
+    /// each point of the page goes. A line goes where its points go; anything
+    /// else keeps its size, around where its middle goes.
+    pub fn follow(&mut self, to: impl Fn((f32, f32)) -> (f32, f32)) {
+        if matches!(self.kind, ItemKind::Stroke { .. }) {
+            let points: Vec<(f32, f32)> = self.stroke_points().into_iter().map(to).collect();
+            self.fit_stroke(&points);
+            return;
+        }
+        let (x, y) = to((self.x + self.w / 2., self.y + self.h / 2.));
+        (self.x, self.y) = (x - self.w / 2., y - self.h / 2.);
+    }
+
     pub fn is_redaction(&self) -> bool {
         self.redaction().is_some()
     }

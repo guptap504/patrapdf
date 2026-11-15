@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::forms::FieldValue;
 use crate::model::{Item, ItemKind, PageImport, RedactFill, Signature, Watermark};
+use crate::scan::Fix;
 use crate::{pdf, signatures};
 
 /// The oldest entries are dropped beyond this many.
@@ -52,6 +53,10 @@ pub struct RecentEntry {
     /// far as any was turned).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turns: Vec<u8>,
+    /// What was done to each page (by original index, as far as anything was
+    /// done to one): cropped, or its colours cleaned up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<Fix>,
     /// Values typed into the document's own form fields, by field name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, FieldValue)>,
@@ -186,6 +191,7 @@ pub fn record(
     page_count: usize,
     order: Option<&[usize]>,
     turns: &[u8],
+    fixes: &[Fix],
     imports: &[PageImport],
     contents: Option<Contents>,
 ) -> Result<Vec<RecentEntry>> {
@@ -259,6 +265,7 @@ pub fn record(
             order: order.map(<[usize]>::to_vec),
             // (Nothing, for a document with no page turned.)
             turns: turns[..turns.iter().rposition(|&turns| turns % 4 != 0).map_or(0, |last| last + 1)].to_vec(),
+            fixes: fixes[..fixes.iter().rposition(|fix| !fix.is_none()).map_or(0, |last| last + 1)].to_vec(),
             fields,
             imports: imports.to_vec(),
         },
@@ -404,7 +411,7 @@ mod tests {
             fields: vec![("name".into(), FieldValue::Text("Jo".into()))],
             thumbnail: Some(thumb),
         };
-        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), &[0, 3], &[], Some(contents)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), &[0, 3], &[], &[], Some(contents)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
@@ -436,7 +443,7 @@ mod tests {
 
         // Saving the same original again updates the entry instead of adding one.
         let contents = Contents { items: &restored, ..Contents::default() };
-        let entries = record(loaded, &original, &output, 2, None, &[], &[], Some(contents)).unwrap();
+        let entries = record(loaded, &original, &output, 2, None, &[], &[], &[], Some(contents)).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

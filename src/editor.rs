@@ -28,6 +28,7 @@ use crate::forms::{self, FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
 use crate::print;
 use crate::recents::{self, RecentEntry};
+use crate::scan::{self, Fix, Look};
 use crate::scrollbar::{self, scrollbar};
 use crate::clipboard;
 use crate::search;
@@ -59,6 +60,12 @@ actions!(
         Print,
         RotateLeft,
         RotateRight,
+        CropPage,
+        ColoursOriginal,
+        ColoursEnhance,
+        ColoursGray,
+        ColoursMono,
+        ColoursOnAllPages,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -174,6 +181,28 @@ const SIG_THUMB_W: f32 = SIDEBAR_W - 50.;
 const SIG_THUMB_H: f32 = 58.;
 /// Padding (in screen px) between an item's content and its selection border.
 const ITEM_PAD: f32 = 3.0;
+/// The handles a crop is dragged by: how far across a corner's is drawn
+/// (half of it, in screen px), how near one a press takes hold of it, and
+/// the shortest a side of what is kept can be made (in points).
+const CROP_HANDLE: f32 = 8.;
+const CROP_REACH: f32 = 16.;
+const CROP_LEAST: f32 = 24.;
+
+/// The key that says "do it", as its keyboard names it.
+const RETURN_KEY: &str = if cfg!(target_os = "macos") { "Return" } else { "Enter" };
+
+/// A page being cropped: nothing is cut off it until Return.
+struct Cropping {
+    /// Which page (its position among the pages).
+    page: usize,
+    /// The corners of what to keep, on the page as it is shown (in points):
+    /// top left, top right, bottom right, bottom left.
+    quad: [scan::Spot; 4],
+    /// The handle held: a corner (0 to 3), or the middle of the side from a
+    /// corner to the next (4 to 7); and where the handle was from the
+    /// pointer when it took hold (in points).
+    held: Option<(usize, (f32, f32))>,
+}
 
 /// Every keyboard shortcut, as the Help menu lists them (written the macOS way; see `ui::keys`).
 const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
@@ -211,6 +240,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Page up / down", "PgUp  PgDn"),
             ("First / Last page", "Home  End"),
             ("Rotate the page left / right", "⌘L  ⌘R"),
+            ("Crop the page", "⌘K"),
             ("Zoom in / out", "⌘+  ⌘−"),
             ("Actual size", "⌘0"),
             ("Fit width / page", "⌘1  ⌘2"),
@@ -324,6 +354,8 @@ struct Snapshot {
     order: Vec<usize>,
     /// The quarter turns clockwise each page (by original index) has been given.
     turns: Vec<u8>,
+    /// What has been done to each page (by original index): cropped, recoloured.
+    fixes: Vec<Fix>,
     /// Values of the document's form fields.
     fields: Vec<FieldValue>,
 }
@@ -769,6 +801,13 @@ pub struct Editor {
     /// The pages are to be looked over when the window is next drawn: some
     /// may need drawing again.
     redraw_pages: bool,
+    /// The page being cropped, if one is (see `start_crop`).
+    crop: Option<Cropping>,
+    /// How the zoom was chosen, and what it was, before a page was shown
+    /// whole to be cropped: it is chosen so again once that is over.
+    zoom_before_crop: Option<(ZoomMode, f32)>,
+    /// The menu of colours for the page in view is open.
+    look_menu_open: bool,
     /// Scroll state of the page list (children are the pages, in order).
     pages_scroll: ScrollHandle,
     /// Where each page *position* was last painted (window coordinates). Kept per
@@ -939,6 +978,9 @@ impl Editor {
             printing: false,
             retired: Vec::new(),
             redraw_pages: false,
+            crop: None,
+            zoom_before_crop: None,
+            look_menu_open: false,
             pages_scroll: ScrollHandle::new(),
             page_slots: Vec::new(),
             painted_scroll: Rc::new(Cell::new(Point::default())),
@@ -1212,6 +1254,7 @@ impl Editor {
         self.recents_search_focused = false;
         window.set_window_title(&format!("PatraPDF — {}", file_name(&path)));
         let order = (0..loaded.pages.len()).collect::<Vec<_>>();
+        self.crop = None;
         self.doc = Some(OpenDoc {
             path,
             widgets: forms::widgets_by_page(&loaded.form, loaded.pages.len()),
@@ -1362,6 +1405,7 @@ impl Editor {
         self.selected = None;
         self.editing = None;
         self.drag = None;
+        self.crop = None;
         self.dirty = false;
         self.tool = Tool::Select;
         self.status = "Ready".into();
@@ -1473,7 +1517,7 @@ impl Editor {
             }
         }
         // What was placed on a turned page was placed on it as it was shown.
-        self.turn_pages(&entry.turns);
+        self.show_pages(&entry.turns, &entry.fixes);
         let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
         let mut next_id = self.next_id;
         self.items = recents::restore_items(entry, page_count, || {
@@ -1746,6 +1790,7 @@ impl Editor {
         self.finish_editing(cx);
         self.tool = if self.tool == tool { Tool::Select } else { tool };
         self.text_selection = None;
+        self.crop = None;
         if self.tool == Tool::SelectText {
             // The pages' text is read for it, as for finding.
             self.selected = None;
@@ -1802,7 +1847,11 @@ impl Editor {
     /// Read the text of the pages that haven't been read, in the background,
     /// looking through each as it arrives.
     fn read_text(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = &self.doc else { return };
+        let Some(doc) = &mut self.doc else { return };
+        // A page that is a picture of itself has no text to read.
+        for (text, _) in doc.text.iter_mut().zip(&doc.loaded.fixes).filter(|(text, fix)| text.is_none() && !fix.is_none()) {
+            *text = Some(search::PageText::default());
+        }
         let unread: Vec<(usize, u8)> = (0..doc.text.len()).filter(|&i| doc.text[i].is_none()).map(|i| (i, doc.loaded.turns[i])).collect();
         if unread.is_empty() || self.text_task.is_some() {
             return;
@@ -2033,8 +2082,8 @@ impl Editor {
             return;
         }
         let path = doc.path.clone();
-        let pages: Vec<(usize, f32, u8)> =
-            missing.iter().map(|&i| (i, THUMB_RENDER_PX / doc.loaded.pages[i].width.max(1.), doc.loaded.turns[i])).collect();
+        let pages: Vec<(usize, f32, pdf::Shown)> =
+            missing.iter().map(|&i| (i, THUMB_RENDER_PX / doc.loaded.pages[i].width.max(1.), doc.loaded.shown(i))).collect();
         let pdf = doc.loaded.pdf.clone();
         self.thumbs_pending = missing;
         // (This replaces `thumb_task`, which stops the render it was waiting for.)
@@ -2109,7 +2158,7 @@ impl Editor {
         let settle = stale.iter().all(|&i| doc.pages[i].image.is_some());
         let pdf = doc.loaded.pdf.clone();
         let path = doc.path.clone();
-        let pages: Vec<(usize, f32, u8)> = stale.into_iter().map(|index| (index, scale, doc.loaded.turns[index])).collect();
+        let pages: Vec<(usize, f32, pdf::Shown)> = stale.into_iter().map(|index| (index, scale, doc.loaded.shown(index))).collect();
         self.render_task = Some(cx.spawn_in(window, async move |this, cx| {
             if settle {
                 cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
@@ -2212,7 +2261,7 @@ impl Editor {
         let loaded = doc.loaded.clone();
         let imports = doc.imports_in_use();
         let order = doc.order.clone();
-        let turns = doc.loaded.turns.clone();
+        let (turns, fixes) = (doc.loaded.turns.clone(), doc.loaded.fixes.clone());
         let page_count = order.len();
         let items = self.items.clone();
         let form = doc.loaded.form.clone();
@@ -2248,6 +2297,7 @@ impl Editor {
                 watermark: watermark.clone(),
                 order: order.clone(),
                 turns,
+                fixes,
                 fields: values.clone(),
             };
             // Remembered by name: the values that differ from the file's own.
@@ -2303,7 +2353,7 @@ impl Editor {
                         thumbnail,
                     });
                     let reordered = Some(saved.order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p));
-                    match recents::record(this.recents.clone(), &original, &output, page_count, reordered, &saved.turns, &imports, contents) {
+                    match recents::record(this.recents.clone(), &original, &output, page_count, reordered, &saved.turns, &saved.fixes, &imports, contents) {
                         Ok(entries) => {
                             this.recents = entries;
                             this.share(cx);
@@ -2544,6 +2594,7 @@ impl Editor {
             watermark: self.watermark.clone(),
             order: self.doc.as_ref().map(|d| d.order.clone()).unwrap_or_default(),
             turns: self.doc.as_ref().map(|d| d.loaded.turns.clone()).unwrap_or_default(),
+            fixes: self.doc.as_ref().map(|d| d.loaded.fixes.clone()).unwrap_or_default(),
             fields: self.fields.clone(),
         }
     }
@@ -2551,11 +2602,23 @@ impl Editor {
     /// Switch to `snapshot`, returning the state it replaced.
     fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
         let current = self.snapshot();
+        // What the page being cropped is: which one, and cut and turned how.
+        let cropped = |this: &Self| {
+            let (crop, doc) = (this.crop.as_ref()?, this.doc.as_ref()?);
+            let source = *doc.order.get(crop.page)?;
+            Some((source, doc.loaded.fixes[source].crop, doc.loaded.turns[source]))
+        };
+        let was = cropped(self);
         self.items = snapshot.items;
         self.watermark = snapshot.watermark;
         if let Some(doc) = self.doc.as_mut().filter(|_| !snapshot.order.is_empty()) {
             doc.order = snapshot.order;
-            self.turn_pages(&snapshot.turns);
+            self.show_pages(&snapshot.turns, &snapshot.fixes);
+        }
+        // Its corners are still where they were dragged to if it is still
+        // that: if only its colours changed, say. If not, they mean nothing now.
+        if cropped(self) != was {
+            self.crop = None;
         }
         if snapshot.fields.len() == self.fields.len() {
             self.fields = snapshot.fields;
@@ -2575,6 +2638,7 @@ impl Editor {
             self.history.remove(0);
         }
         self.future.clear();
+        self.crop = None;
         self.mark_dirty();
     }
 
@@ -2893,6 +2957,381 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     /// Delete page `page` (and the fields on it). Undoable.
+    // -----------------------------------------------------------------------
+    // Cropping & colours
+    // -----------------------------------------------------------------------
+
+    /// ⌘K: start cropping the page in view. (Again: leave it as it is.)
+    fn start_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.crop.is_some() {
+            self.cancel_crop(cx);
+            return;
+        }
+        let Some(page) = self.current_page() else { return };
+        let Some((fixable, geom)) = self.doc.as_ref().and_then(|d| Some((d.loaded.can_fix(*d.order.get(page)?), d.geom(page)?.clone()))) else {
+            return;
+        };
+        self.finish_editing(cx);
+        self.close_menus();
+        self.unfocus_find();
+        window.focus(&self.focus);
+        if !fixable {
+            self.status = format!("Page {} has form fields to fill in, so it can't be cropped.", page + 1).into();
+            cx.notify();
+            return;
+        }
+        (self.tool, self.selected, self.text_selection, self.drag) = (Tool::Select, None, None, None);
+        self.crop = Some(Cropping { page, quad: scan::corners(geom.width, geom.height), held: None });
+        // All of the page is in view while it is cropped: its corners are what is dragged.
+        let viewport = self.pages_scroll.bounds();
+        let in_view = self.live_page_bounds(page).is_none_or(|shown| {
+            shown.top() >= viewport.top() && shown.bottom() <= viewport.bottom() && shown.left() >= viewport.left() && shown.right() <= viewport.right()
+        });
+        if !in_view {
+            self.zoom_before_crop.get_or_insert((self.zoom_mode, self.zoom));
+            self.set_zoom_mode(ZoomMode::FitPage, window, cx);
+        }
+        self.status = format!("Cropping page {}: drag the corners to what you want to keep, then press {RETURN_KEY}.", page + 1).into();
+        cx.notify();
+    }
+
+    /// Esc: the page being cropped stays as it is.
+    fn cancel_crop(&mut self, cx: &mut Context<Self>) {
+        if self.crop.take().is_some() {
+            self.status = "Left the page as it is.".into();
+            cx.notify();
+        }
+    }
+
+    /// Where a crop is taken hold of: its corners, then the middle of each
+    /// side (the one from that corner to the next).
+    fn crop_handles(quad: &[scan::Spot; 4]) -> [scan::Spot; 8] {
+        std::array::from_fn(|handle| {
+            let (corner, next) = (quad[handle % 4], quad[(handle + 1) % 4]);
+            if handle < 4 { corner } else { ((corner.0 + next.0) / 2., (corner.1 + next.1) / 2.) }
+        })
+    }
+
+    /// A press on the page being cropped: it takes hold of the handle under
+    /// it, if one is. Anywhere else it drags the pages about, as ever.
+    fn crop_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let zoom = self.zoom;
+        let origin = self.crop.as_ref().and_then(|crop| self.slot_bounds(crop.page)).map(|bounds| bounds.origin);
+        let (Some(crop), Some(origin)) = (&mut self.crop, origin) else { return };
+        let at = event.position - origin;
+        let (x, y) = (at.x / px(zoom), at.y / px(zoom));
+        let nearest = Self::crop_handles(&crop.quad)
+            .into_iter()
+            .enumerate()
+            .map(|(handle, spot)| (handle, (spot.0 - x, spot.1 - y)))
+            .filter(|(_, away)| away.0.hypot(away.1) * zoom <= CROP_REACH)
+            .min_by(|a, b| a.1.0.hypot(a.1.1).total_cmp(&b.1.0.hypot(b.1.1)));
+        match nearest {
+            Some(held) => {
+                crop.held = Some(held);
+                cx.notify();
+            }
+            None => self.start_pan(event, window, cx),
+        }
+    }
+
+    /// The pointer moved with a handle of the crop held: the handle follows
+    /// it, as far as the page's edge, and as long as what is kept keeps its shape.
+    fn drag_crop(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let zoom = self.zoom;
+        let Some((origin, geom)) =
+            self.crop.as_ref().and_then(|crop| Some((self.slot_bounds(crop.page)?.origin, self.page_geom(crop.page)?.clone())))
+        else {
+            return;
+        };
+        let Some(crop) = &mut self.crop else { return };
+        let Some((handle, away)) = crop.held else { return };
+        let at = position - origin;
+        let (x, y) = ((at.x / px(zoom) + away.0).clamp(0., geom.width), (at.y / px(zoom) + away.1).clamp(0., geom.height));
+        let mut quad = crop.quad;
+        if handle < 4 {
+            quad[handle] = (x, y);
+        } else {
+            // A side moves as a whole, straight out or in.
+            let ends = [handle - 4, (handle - 3) % 4];
+            let (from, to) = (quad[ends[0]], quad[ends[1]]);
+            let length = (to.0 - from.0).hypot(to.1 - from.1).max(1e-3);
+            let out = ((to.1 - from.1) / length, (from.0 - to.0) / length);
+            let by = (x - (from.0 + to.0) / 2.) * out.0 + (y - (from.1 + to.1) / 2.) * out.1;
+            for end in ends {
+                quad[end] = ((quad[end].0 + by * out.0).clamp(0., geom.width), (quad[end].1 + by * out.1).clamp(0., geom.height));
+            }
+        }
+        if scan::is_sound(&quad, CROP_LEAST.min(geom.width / 2.).min(geom.height / 2.)) {
+            crop.quad = quad;
+            cx.notify();
+        }
+    }
+
+    /// Return: cut the page to the corners as they have been dragged, and
+    /// pull what is between them straight. Undoable.
+    fn apply_crop(&mut self, cx: &mut Context<Self>) {
+        let Some(Cropping { page, quad, .. }) = self.crop.take() else { return };
+        let Some((source, geom)) = self.doc.as_ref().and_then(|d| Some((*d.order.get(page)?, d.geom(page)?.clone()))) else { return };
+        let whole = scan::corners(geom.width, geom.height);
+        if quad.iter().zip(whole).all(|(corner, edge)| (corner.0 - edge.0).abs() < 0.5 && (corner.1 - edge.1).abs() < 0.5) {
+            self.status = "Nothing was cut off the page.".into();
+            cx.notify();
+            return;
+        }
+        let Some(doc) = &self.doc else { return };
+        let (was, turns) = (doc.loaded.fixes[source], doc.loaded.turns[source]);
+        // The corners on the page as the file has it. (Each quarter turn the
+        // page has been given moved every corner on by one.)
+        let to_file = page_map(&geom, turns, was.crop, true);
+        let file_quad: [scan::Spot; 4] = std::array::from_fn(|corner| to_file(quad[(corner + turns as usize) % 4]));
+        let (width, height) = scan::size_of(&quad);
+        let (width, height) = if turns % 2 == 1 { (height, width) } else { (width, height) };
+        // Until the page is drawn again: what there is of it, cut the same.
+        let stand_in = doc.pages[source].image.as_ref().and_then(|image| cropped_image(image, quad, &geom));
+        self.checkpoint();
+        self.fix_page(page, Fix { crop: Some(scan::Crop { quad: file_quad, width, height }), look: was.look });
+        if let (Some(view), Some(image)) = (self.doc.as_mut().map(|doc| &mut doc.pages[source]), stand_in) {
+            view.image.get_or_insert(image);
+        }
+        self.status = format!("Cropped page {}. It will be saved as a picture of itself. Press {} to undo.", page + 1, ui::keys("⌘Z")).into();
+        cx.notify();
+    }
+
+    /// Show all of the page being cropped again: what was cut off it before comes back.
+    fn uncrop(&mut self, cx: &mut Context<Self>) {
+        let Some(Cropping { page, .. }) = self.crop.take() else { return };
+        let Some(was) = self.doc.as_ref().and_then(|d| Some(d.loaded.fixes[*d.order.get(page)?])) else { return };
+        if was.crop.is_some() {
+            self.checkpoint();
+            self.fix_page(page, Fix { crop: None, ..was });
+            self.status = format!("Page {} is whole again.", page + 1).into();
+        }
+        cx.notify();
+    }
+
+    /// Have a page (by position) cropped and coloured as `fix` says, in place
+    /// of what was done to it before. What has been placed on it stays where
+    /// it is on what is left of the page, and goes with what is cut off.
+    /// (Not an undo step of its own.)
+    fn fix_page(&mut self, page: usize, fix: Fix) {
+        let Some(doc) = &self.doc else { return };
+        let Some(&source) = doc.order.get(page) else { return };
+        let (was, turns, before) = (doc.loaded.fixes[source], doc.loaded.turns[source], doc.loaded.pages[source].clone());
+        let (all_turns, mut fixes) = (doc.loaded.turns.clone(), doc.loaded.fixes.clone());
+        fixes[source] = fix;
+        self.show_pages(&all_turns, &fixes);
+        let Some(after) = self.page_geom(page).cloned() else { return };
+        if fix.crop == was.crop {
+            return;
+        }
+        // From the page as it was shown to the page as the file has it, and
+        // from there to the page as it is shown now.
+        let (to_file, from_file) = (page_map(&before, turns, was.crop, true), page_map(&after, turns, fix.crop, false));
+        let mut items = std::mem::take(&mut self.items);
+        items.retain_mut(|item| {
+            if item.page != page {
+                return true;
+            }
+            item.follow(|spot| from_file(to_file(spot)));
+            let on_page = item.x < after.width && item.y < after.height && item.x + item.w > 0. && item.y + item.h > 0.;
+            if on_page && !matches!(item.kind, ItemKind::Stroke { .. }) {
+                self.clamp_item(item);
+            }
+            on_page
+        });
+        self.items = items;
+        if self.selected.is_some_and(|id| !self.items.iter().any(|item| item.id == id)) {
+            (self.selected, self.editing) = (None, None);
+        }
+        self.drag = None;
+    }
+
+    /// The colours of the page in view, if a document is open.
+    fn look_in_view(&self) -> Option<(usize, usize, Fix)> {
+        let (page, doc) = (self.current_page()?, self.doc.as_ref()?);
+        let source = *doc.order.get(page)?;
+        Some((page, source, doc.loaded.fixes[source]))
+    }
+
+    /// Show the page in view in other colours (see [`Look`]). Undoable.
+    fn set_look(&mut self, look: Look, cx: &mut Context<Self>) {
+        self.close_menus();
+        cx.notify();
+        let Some((page, source, was)) = self.look_in_view() else { return };
+        if !self.doc.as_ref().is_some_and(|doc| doc.loaded.can_fix(source)) {
+            self.status = format!("Page {} has form fields to fill in, so its colours stay as they are.", page + 1).into();
+            return;
+        }
+        if was.look == look {
+            return;
+        }
+        self.finish_editing(cx);
+        // (A crop under way goes on: the page's colours don't move its corners.)
+        let cropping = self.crop.take();
+        self.checkpoint();
+        let fix = Fix { look, ..was };
+        self.fix_page(page, fix);
+        self.crop = cropping;
+        self.status = if fix.is_none() {
+            format!("Page {} is in its own colours again.", page + 1)
+        } else {
+            format!("Page {} is {}. It will be saved as a picture of itself. Press {} to undo.", page + 1, look_phrase(look), ui::keys("⌘Z"))
+        }
+        .into();
+    }
+
+    /// Show every page in the colours of the page in view. Undoable.
+    fn look_on_all_pages(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        cx.notify();
+        let Some((_, _, Fix { look, .. })) = self.look_in_view() else { return };
+        let Some(doc) = &self.doc else { return };
+        let (turns, mut fixes) = (doc.loaded.turns.clone(), doc.loaded.fixes.clone());
+        let (mut changed, mut left) = (0, 0);
+        for &source in &doc.order {
+            if !doc.loaded.can_fix(source) {
+                left += 1;
+            } else if fixes[source].look != look {
+                fixes[source].look = look;
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            self.status = format!("Every page is {} already.", look_phrase(look)).into();
+            return;
+        }
+        self.finish_editing(cx);
+        let cropping = self.crop.take();
+        self.checkpoint();
+        self.show_pages(&turns, &fixes);
+        self.crop = cropping;
+        let left = match left {
+            0 => String::new(),
+            n => format!(" ({} with form fields to fill in {} as {} was.)", count(n, "page"), if n == 1 { "stays" } else { "stay" }, if n == 1 { "it" } else { "they" }),
+        };
+        let pages = if changed == 1 { "page is" } else { "pages are" };
+        self.status = format!("{changed} more {pages} {}.{left} Press {} to undo.", look_phrase(look), ui::keys("⌘Z")).into();
+    }
+
+    /// The colours to show the page in view in.
+    fn render_look_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let look = self.look_in_view().map(|(_, _, fix)| fix.look).unwrap_or_default();
+        let mut panel = ui::menu_panel().child(ui::menu_caption("This page's colours"));
+        for (i, choice) in Look::ALL.into_iter().enumerate() {
+            panel = panel.child(
+                ui::menu_item(("look", i), choice.name(), choice == look, None)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_look(choice, cx))),
+            );
+        }
+        panel = panel.child(ui::menu_separator()).child(
+            ui::menu_item("look-all", "Same on all pages", false, None)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.look_on_all_pages(cx))),
+        );
+        self.floating_menu(panel, true, cx)
+    }
+
+    /// Over the page being cropped: what is to be cut off it dimmed, the
+    /// outline of what is kept, and the handles that is dragged by.
+    fn render_crop(&self, crop: &Cropping, geom: &PageGeom, cx: &mut Context<Self>) -> AnyElement {
+        let z = self.zoom;
+        let (quad, held) = (crop.quad, crop.held.map(|(handle, _)| handle));
+        let whole = scan::corners(geom.width, geom.height);
+        let handles = Self::crop_handles(&quad).into_iter().enumerate().map(move |(handle, (x, y))| {
+            // A corner's is larger than a side's.
+            let across = if handle < 4 { 2. * CROP_HANDLE } else { 1.25 * CROP_HANDLE };
+            div()
+                .absolute()
+                .left(px(CROP_REACH + x * z - across / 2.))
+                .top(px(CROP_REACH + y * z - across / 2.))
+                .size(px(across))
+                .rounded_full()
+                .bg(if held == Some(handle) { ui::accent() } else { gpui::white() })
+                .border_2()
+                .border_color(ui::accent())
+                .shadow(ui::card_shadow())
+                .cursor(if held.is_some() { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+        });
+        let line = ui::accent();
+        // It reaches a little past the page, so that a handle on the page's edge can be taken hold of.
+        div()
+            .absolute()
+            .left(px(-CROP_REACH))
+            .top(px(-CROP_REACH))
+            .w(px(geom.width * z + 2. * CROP_REACH))
+            .h(px(geom.height * z + 2. * CROP_REACH))
+            .cursor(CursorStyle::Arrow)
+            // (Nothing under it gets the press: not the page, nor what is placed on it.)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.crop_mouse_down(event, window, cx);
+                }),
+            )
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let origin = bounds.origin + point(px(CROP_REACH), px(CROP_REACH));
+                        let outline = |builder: &mut gpui::PathBuilder, corners: [scan::Spot; 4]| {
+                            for (i, (x, y)) in corners.into_iter().enumerate() {
+                                let at = origin + point(px(x * z), px(y * z));
+                                if i == 0 { builder.move_to(at) } else { builder.line_to(at) }
+                            }
+                            builder.close();
+                        };
+                        // The page with what is kept left out of it.
+                        let mut cut = gpui::PathBuilder::fill();
+                        outline(&mut cut, whole);
+                        outline(&mut cut, quad);
+                        if let Ok(path) = cut.build() {
+                            window.paint_path(path, rgba(0x00000080));
+                        }
+                        let mut kept = gpui::PathBuilder::stroke(px(2.));
+                        outline(&mut kept, quad);
+                        if let Ok(path) = kept.build() {
+                            window.paint_path(path, line);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .children(handles)
+            .into_any_element()
+    }
+
+    /// What can be done with the page being cropped, on the bar that says how.
+    fn render_crop_options(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let button = |id: &'static str, label: &'static str| {
+            div().id(id).px_2().py_0p5().rounded_full().cursor(CursorStyle::PointingHand).hover(|s| s.opacity(0.85)).child(label)
+        };
+        let cropped = self.crop.as_ref().and_then(|crop| {
+            let doc = self.doc.as_ref()?;
+            Some(doc.loaded.fixes[*doc.order.get(crop.page)?].crop.is_some())
+        });
+        let mut options = Vec::new();
+        if cropped == Some(true) {
+            options.push(
+                button("crop-whole", "Whole page")
+                    .bg(rgba(0xffffff1f))
+                    .tooltip(ui::tooltip("Bring back what was cropped off this page", None))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.uncrop(cx)))
+                    .into_any_element(),
+            );
+        }
+        options.push(
+            button("crop-apply", "Crop")
+                .bg(ui::accent())
+                .tooltip(ui::tooltip("Keep what is between the corners", Some(RETURN_KEY)))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.apply_crop(cx)))
+                .into_any_element(),
+        );
+        options
+    }
+
     /// Turn a page (the one in view, if none is named) a quarter turn:
     /// clockwise, or the other way. What is drawn on it turns with it.
     fn rotate_page(&mut self, page: Option<usize>, clockwise: bool, cx: &mut Context<Self>) {
@@ -2904,10 +3343,26 @@ impl Editor {
         };
         self.finish_editing(cx);
         self.close_menus();
+        // (A crop under way goes on: if it is of this page, its corners turn with it.)
+        let cropping = self.crop.take();
         self.checkpoint();
         let quarters = if clockwise { 1 } else { 3 };
+        self.crop = cropping.map(|mut crop| {
+            if crop.page == page {
+                let [a, b, c, d, e, f] = model::turn(quarters, geom.width as f64, geom.height as f64).map(|v| v as f32);
+                // Each corner is the next one round for every quarter turn.
+                let was = crop.quad;
+                crop.quad = std::array::from_fn(|corner| {
+                    let (x, y) = was[(corner + 4 - quarters as usize) % 4];
+                    (a * x + c * y + e, b * x + d * y + f)
+                });
+                crop.held = None;
+            }
+            crop
+        });
         turns[source] = (turns[source] + quarters) % 4;
-        self.turn_pages(&turns);
+        let fixes = self.doc.as_ref().map(|d| d.loaded.fixes.clone()).unwrap_or_default();
+        self.show_pages(&turns, &fixes);
         let mut items = std::mem::take(&mut self.items);
         for item in items.iter_mut().filter(|item| item.page == page) {
             item.turn(quarters, geom.width, geom.height);
@@ -2925,13 +3380,29 @@ impl Editor {
         cx.notify();
     }
 
-    /// Have the document's pages turned as `turns` says (quarter turns
-    /// clockwise, by original index), and with them their pictures and what
-    /// is known of them. (Not what has been placed on them: see `rotate_page`.)
-    fn turn_pages(&mut self, turns: &[u8]) {
+    /// Have the document's pages cropped and coloured as `fixes` says, and
+    /// turned as `turns` says (quarter turns clockwise), both by original
+    /// index; and with them their pictures and what is known of them. (Not
+    /// what has been placed on them: see `rotate_page` and `fix_page`.)
+    fn show_pages(&mut self, turns: &[u8], fixes: &[Fix]) {
         let Some(doc) = &mut self.doc else { return };
         let mut turned = false;
         for source in 0..doc.loaded.pages.len() {
+            let fix = fixes.get(source).copied().unwrap_or_default();
+            let was = doc.loaded.fixes[source];
+            if fix != was && doc.loaded.can_fix(source) {
+                turned = true;
+                doc.loaded.fix(source, fix);
+                let view = &mut doc.pages[source];
+                // A picture of another shape is of no use. One in other
+                // colours stays until the page is drawn again, which it is at once.
+                if fix.crop != was.crop {
+                    self.retired.extend(view.image.take());
+                }
+                self.retired.extend(view.thumb.take());
+                (view.rendered_scale, view.requested_scale) = (0., 0.);
+                doc.text[source] = None;
+            }
             let wanted = turns.get(source).copied().unwrap_or(0) % 4;
             let quarters = (wanted + 4 - doc.loaded.turns[source]) % 4;
             if quarters == 0 {
@@ -3139,6 +3610,7 @@ impl Editor {
         doc.widgets = forms::widgets_by_page(&merged.form, count);
         // (A page may have been turned while the others were being added.)
         let mut merged = merged;
+        merged.set_fixes(&doc.loaded.fixes);
         merged.set_turns(&doc.loaded.turns);
         doc.loaded = merged;
         // The pages stay in the document from here on; undo only takes them out of `order`.
@@ -3805,6 +4277,7 @@ impl Editor {
         self.help_menu_open = false;
         self.watermark_menu_open = false;
         self.watermark_editing = false;
+        self.look_menu_open = false;
         self.choice_open = None;
         self.goto = None;
         (self.app_menu_open, self.app_menu_item) = (None, None);
@@ -3816,6 +4289,7 @@ impl Editor {
             || self.shape_menu_open
             || self.help_menu_open
             || self.watermark_menu_open
+            || self.look_menu_open
             || self.choice_open.is_some()
             || self.app_menu_open.is_some()
     }
@@ -3898,6 +4372,16 @@ impl Editor {
                 self.pan = None;
             }
             cx.notify();
+            return;
+        }
+        if self.crop.as_ref().is_some_and(|crop| crop.held.is_some()) {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_crop(event.position, cx);
+            } else if let Some(crop) = &mut self.crop {
+                // The button was let go where that wasn't seen.
+                crop.held = None;
+                cx.notify();
+            }
             return;
         }
         if self.selecting_text {
@@ -3990,6 +4474,9 @@ impl Editor {
         if self.pan.take().is_some() {
             cx.notify();
         }
+        if self.crop.as_mut().is_some_and(|crop| crop.held.take().is_some()) {
+            cx.notify();
+        }
         self.finish_drag(cx);
     }
 
@@ -4070,6 +4557,19 @@ impl Editor {
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+
+        // While a page is being cropped, Return crops it and Esc leaves it as it
+        // is (unless something is being typed: a page number, a phrase to find).
+        let typing = self.goto.is_some() || self.find.as_ref().is_some_and(|find| find.focused);
+        if self.crop.is_some() && !typing && !shortcut && matches!(ks.key.as_str(), "enter" | "escape") {
+            if ks.key == "enter" {
+                self.apply_crop(cx);
+            } else {
+                self.cancel_crop(cx);
+            }
+            cx.stop_propagation();
             return;
         }
 
@@ -4504,6 +5004,33 @@ impl Editor {
                             ui::icon_button("rotate-right", "rotate-right")
                                 .tooltip(ui::tooltip("Rotate the page right", Some("⌘R")))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rotate_page(None, true, cx))),
+                        )
+                        // And what a scanner does to it: cut to its corners, its colours cleaned up.
+                        .child(
+                            ui::icon_button("crop-page", "crop")
+                                .when(self.crop.is_some(), |b| b.bg(ui::accent_soft()))
+                                .tooltip(ui::tooltip("Crop and straighten the page", Some("⌘K")))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.start_crop(window, cx))),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child(
+                                    ui::icon_button("page-colours", "colours")
+                                        .when(self.look_menu_open, |b| b.bg(ui::hover_bg()))
+                                        .when(!self.look_menu_open, |b| b.tooltip(ui::tooltip("Clean up the page's colours", None)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            if std::mem::take(&mut this.menu_dismissed) {
+                                                return;
+                                            }
+                                            let open = !this.look_menu_open;
+                                            this.close_menus();
+                                            this.look_menu_open = open;
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(self.look_menu_open, |d| d.child(self.render_look_menu(cx))),
                         )
                         .child(ui::vertical_divider())
                         .child(
@@ -6530,6 +7057,7 @@ impl Editor {
             on_page.sort_by_key(|i| i.is_redaction());
             let items: Vec<_> = on_page.into_iter().map(|item| self.render_item(item, cx)).collect();
             let widgets = self.render_widgets(source, cx);
+            let cropping = self.crop.as_ref().filter(|crop| crop.page == index).map(|crop| self.render_crop(crop, geom, cx));
             let mut found = self.render_find_marks(source);
             found.extend(self.render_text_selection(source));
             let watermark_image = self
@@ -6591,7 +7119,8 @@ impl Editor {
                 // What was looked for, the document's own fields, then the items placed on top.
                 .children(found)
                 .children(widgets)
-                .children(items);
+                .children(items)
+                .children(cropping);
 
             page_elements.push(
                 div()
@@ -6613,6 +7142,7 @@ impl Editor {
         page_elements.extend(skipped.map(space));
 
         let hint = match self.tool {
+            _ if self.crop.is_some() => Some(("crop", "Drag the corners or the sides to what you want to keep")),
             Tool::Select => None,
             Tool::Text => Some(("text", "Click on the page to add a text box")),
             Tool::Date => Some(("calendar", "Click on the page to add today's date")),
@@ -6624,7 +7154,9 @@ impl Editor {
             Tool::SelectText => Some(("select-text", "Drag over text to select it, or double-click a word")),
         };
         // A drawing tool's colours (and line widths) are chosen here, and it is put down with Esc.
-        let (options, done) = if self.tool.draws() {
+        let (options, done) = if self.crop.is_some() {
+            (self.render_crop_options(cx), "Esc to cancel")
+        } else if self.tool.draws() {
             let highlight = self.tool == Tool::Highlight;
             let color = if highlight { self.settings.highlight_color } else { self.settings.pen_color };
             (self.render_pen_options(0, highlight, color, (!highlight).then_some(self.settings.pen_width), cx), "Esc when done")
@@ -6761,6 +7293,17 @@ impl Render for Editor {
                 _ => {}
             }
         }
+        // A page was shown whole to be cropped, and that is over: the zoom is
+        // what it was again, unless it has been chosen anew meanwhile.
+        if self.crop.is_none() {
+            if let Some((mode, zoom)) = self.zoom_before_crop.take().filter(|_| self.zoom_mode == ZoomMode::FitPage && self.doc.is_some()) {
+                self.zoom_mode = mode;
+                match self.fit_zoom(mode) {
+                    Some(fit) => self.apply_zoom(fit, None, window, cx),
+                    None => self.apply_zoom(zoom, None, window, cx),
+                }
+            }
+        }
         for image in std::mem::take(&mut self.retired) {
             cx.drop_image(image, Some(window));
         }
@@ -6820,6 +7363,12 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &OpenAppMenu, _, cx| this.toggle_app_menu(cx)))
             .on_action(cx.listener(|this, _: &RotateLeft, _, cx| this.rotate_page(None, false, cx)))
             .on_action(cx.listener(|this, _: &RotateRight, _, cx| this.rotate_page(None, true, cx)))
+            .on_action(cx.listener(|this, _: &CropPage, window, cx| this.start_crop(window, cx)))
+            .on_action(cx.listener(|this, _: &ColoursOriginal, _, cx| this.set_look(Look::Original, cx)))
+            .on_action(cx.listener(|this, _: &ColoursEnhance, _, cx| this.set_look(Look::Enhanced, cx)))
+            .on_action(cx.listener(|this, _: &ColoursGray, _, cx| this.set_look(Look::Gray, cx)))
+            .on_action(cx.listener(|this, _: &ColoursMono, _, cx| this.set_look(Look::Mono, cx)))
+            .on_action(cx.listener(|this, _: &ColoursOnAllPages, _, cx| this.look_on_all_pages(cx)))
             .on_action(cx.listener(|this, _: &ZoomFitWidth, window, cx| this.set_zoom_mode(ZoomMode::FitWidth, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitPage, window, cx| this.set_zoom_mode(ZoomMode::FitPage, window, cx)))
             .on_action(cx.listener(|this, _: &AddSignature, window, cx| this.add_signature_dialog(window, cx)))
@@ -6961,13 +7510,13 @@ fn relative_time(timestamp: i64) -> String {
 }
 
 /// Wrap a rendered page (already BGRA) as a GPUI image.
-/// Render pages (index, scale and quarter turns) of a document in the background, one after
+/// Render pages (index, scale and how each is shown) of a document in the background, one after
 /// the other and sharing what they have in common (see `pdf::render_pages`).
 /// They arrive as they finish, for as long as they're being received and the
 /// task is kept.
 fn render_in_background(
     pdf: Arc<hayro::hayro_syntax::Pdf>,
-    pages: Vec<(usize, f32, u8)>,
+    pages: Vec<(usize, f32, pdf::Shown)>,
     executor: &gpui::BackgroundExecutor,
 ) -> (mpsc::UnboundedReceiver<(usize, Option<pdf::RenderedPage>)>, Task<()>) {
     let (done, rendered) = mpsc::unbounded();
@@ -6983,6 +7532,49 @@ fn commands_of(menu: &OwnedMenu) -> impl Iterator<Item = (usize, &str, &dyn gpui
         OwnedMenuItem::Action { name, action, .. } => Some((n, name.as_str(), action.as_ref())),
         _ => None,
     })
+}
+
+/// What is between four corners (on the page `geom`, in points) of a picture
+/// of that page, pulled straight.
+fn cropped_image(image: &RenderImage, quad: [scan::Spot; 4], geom: &PageGeom) -> Option<Arc<RenderImage>> {
+    let size = image.size(0);
+    let (width, height) = (size.width.0 as usize, size.height.0 as usize);
+    let (across, down) = (width as f32 / geom.width.max(1.), height as f32 / geom.height.max(1.));
+    let (w, h) = scan::size_of(&quad);
+    let (w, h) = (((w * across).round() as usize).max(1), ((h * down).round() as usize).max(1));
+    let bgra = scan::straighten(image.as_bytes(0)?, width, height, quad.map(|(x, y)| (x * across, y * down)), w, h)?;
+    to_render_image(pdf::RenderedPage { width: w as u32, height: h as u32, bgra })
+}
+
+/// Where a point goes between a page as it is shown — `shown`, which is the
+/// page as the file has it, cut to `crop` and then turned `turns` quarter
+/// turns clockwise — and the page as the file has it: from the first to the
+/// second if `to_file`, the other way if not.
+fn page_map(shown: &PageGeom, turns: u8, crop: Option<scan::Crop>, to_file: bool) -> impl Fn(scan::Spot) -> scan::Spot + use<> {
+    let turns = turns % 4;
+    let (width, height) = (shown.width as f64, shown.height as f64);
+    // Before it was turned, a page on its side was the other way up.
+    let (flat_width, flat_height) = if turns % 2 == 1 { (height, width) } else { (width, height) };
+    let [a, b, c, d, e, f] = if to_file { model::turn(4 - turns, width, height) } else { model::turn(turns, flat_width, flat_height) };
+    let warp = crop.and_then(|crop| {
+        let whole = scan::corners(crop.width, crop.height);
+        if to_file { scan::Warp::between(whole, crop.quad) } else { scan::Warp::between(crop.quad, whole) }
+    });
+    move |spot| {
+        let turned = |(x, y): scan::Spot| ((a * x as f64 + c * y as f64 + e) as f32, (b * x as f64 + d * y as f64 + f) as f32);
+        let warped = |spot: scan::Spot| warp.map_or(spot, |warp| warp.at(spot));
+        if to_file { warped(turned(spot)) } else { turned(warped(spot)) }
+    }
+}
+
+/// How a page in these colours is described: "Page 2 is …".
+fn look_phrase(look: Look) -> &'static str {
+    match look {
+        Look::Original => "in its own colours",
+        Look::Enhanced => "enhanced",
+        Look::Gray => "in grayscale",
+        Look::Mono => "in black and white",
+    }
 }
 
 /// A picture of a page, turned `quarters` quarter turns clockwise.
@@ -7105,11 +7697,23 @@ pub fn app_menus(self_updating: bool) -> Vec<Menu> {
                 MenuItem::action("Fit Width", ZoomFitWidth),
                 MenuItem::action("Fit Page", ZoomFitPage),
                 MenuItem::separator(),
-                MenuItem::action("Rotate Left", RotateLeft),
-                MenuItem::action("Rotate Right", RotateRight),
-                MenuItem::separator(),
                 MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
                 MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+            ],
+        },
+        // What is done to the page in view.
+        Menu {
+            name: "Page".into(),
+            items: vec![
+                MenuItem::action("Rotate Left", RotateLeft),
+                MenuItem::action("Rotate Right", RotateRight),
+                MenuItem::action("Crop…", CropPage),
+                MenuItem::separator(),
+                MenuItem::action("Original Colours", ColoursOriginal),
+                MenuItem::action("Enhance Colours", ColoursEnhance),
+                MenuItem::action("Grayscale", ColoursGray),
+                MenuItem::action("Black & White", ColoursMono),
+                MenuItem::action("Same Colours on All Pages", ColoursOnAllPages),
             ],
         },
         // macOS lists the open windows at the end of the menu with this name.
@@ -7174,6 +7778,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-g", GoToPage, None),
         KeyBinding::new("secondary-l", RotateLeft, None),
         KeyBinding::new("secondary-r", RotateRight, None),
+        KeyBinding::new("secondary-k", CropPage, None),
         KeyBinding::new("secondary-1", ZoomFitWidth, None),
         KeyBinding::new("secondary-2", ZoomFitPage, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -9042,6 +9647,230 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_page_is_cropped_to_its_corners_and_recoloured(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let geoms = |cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().geoms().map(|g| (g.width, g.height)).collect::<Vec<_>>())
+        };
+        let fixes = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().loaded.fixes.clone());
+        let quad = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.crop.as_ref().map(|crop| crop.quad));
+        let near = |a: scan::Spot, b: scan::Spot| (a.0 - b.0).abs() < 0.05 && (a.1 - b.1).abs() < 0.05;
+        let before = geoms(cx);
+        let (w, h) = before[0];
+        // From one place on the first page to another (in points), wherever the page is and however large.
+        let drag = |cx: &mut VisualTestContext, from: (f32, f32), to: (f32, f32)| {
+            cx.run_until_parked();
+            let (origin, zoom) = editor.read_with(cx, |e, _| (e.slot_bounds(0).expect("page was painted").origin, e.zoom));
+            let at = |(x, y): (f32, f32)| origin + point(px(x * zoom), px(y * zoom));
+            cx.simulate_mouse_down(at(from), MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(at(to), Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(at(to), MouseButton::Left, Modifiers::none());
+        };
+        let all_near = |quad: [scan::Spot; 4], to: [scan::Spot; 4]| quad.into_iter().zip(to).all(|(a, b)| near(a, b));
+        // Two highlights: one by the top left corner, one further down the page.
+        editor.update(cx, |e, _| e.tool = Tool::Highlight);
+        drag(cx, (20., 40.), (120., 70.));
+        drag(cx, (300., 400.), (400., 430.));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let steps = editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 2);
+            e.history.len()
+        });
+
+        // ⌘K: the corners of the page in view are there to drag. Esc leaves
+        // the page as it is, and so does Return with nothing dragged.
+        // A page too large to see all of is shown whole for it, and as it was shown again afterwards.
+        editor.update_in(cx, |e, window, cx| e.set_zoom(2.5, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("secondary-k");
+        assert_eq!(quad(cx), Some(scan::corners(w, h)));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert!(e.status.contains("Cropping page 1"), "{}", e.status);
+            let (page, viewport) = (e.slot_bounds(0).unwrap(), e.pages_scroll.bounds());
+            assert!(e.zoom < 2.5 && page.top() >= viewport.top() && page.bottom() <= viewport.bottom(), "{page:?} in {viewport:?}");
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(quad(cx), None);
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert_eq!((e.zoom, e.zoom_mode), (2.5, ZoomMode::Fixed)));
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1., window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("secondary-k enter");
+        editor.read_with(cx, |e, _| {
+            assert!(e.crop.is_none() && e.history.len() == steps && e.items.len() == 2);
+            assert!(e.doc.as_ref().unwrap().loaded.fixes.iter().all(Fix::is_none));
+        });
+
+        // A corner goes where it is dragged, from wherever on its handle it was taken hold of.
+        cx.simulate_keystrokes("secondary-k");
+        drag(cx, (3., 2.), (103., 202.));
+        drag(cx, (w - 2., 1.), (w - 52., 101.));
+        assert!(all_near(quad(cx).unwrap(), [(100., 200.), (w - 50., 100.), (w, h), (0., h)]), "{:?}", quad(cx));
+        // A click on the page away from the handles doesn't move them, nor does it reach what is on the page.
+        drag(cx, (350., 415.), (350., 415.));
+        editor.read_with(cx, |e, _| assert!(e.selected.is_none() && e.crop.as_ref().is_some_and(|crop| crop.held.is_none())));
+        // The middle of a side moves the side as a whole, straight out or in: it keeps its slope.
+        drag(cx, ((100. + w - 50.) / 2., 150.), ((100. + w - 50.) / 2., 190.));
+        let dragged = quad(cx).unwrap();
+        assert!(dragged[0].1 > 230. && dragged[0].1 < 240. && dragged[0].0 > 100., "{dragged:?}");
+        assert!(near((dragged[1].0 - dragged[0].0, dragged[1].1 - dragged[0].1), (w - 150., -100.)), "{dragged:?}");
+        assert!(near(dragged[2], (w, h)) && near(dragged[3], (0., h)), "{dragged:?}");
+        // What is kept can't be turned inside out.
+        drag(cx, (dragged[0].0, dragged[0].1), (w - 20., 110.));
+        assert!(scan::is_sound(&quad(cx).unwrap(), CROP_LEAST), "{:?}", quad(cx));
+        editor.update(cx, |e, _| e.crop.as_mut().unwrap().quad = dragged);
+
+        // Its colours can be chosen while its corners are being dragged: they
+        // stay where they are, through that and through undoing it.
+        cx.dispatch_action(ColoursEnhance);
+        assert_eq!((quad(cx), fixes(cx)[0]), (Some(dragged), Fix { crop: None, look: Look::Enhanced }));
+        cx.dispatch_action(ColoursOnAllPages);
+        assert_eq!((quad(cx), fixes(cx)[1].look), (Some(dragged), Look::Enhanced));
+        cx.simulate_keystrokes("secondary-z secondary-z");
+        assert_eq!(quad(cx), Some(dragged));
+        assert!(fixes(cx).iter().all(Fix::is_none));
+        cx.simulate_keystrokes("secondary-shift-z");
+        assert_eq!((quad(cx), fixes(cx)[0].look), (Some(dragged), Look::Enhanced));
+        cx.simulate_keystrokes("secondary-z");
+        // Turned, the page takes its corners round with it; turned back, they are where they were.
+        cx.simulate_keystrokes("secondary-r");
+        let turned = quad(cx).expect("still being cropped");
+        assert!(all_near(turned, [(h - dragged[3].1, dragged[3].0), (h - dragged[0].1, dragged[0].0), (h - dragged[1].1, dragged[1].0), (h - dragged[2].1, dragged[2].0)]), "{turned:?}");
+        cx.simulate_keystrokes("secondary-l");
+        assert!(all_near(quad(cx).unwrap(), dragged), "{:?}", quad(cx));
+        cx.simulate_keystrokes("secondary-z secondary-z");
+        assert!(quad(cx).is_none(), "undoing a turn leaves the corners nowhere: the crop is put down");
+        cx.simulate_keystrokes("secondary-k");
+        editor.update(cx, |e, _| e.crop.as_mut().unwrap().quad = dragged);
+
+        // Return: the page is what was between the corners, pulled straight.
+        cx.simulate_keystrokes("enter");
+        let (cw, ch) = scan::size_of(&dragged);
+        assert_eq!(geoms(cx), [(cw, ch), before[1]]);
+        assert_eq!(fixes(cx)[0], Fix { crop: Some(scan::Crop { quad: dragged, width: cw, height: ch }), look: Look::Original });
+        editor.read_with(cx, |e, _| assert_eq!((e.zoom, e.zoom_mode), (1., ZoomMode::Fixed)));
+        // What was on the part cut off went with it; the rest is where that part of the page went.
+        let to = scan::Warp::between(dragged, scan::corners(cw, ch)).unwrap();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.items.len(), 1);
+            let item = &e.items[0];
+            assert!(near((item.x + item.w / 2., item.y + item.h / 2.), to.at((350., 415.))), "{item:?}");
+            assert!((item.w - 100.).abs() < 1. && (item.h - 30.).abs() < 1., "{item:?}");
+            assert!(e.crop.is_none() && e.dirty && e.status.contains("Cropped page 1"), "{}", e.status);
+            // It shows at once: what there was of it, cut the same.
+            let size = e.doc.as_ref().unwrap().pages[0].image.as_ref().expect("a picture stands in").size(0);
+            assert!((size.width.0 as f32 / size.height.0 as f32 - cw / ch).abs() < 0.01);
+        });
+        // (A page with a picture to show is drawn again a moment later.)
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let view = &e.doc.as_ref().unwrap().pages[0];
+            let size = view.image.as_ref().expect("the page is drawn again").size(0);
+            assert!(view.rendered_scale > 0. && (size.width.0 as f32 / size.height.0 as f32 - cw / ch).abs() < 0.01);
+        });
+
+        // Undo brings the page back whole, with what was on it; redo crops it again.
+        cx.simulate_keystrokes("secondary-z");
+        cx.run_until_parked();
+        assert_eq!(geoms(cx), before);
+        editor.read_with(cx, |e, _| {
+            assert!(e.doc.as_ref().unwrap().loaded.fixes.iter().all(Fix::is_none));
+            assert_eq!(e.items.iter().map(|i| (i.x, i.y)).collect::<Vec<_>>(), [(20., 40.), (300., 400.)]);
+        });
+        cx.simulate_keystrokes("secondary-shift-z");
+        cx.run_until_parked();
+        assert_eq!(geoms(cx), [(cw, ch), before[1]]);
+
+        // Turned, it is still the same part of the page; and it can be cropped
+        // again as it is shown, which cuts that part down.
+        cx.simulate_keystrokes("secondary-r");
+        assert_eq!(geoms(cx)[0], (ch, cw));
+        assert_eq!(fixes(cx)[0].crop.unwrap().quad, dragged);
+        cx.simulate_keystrokes("secondary-k");
+        assert_eq!(quad(cx), Some(scan::corners(ch, cw)));
+        drag(cx, (1., 1.), (31., 21.));
+        let again = quad(cx).unwrap();
+        assert!(near(again[0], (30., 20.)), "{again:?}");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (ws, hs) = scan::size_of(&again);
+        assert_eq!(geoms(cx)[0], (ws, hs));
+        let crop = fixes(cx)[0].crop.unwrap();
+        assert_eq!((crop.width, crop.height), (hs, ws), "as it was before it was turned");
+        // The top left of the page as it lies now is the bottom left of the
+        // page as the file has it: that corner moved, the others are where they were.
+        let back = scan::Warp::between(scan::corners(cw, ch), dragged).unwrap();
+        for (corner, there) in crop.quad.into_iter().zip([dragged[0], dragged[1], dragged[2], back.at((again[0].1, ch - again[0].0))]) {
+            assert!(near(corner, there), "{:?} for {there:?}", crop.quad);
+        }
+
+        // Its colours: black and white; then the same for every page.
+        cx.dispatch_action(ColoursMono);
+        assert_eq!(fixes(cx).iter().map(|fix| fix.look).collect::<Vec<_>>(), [Look::Mono, Look::Original]);
+        assert_eq!(fixes(cx)[0].crop, Some(crop));
+        editor.read_with(cx, |e, _| assert!(e.status.contains("Page 1 is in black and white"), "{}", e.status));
+        cx.dispatch_action(ColoursOnAllPages);
+        assert_eq!(fixes(cx).iter().map(|fix| fix.look).collect::<Vec<_>>(), [Look::Mono, Look::Mono]);
+        editor.read_with(cx, |e, _| assert!(e.status.starts_with("1 more page is in black and white"), "{}", e.status));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        // Shown as it will be saved: every pixel of the page black or white (or the smooth edge between).
+        editor.read_with(cx, |e, _| {
+            let image = e.doc.as_ref().unwrap().pages[0].image.clone().unwrap();
+            let pixels = image.as_bytes(0).unwrap();
+            assert!(pixels.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]));
+            assert!(pixels.chunks_exact(4).filter(|p| p[0] == 255).count() * 10 > pixels.len() / 4 * 9);
+        });
+
+        // Saved, the pages are those pictures, and Recents remembers what was done to them.
+        let out = test_dir().join("cropped.pdf");
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        let written = crate::pdf::load(std::fs::read(&out).unwrap()).unwrap();
+        assert!((written.pages[0].width - ws).abs() < 0.01 && (written.pages[0].height - hs).abs() < 0.01, "{:?}", written.pages[0]);
+        let done = fixes(cx);
+        editor.read_with(cx, |e, _| {
+            assert!(!e.dirty, "{}", e.status);
+            assert_eq!((&e.recents[0].fixes, &e.recents[0].turns), (&done, &vec![1]));
+        });
+        let placed = editor.read_with(cx, |e, _| e.items.iter().map(|i| (i.x, i.y, i.w, i.h)).collect::<Vec<_>>());
+
+        // While it is being cropped again, all of it can be brought back.
+        cx.simulate_keystrokes("secondary-k");
+        editor.update(cx, |e, cx| e.uncrop(cx));
+        cx.run_until_parked();
+        assert_eq!(geoms(cx)[0], (h, w));
+        assert_eq!(fixes(cx)[0], Fix { crop: None, look: Look::Mono });
+        editor.read_with(cx, |e, _| assert!(e.crop.is_none() && e.dirty && e.status.contains("whole again"), "{}", e.status));
+        // And its own colours: nothing is done to it any more.
+        cx.dispatch_action(ColoursOriginal);
+        assert!(fixes(cx)[0].is_none());
+        editor.read_with(cx, |e, _| assert!(e.status.contains("own colours again"), "{}", e.status));
+
+        // Reopened from Recents, the original is cropped, turned and coloured as it was saved.
+        let id = editor.read_with(cx, |e, _| e.recents[0].id.clone());
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        editor.update_in(cx, |e, window, cx| e.open_recent(&id, window, cx));
+        cx.run_until_parked();
+        assert_eq!(geoms(cx)[0], (ws, hs));
+        assert_eq!(fixes(cx), done);
+        editor.read_with(cx, |e, _| {
+            assert!(!e.dirty);
+            assert_eq!(e.items.iter().map(|i| (i.x, i.y, i.w, i.h)).collect::<Vec<_>>(), placed);
+        });
+    }
+
+    #[gpui::test]
     fn the_window_has_the_menus_where_there_is_no_menu_bar(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx);
         let open = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| (e.app_menu_open, e.app_menu_item));
@@ -9057,14 +9886,14 @@ mod tests {
         cx.run_until_parked();
         let menus = editor.read_with(cx, |e, cx| e.own_menus(cx));
         let names: Vec<&str> = menus.iter().map(|menu| menu.name.as_ref()).collect();
-        assert_eq!(names, ["PatraPDF", "File", "Edit", "View", "Window", "Help"]);
+        assert_eq!(names, ["PatraPDF", "File", "Edit", "View", "Page", "Window", "Help"]);
 
         // The menu key opens the first menu; the arrows go along the bar (and round it), and down a menu.
         cx.dispatch_action(OpenAppMenu);
         cx.run_until_parked();
         assert_eq!(open(cx), (Some(0), None));
         cx.simulate_keystrokes("left");
-        assert_eq!(open(cx), (Some(5), None));
+        assert_eq!(open(cx), (Some(6), None));
         cx.simulate_keystrokes("right right");
         assert_eq!(open(cx), (Some(1), None));
         let file: Vec<(usize, &str)> = commands_of(&menus[1]).map(|(n, name, _)| (n, name)).collect();
@@ -9615,6 +10444,7 @@ mod tests {
             watermark: Some(Watermark { text: "COPY".into(), ..Watermark::default() }),
             order: Some(vec![1, 0]),
             turns: Vec::new(),
+            fixes: Vec::new(),
             fields: Vec::new(),
         }];
 

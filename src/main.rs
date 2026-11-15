@@ -14,6 +14,7 @@ mod model;
 mod pdf;
 mod print;
 mod recents;
+mod scan;
 mod scrollbar;
 mod search;
 mod settings;

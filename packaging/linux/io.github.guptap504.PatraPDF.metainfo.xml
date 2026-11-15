@@ -32,6 +32,13 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.7.0" date="2026-11-15">
+      <description>
+        <p>Clean up scans and photos of pages, as a phone's scanner does: crop a page by dragging its corners, and it is pulled straight.</p>
+        <p>Choose a page's colours: enhanced (the paper made white, shadows taken off it), grayscale, or black and white.</p>
+        <p>A Page menu holds rotating, cropping and the colours.</p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-11-15">
       <description>
         <p>Print the finished document, and rotate pages to the left or the right.</p>
