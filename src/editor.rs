@@ -77,10 +77,15 @@ actions!(
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.0;
 const MAX_RENDER_SCALE: f32 = 6.0;
-/// How many bytes of page bitmaps a document keeps. One with more pages than
-/// that holds has the pages around the one in view drawn, and the rest again
-/// when they are scrolled to.
-const RENDER_BUDGET: usize = 1 << 30;
+/// How many bytes of page bitmaps a document keeps: the pages around the one
+/// in view, the rest being drawn again when they are scrolled to. A page that
+/// has been on screen takes twice its bitmap, as the graphics card has a copy.
+const RENDER_BUDGET: usize = 128 << 20;
+/// Thumbnails are drawn for the pages in sight in the rail, and for those this
+/// far either side of the page in view (which they stand in for until the
+/// page itself is drawn). Past `THUMBS_KEPT` of them, the others are let go.
+const THUMBS_AROUND: usize = 8;
+const THUMBS_KEPT: usize = 96;
 
 /// The pages (by position) to keep drawn at `scale`, nearest to `current`
 /// first: as many as `budget` bytes hold, and the nearest three whatever they take.
@@ -764,6 +769,8 @@ pub struct Editor {
     /// The installed fonts being found (see `load_fonts`).
     fonts_task: Option<Task<()>>,
     thumb_task: Option<Task<()>>,
+    /// The pages (original indices) `thumb_task` was started for.
+    thumbs_pending: Vec<usize>,
     _appearance_observer: Subscription,
     /// The app's updater (absent in tests), and our subscriptions to it.
     updater: Option<Entity<Updater>>,
@@ -910,6 +917,7 @@ impl Editor {
             opening: None,
             fonts_task: None,
             thumb_task: None,
+            thumbs_pending: Vec::new(),
             _appearance_observer: appearance_observer,
             updater: updater.clone(),
             _updater_subscriptions: updater
@@ -1167,7 +1175,7 @@ impl Editor {
         self.thumbs_scroll.set_offset(point(px(0.), px(0.)));
         self.rail_page = None;
         self.ensure_rendered(window, cx);
-        self.render_thumbnails(window, cx);
+        self.ensure_thumbnails(window, cx);
         cx.notify();
         match then {
             Some(AfterOpen::Restore(id)) => {
@@ -1251,6 +1259,7 @@ impl Editor {
         (self.text_selection, self.selecting_text) = (None, false);
         self.render_task = None;
         self.thumb_task = None;
+        self.thumbs_pending.clear();
     }
 
     /// Close the document and go back to the gallery (asking first if there are unsaved changes).
@@ -1768,27 +1777,49 @@ impl Editor {
         marks
     }
 
-    /// Render the small page images for the thumbnail rail: once per document,
-    /// and again for the pages added to it.
-    fn render_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(doc) = &self.doc else { return };
+    /// Render the small page images: for the pages in sight in the thumbnail
+    /// rail, and for those around the page in view. The rest are drawn when
+    /// they are scrolled to, and let go once many are held: a long document
+    /// has hundreds of pages.
+    fn ensure_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.current_page().unwrap_or(0);
+        // Before the rail has been laid out, which thumbnails are in sight isn't known.
+        let rail = self.settings.show_right_sidebar && self.painted_thumb.get().is_some() && self.thumbs_scroll.bounds().size.height > px(0.);
+        let in_rail = if rail { self.drawn_thumbs() } else { Vec::new() };
+        let Some(doc) = &mut self.doc else { return };
+        // The pages (positions) to have thumbnails of, nearest the one in view first.
+        let mut wanted: Vec<usize> =
+            (0..doc.order.len()).filter(|&p| p.abs_diff(current) <= THUMBS_AROUND || in_rail.get(p).is_some_and(|&shown| shown)).collect();
+        wanted.sort_by_key(|&position| position.abs_diff(current));
+        let wanted: Vec<usize> = wanted.into_iter().map(|position| doc.order[position]).collect();
+        if doc.pages.iter().filter(|page| page.thumb.is_some()).count() > THUMBS_KEPT {
+            let mut keep = vec![false; doc.pages.len()];
+            wanted.iter().for_each(|&i| keep[i] = true);
+            for (page, _) in doc.pages.iter_mut().zip(keep).filter(|(_, keep)| !keep) {
+                if let Some(old) = page.thumb.take() {
+                    cx.drop_image(old, Some(window));
+                }
+            }
+        }
+        let missing: Vec<usize> = wanted.into_iter().filter(|&i| doc.pages[i].thumb.is_none()).collect();
+        // Nothing to do, either, if the render under way is drawing them.
+        if missing.iter().all(|i| self.thumbs_pending.contains(i)) {
+            return;
+        }
         let path = doc.path.clone();
-        let pages: Vec<(usize, f32)> = doc
-            .loaded
-            .pages
-            .iter()
-            .map(|p| THUMB_RENDER_PX / p.width.max(1.))
-            .enumerate()
-            .filter(|(index, _)| doc.pages[*index].thumb.is_none())
-            .collect();
+        let pages: Vec<(usize, f32)> = missing.iter().map(|&i| (i, THUMB_RENDER_PX / doc.loaded.pages[i].width.max(1.))).collect();
         let pdf = doc.loaded.pdf.clone();
+        self.thumbs_pending = missing;
+        // (This replaces `thumb_task`, which stops the render it was waiting for.)
         self.thumb_task = Some(cx.spawn_in(window, async move |this, cx| {
             let (mut rendered, _rendering) = render_in_background(pdf, pages, cx.background_executor());
             while let Some((index, page)) = rendered.next().await {
                 let Some(image) = page.and_then(to_render_image) else { continue };
-                let ok = this.update(cx, |this, cx| {
+                let ok = this.update_in(cx, |this, window, cx| {
                     let Some(doc) = this.doc.as_mut().filter(|d| d.path == path) else { return false };
-                    doc.pages[index].thumb = Some(image);
+                    if let Some(old) = doc.pages[index].thumb.replace(image) {
+                        cx.drop_image(old, Some(window));
+                    }
                     cx.notify();
                     true
                 });
@@ -1801,9 +1832,11 @@ impl Editor {
 
     /// (Re-)render pages whose bitmap is too low-resolution for the current zoom.
     fn ensure_rendered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = (self.zoom * window.scale_factor()).clamp(1.0, MAX_RENDER_SCALE);
-        // Render a bit above what's needed so small zoom steps don't re-render.
-        let scale = (wanted * 1.25).min(MAX_RENDER_SCALE);
+        // As sharp as the screen shows it. A bitmap will do while it is nearly
+        // that sharp, and not so much sharper (after zooming out) that it takes
+        // far more memory than it need.
+        let scale = (self.zoom * window.scale_factor()).clamp(1.0, MAX_RENDER_SCALE);
+        let fits = |drawn: f32| drawn >= scale * 0.95 && drawn <= scale * 1.5;
         let current = self.current_page().unwrap_or(0);
         let budget = self.render_budget;
         let Some(doc) = &mut self.doc else { return };
@@ -1825,11 +1858,11 @@ impl Editor {
                 (page.rendered_scale, page.requested_scale) = (0., 0.);
             }
         }
-        let stale: Vec<usize> = near.into_iter().filter(|&i| doc.pages[i].rendered_scale < wanted * 0.95).collect();
+        let stale: Vec<usize> = near.into_iter().filter(|&i| !fits(doc.pages[i].rendered_scale)).collect();
         // Nothing to do, either, if the render under way is drawing them sharply
         // enough: when a document opens, the zoom that fits the window is only
         // known a frame after its pages were first asked for.
-        if stale.iter().all(|&i| doc.pages[i].requested_scale >= wanted * 0.95) {
+        if stale.iter().all(|&i| fits(doc.pages[i].requested_scale)) {
             return;
         }
         stale.iter().for_each(|&i| doc.pages[i].requested_scale = scale);
@@ -2749,7 +2782,7 @@ impl Editor {
         doc.imports.push(import);
         self.selected = None;
         self.ensure_rendered(window, cx);
-        self.render_thumbnails(window, cx);
+        self.ensure_thumbnails(window, cx);
         // The find bar looks through the new pages too.
         self.text_task = None;
         if self.find.is_some() {
@@ -5991,10 +6024,11 @@ impl Editor {
                     .absolute()
                     .size_full(),
                 )
-                .when_some(view.image.clone(), |d, image| {
+                // Until the page is drawn, its thumbnail stands in for it.
+                .when_some(view.image.clone().or_else(|| view.thumb.clone()), |d, image| {
                     d.child(img(image).absolute().size_full().object_fit(ObjectFit::Fill))
                 })
-                .when(view.image.is_none(), |d| {
+                .when(view.image.is_none() && view.thumb.is_none(), |d| {
                     d.child(
                         div()
                             .absolute()
@@ -6190,6 +6224,7 @@ impl Render for Editor {
             }
         }
         self.follow_in_rail();
+        self.ensure_thumbnails(window, cx);
         // A sidebar came or went: this frame lays the page view out at its new
         // size, and the next one can fit the zoom to it.
         if std::mem::take(&mut self.refit) {
@@ -7662,7 +7697,7 @@ mod tests {
 
         // With room for all of them, all are drawn.
         editor.update_in(cx, |e, window, cx| {
-            e.render_budget = RENDER_BUDGET;
+            e.render_budget = usize::MAX;
             e.ensure_rendered(window, cx);
         });
         cx.run_until_parked();
@@ -7942,6 +7977,87 @@ mod tests {
         cx.simulate_mouse_down(point(viewport.left() + px(60.), viewport.bottom() - half), MouseButton::Left, none);
         editor.read_with(cx, |e, _| assert!(e.pan.is_some() && e.scrollbar_held.get().is_none()));
         cx.simulate_mouse_up(point(viewport.left() + px(60.), viewport.bottom() - half), MouseButton::Left, none);
+    }
+
+    #[gpui::test]
+    fn a_long_document_holds_only_the_bitmaps_it_shows(cx: &mut TestAppContext) {
+        const PAGES: usize = 150;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-memory.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| {
+            e.settings.show_right_sidebar = true;
+            e.open_path(path, window, cx);
+        });
+        cx.run_until_parked();
+        // The positions with a thumbnail, and with the page itself drawn.
+        let held = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| {
+                let doc = e.doc.as_ref().unwrap();
+                let positions = |has: fn(&PageView) -> bool| (0..PAGES).filter(|&p| has(&doc.pages[doc.order[p]])).collect::<Vec<_>>();
+                (positions(|page| page.thumb.is_some()), positions(|page| page.image.is_some()))
+            })
+        };
+
+        // Just opened: the first pages and their thumbnails, not all hundred and fifty.
+        let (thumbs, pages) = held(&editor, cx);
+        assert!(thumbs.starts_with(&[0, 1, 2]) && thumbs.len() < 40 && thumbs.iter().all(|&p| p < 40), "{thumbs:?}");
+        assert!(pages.starts_with(&[0, 1, 2]) && pages.len() < PAGES, "{pages:?}");
+
+        // Far down, the ones there: around the page in view, and in sight in the rail.
+        editor.update(cx, |e, cx| e.scroll_to_page(100, cx));
+        cx.run_until_parked();
+        let (thumbs, pages) = held(&editor, cx);
+        assert!((100 - THUMBS_AROUND..=100 + THUMBS_AROUND).all(|p| thumbs.contains(&p)), "{thumbs:?}");
+        assert!(pages.contains(&100) && pages.iter().all(|&p| p.abs_diff(100) < 40), "{pages:?}");
+        editor.read_with(cx, |e, _| {
+            let shown = e.drawn_thumbs();
+            let doc = e.doc.as_ref().unwrap();
+            assert!((1..PAGES).filter(|&p| shown[p]).all(|p| doc.pages[doc.order[p]].thumb.is_some()), "those in sight in the rail");
+        });
+
+        // Paged through from end to end, it never holds many more than it keeps.
+        for page in (0..PAGES).step_by(4) {
+            editor.update(cx, |e, cx| e.scroll_to_page(page, cx));
+            cx.run_until_parked();
+            let (thumbs, pages) = held(&editor, cx);
+            assert!(thumbs.contains(&page) && pages.contains(&page), "page {page} is drawn, and its thumbnail");
+            assert!(thumbs.len() <= THUMBS_KEPT + 3 * THUMBS_AROUND + 24, "{} thumbnails at page {page}", thumbs.len());
+        }
+        let (thumbs, _) = held(&editor, cx);
+        // (All but the first, which the rail always draws: the others are placed from it.)
+        assert!(thumbs.iter().all(|&p| p == 0 || p > 20), "the first pages' thumbnails were let go: {thumbs:?}");
+
+        // With the rail hidden, there are still thumbnails around the page in view, to stand in for it.
+        cx.dispatch_action(ToggleRightSidebar);
+        editor.update(cx, |e, cx| e.scroll_to_page(40, cx));
+        cx.run_until_parked();
+        let (thumbs, _) = held(&editor, cx);
+        assert!((40 - THUMBS_AROUND..=40 + THUMBS_AROUND).all(|p| thumbs.contains(&p)), "{thumbs:?}");
+
+        // A page is drawn as sharply as it's shown: sharper when zoomed in, and
+        // not left that large once zoomed out again.
+        let sharpness = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| {
+                let doc = e.doc.as_ref().unwrap();
+                doc.pages[doc.order[e.current_page().unwrap()]].rendered_scale
+            })
+        };
+        let settle = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+        };
+        let factor = cx.update(|window, _| window.scale_factor());
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1.0, window, cx));
+        settle(cx);
+        assert_eq!(sharpness(&editor, cx), factor.max(1.));
+        editor.update_in(cx, |e, window, cx| e.set_zoom(3.0, window, cx));
+        settle(cx);
+        assert_eq!(sharpness(&editor, cx), 3. * factor);
+        editor.update_in(cx, |e, window, cx| e.set_zoom(1.0, window, cx));
+        settle(cx);
+        assert_eq!(sharpness(&editor, cx), factor.max(1.));
     }
 
     #[test]

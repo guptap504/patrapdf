@@ -32,6 +32,11 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.5.3" date="2026-11-15">
+      <description>
+        <p>Long documents take far less memory: only the pages and thumbnails around the ones in view are kept drawn.</p>
+      </description>
+    </release>
     <release version="0.5.2" date="2026-11-15">
       <description>
         <p>Scroll bars, and the page thumbnails follow the document as it is scrolled.</p>
