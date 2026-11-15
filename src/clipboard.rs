@@ -17,10 +17,24 @@ fn dir() -> PathBuf {
     app_data_dir().join("clipboard")
 }
 
+/// Where a copy is kept that was opened in another app to print (see `print.rs`).
+fn print_dir() -> PathBuf {
+    app_data_dir().join("print")
+}
+
 /// Keep `bytes` as the file called `name`, in place of the copy kept before.
 /// Only the user can read it.
 pub fn keep(name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let dir = dir();
+    keep_in(dir(), name, bytes)
+}
+
+/// The same, for a copy to print: it doesn't take the place of the one on the clipboard.
+#[cfg_attr(test, allow(dead_code))]
+pub fn keep_to_print(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    keep_in(print_dir(), name, bytes)
+}
+
+fn keep_in(dir: PathBuf, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     private_dir(&dir).with_context(|| format!("couldn't create {}", dir.display()))?;
     for old in std::fs::read_dir(&dir)?.flatten() {
         let _ = std::fs::remove_file(old.path());
@@ -33,11 +47,13 @@ pub fn keep(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 
 /// Remove copies left by earlier runs, once they are a day old.
 pub fn tidy() {
-    let Ok(copies) = std::fs::read_dir(dir()) else { return };
-    for copy in copies.flatten() {
-        let age = copy.metadata().and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok());
-        if age.is_some_and(|age| age > KEPT_FOR) {
-            let _ = std::fs::remove_file(copy.path());
+    for dir in [dir(), print_dir()] {
+        let Ok(copies) = std::fs::read_dir(dir) else { continue };
+        for copy in copies.flatten() {
+            let age = copy.metadata().and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok());
+            if age.is_some_and(|age| age > KEPT_FOR) {
+                let _ = std::fs::remove_file(copy.path());
+            }
         }
     }
 }

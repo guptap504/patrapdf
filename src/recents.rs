@@ -48,6 +48,10 @@ pub struct RecentEntry {
     /// `None` when unchanged.
     #[serde(default)]
     pub order: Option<Vec<usize>>,
+    /// The quarter turns clockwise each page was given (by original index, as
+    /// far as any was turned).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<u8>,
     /// Values typed into the document's own form fields, by field name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, FieldValue)>,
@@ -181,6 +185,7 @@ pub fn record(
     output: &Path,
     page_count: usize,
     order: Option<&[usize]>,
+    turns: &[u8],
     imports: &[PageImport],
     contents: Option<Contents>,
 ) -> Result<Vec<RecentEntry>> {
@@ -252,6 +257,8 @@ pub fn record(
             items: saved_items,
             watermark: watermark.cloned(),
             order: order.map(<[usize]>::to_vec),
+            // (Nothing, for a document with no page turned.)
+            turns: turns[..turns.iter().rposition(|&turns| turns % 4 != 0).map_or(0, |last| last + 1)].to_vec(),
             fields,
             imports: imports.to_vec(),
         },
@@ -397,13 +404,14 @@ mod tests {
             fields: vec![("name".into(), FieldValue::Text("Jo".into()))],
             thumbnail: Some(thumb),
         };
-        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), &[], Some(contents)).unwrap();
+        let entries = record(Vec::new(), &original, &output, 2, Some(&[1, 0]), &[0, 3], &[], Some(contents)).unwrap();
         assert_eq!(entries.len(), 1);
         // The signature was copied into the store, so deleting the library file is harmless.
         std::fs::remove_file(&sig_path).unwrap();
 
         let loaded = load();
         assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].turns, [0, 3]);
         assert!(loaded[0].thumbnail.as_ref().is_some_and(|p| p.exists()));
         let mut n = 100;
         let restored = restore_items(&loaded[0], 2, || {
@@ -428,7 +436,7 @@ mod tests {
 
         // Saving the same original again updates the entry instead of adding one.
         let contents = Contents { items: &restored, ..Contents::default() };
-        let entries = record(loaded, &original, &output, 2, None, &[], Some(contents)).unwrap();
+        let entries = record(loaded, &original, &output, 2, None, &[], &[], Some(contents)).unwrap();
         assert_eq!(entries[0].watermark, None);
         assert_eq!(entries.len(), 1);
 

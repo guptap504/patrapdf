@@ -29,9 +29,9 @@ pub(super) enum InputTarget {
 impl Editor {
     /// What is being typed into, if anything. The password prompt takes its
     /// keys directly instead (no input method, as in system password fields),
-    /// and so does the prompt for the pages to add.
+    /// and so do the prompts for the pages to add and the page to go to.
     pub(super) fn input_target(&self) -> Option<InputTarget> {
-        if self.password_prompt.is_some() || self.import_prompt.is_some() {
+        if self.password_prompt.is_some() || self.import_prompt.is_some() || self.goto.is_some() {
             None
         } else if self.searching_recents() {
             Some(InputTarget::Recents)

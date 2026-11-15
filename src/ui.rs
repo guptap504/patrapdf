@@ -424,6 +424,23 @@ pub fn menu_item(
         .when_some(shortcut, |d, s| d.child(div().text_xs().text_color(text_tertiary()).child(keys(s))))
 }
 
+/// A row of one of the app's menus: what it does, and the keys that do the
+/// same. `on`: the keyboard is on it.
+pub fn menu_command(id: impl Into<ElementId>, label: impl Into<SharedString>, shortcut: Option<String>, on: bool) -> Stateful<Div> {
+    button_base(id)
+        .flex()
+        .items_center()
+        .gap_6()
+        .h(px(28.))
+        .px_2()
+        .rounded(px(5.))
+        .text_sm()
+        .cursor(CursorStyle::PointingHand)
+        .when(on, |d| d.bg(hover_bg()))
+        .child(div().flex_1().whitespace_nowrap().child(label.into()))
+        .when_some(shortcut, |d, keys| d.child(div().flex_none().text_xs().text_color(text_tertiary()).child(keys)))
+}
+
 /// A menu row that does something rather than choosing an option: an icon where the check mark would be.
 pub fn menu_action(id: impl Into<ElementId>, icon_name: &str, label: &'static str) -> Stateful<Div> {
     button_base(id)

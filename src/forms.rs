@@ -99,6 +99,26 @@ pub struct Widget {
     pub symbol: Symbol,
 }
 
+impl Widget {
+    /// Follow its page as that is turned: shown as `was`, now as `now`.
+    pub fn follow_page(&mut self, was: &PageGeom, now: &PageGeom) {
+        let [x, y, w, h] = self.rect.map(f64::from);
+        let to_view = Affine::new(now.view_to_user).inverse();
+        let view = (to_view * Affine::new(was.view_to_user)).transform_rect_bbox(Rect::new(x, y, x + w, y + h));
+        self.rect = [view.x0 as f32, view.y0 as f32, view.width() as f32, view.height() as f32];
+        self.upright = reads_upright(to_view, self.rotation);
+    }
+}
+
+/// Whether content turned `rotation` degrees in the file's space reads
+/// upright on a page shown through `to_view`.
+fn reads_upright(to_view: Affine, rotation: u16) -> bool {
+    // The content's x axis, as it points on screen.
+    let r = (rotation as f64).to_radians();
+    let axis = to_view * Point::new(r.cos(), r.sin()) - to_view * Point::ZERO;
+    axis.x > 0. && axis.y.abs() < axis.x * 1e-3
+}
+
 impl FieldKind {
     /// Check boxes and radio buttons: switched on or off rather than given text.
     pub fn is_button(&self) -> bool {
@@ -417,10 +437,7 @@ fn make_widget(
     let rotation = mk.and_then(|mk| int(doc, mk, b"R")).map(|r| (r.rem_euclid(360) / 90 * 90) as u16).unwrap_or(0);
     let (w, h) = (x1 - x0, y1 - y0);
     let size = if rotation % 180 == 90 { (h, w) } else { (w, h) };
-    // The content's x axis, turned by R, as it points on screen.
-    let r = (rotation as f64).to_radians();
-    let axis = to_view * Point::new(r.cos(), r.sin()) - to_view * Point::ZERO;
-    let upright = axis.x > 0. && axis.y.abs() < axis.x * 1e-3;
+    let upright = reads_upright(to_view, rotation);
     let color = |key: &[u8]| mk.and_then(|mk| mk.get(key).ok()).and_then(|o| rgb(&numbers(doc, o)));
     let border = color(b"BC");
     let border_width = doc

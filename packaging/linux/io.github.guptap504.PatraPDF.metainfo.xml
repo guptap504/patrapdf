@@ -32,6 +32,14 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.6.0" date="2026-11-15">
+      <description>
+        <p>Print the finished document, and rotate pages to the left or the right.</p>
+        <p>Go to a page by its number, and move through the document with Page Up, Page Down, Home and End.</p>
+        <p>A menu bar at the top of each window on Windows and Linux.</p>
+        <p>Less memory while a document is left open: only the pages in view stay drawn.</p>
+      </description>
+    </release>
     <release version="0.5.3" date="2026-11-15">
       <description>
         <p>Long documents take far less memory: only the pages and thumbnails around the ones in view are kept drawn.</p>

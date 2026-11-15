@@ -12,8 +12,8 @@ use futures::channel::{mpsc, oneshot};
 
 use gpui::{
     AnyElement, AnyWindowHandle, App, Axis, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, Global, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
+    FontWeight, Global, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    OwnedMenu, OwnedMenuItem, PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Task, WeakEntity, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
     size,
 };
@@ -26,6 +26,7 @@ use input::InputTarget;
 use crate::fonts::FontBook;
 use crate::forms::{self, FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
+use crate::print;
 use crate::recents::{self, RecentEntry};
 use crate::scrollbar::{self, scrollbar};
 use crate::clipboard;
@@ -53,6 +54,11 @@ actions!(
         Find,
         FindNext,
         FindPrevious,
+        GoToPage,
+        OpenAppMenu,
+        Print,
+        RotateLeft,
+        RotateRight,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -86,6 +92,27 @@ const RENDER_BUDGET: usize = 128 << 20;
 /// page itself is drawn). Past `THUMBS_KEPT` of them, the others are let go.
 const THUMBS_AROUND: usize = 8;
 const THUMBS_KEPT: usize = 96;
+/// Once the view has been still this long, only the pages in it stay drawn:
+/// the ones around it are drawn again when it moves.
+const REST_AFTER: Duration = Duration::from_secs(4);
+
+/// What decides which pages are in view: where the page list is scrolled to,
+/// the zoom, the size of the view, and the pages in their order and as they are turned.
+type ViewState = (Point<Pixels>, f32, gpui::Size<Pixels>, Vec<usize>, Vec<u8>);
+
+/// Hand the memory that has been freed back to the system, where the
+/// allocator keeps it for reuse otherwise: drawing pages frees a lot of it.
+/// (On macOS what pages take is given back as it is freed: see `alloc.rs`.)
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's own call for this; it takes no pointers.
+        unsafe { malloc_trim(0) };
+    }
+}
 
 /// The pages (by position) to keep drawn at `scale`, nearest to `current`
 /// first: as many as `budget` bytes hold, and the nearest three whatever they take.
@@ -158,6 +185,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Save a filled copy", "⌘S"),
             ("Save with a password", "⌥⌘S"),
             ("Copy the PDF to the clipboard", "⇧⌘C"),
+            ("Print", "⌘P"),
             ("Add signature image", "⇧⌘S"),
             ("All documents", "⌘W"),
             ("Search recent documents", "⌘F"),
@@ -172,6 +200,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Delete field", "⌫"),
             ("Find in the document", "⌘F"),
             ("Next / Previous match", "⌘G  ⇧⌘G"),
+            ("Go to a page", "⌥⌘G"),
             ("Nudge (Shift = 10pt)", "←↑→↓"),
             ("Next / Previous form field", "Tab  ⇧Tab"),
         ],
@@ -179,6 +208,9 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "View",
         &[
+            ("Page up / down", "PgUp  PgDn"),
+            ("First / Last page", "Home  End"),
+            ("Rotate the page left / right", "⌘L  ⌘R"),
             ("Zoom in / out", "⌘+  ⌘−"),
             ("Actual size", "⌘0"),
             ("Fit width / page", "⌘1  ⌘2"),
@@ -290,6 +322,8 @@ struct Snapshot {
     items: Vec<Item>,
     watermark: Option<Watermark>,
     order: Vec<usize>,
+    /// The quarter turns clockwise each page (by original index) has been given.
+    turns: Vec<u8>,
     /// Values of the document's form fields.
     fields: Vec<FieldValue>,
 }
@@ -721,6 +755,20 @@ pub struct Editor {
     /// Set when a click outside closed a menu, so that same click can't reopen it.
     menu_dismissed: bool,
     settings: Settings,
+    /// The window draws the app's menus itself: there is no menu bar to put them in.
+    own_menu_bar: bool,
+    /// Which of those menus is open, and the item in it the keyboard is on.
+    app_menu_open: Option<usize>,
+    app_menu_item: Option<usize>,
+    /// Asking which page to go to (⌥⌘G): the number as typed so far.
+    goto: Option<String>,
+    /// The document is being made ready for the printer.
+    printing: bool,
+    /// Pictures of pages no longer shown, to let go of when the window is next drawn.
+    retired: Vec<Arc<RenderImage>>,
+    /// The pages are to be looked over when the window is next drawn: some
+    /// may need drawing again.
+    redraw_pages: bool,
     /// Scroll state of the page list (children are the pages, in order).
     pages_scroll: ScrollHandle,
     /// Where each page *position* was last painted (window coordinates). Kept per
@@ -758,6 +806,11 @@ pub struct Editor {
     render_task: Option<Task<()>>,
     render_budget: usize,
     drawn_around: Option<DrawnAround>,
+    /// The view has been still for `REST_AFTER`: only the pages in it are
+    /// drawn. `rest_view` is the view that wait began with, and `rest_task` the wait.
+    resting: bool,
+    rest_view: Option<ViewState>,
+    rest_task: Option<Task<()>>,
     /// Text picked out with the Select text tool, and whether the drag that
     /// picks it out is under way.
     text_selection: Option<TextSelection>,
@@ -879,6 +932,13 @@ impl Editor {
             shape_menu_open: false,
             menu_dismissed: false,
             settings: Settings::load(),
+            own_menu_bar: draws_own_menus(),
+            app_menu_open: None,
+            app_menu_item: None,
+            goto: None,
+            printing: false,
+            retired: Vec::new(),
+            redraw_pages: false,
             pages_scroll: ScrollHandle::new(),
             page_slots: Vec::new(),
             painted_scroll: Rc::new(Cell::new(Point::default())),
@@ -911,6 +971,9 @@ impl Editor {
             render_task: None,
             render_budget: RENDER_BUDGET,
             drawn_around: None,
+            resting: false,
+            rest_view: None,
+            rest_task: None,
             text_selection: None,
             selecting_text: false,
             open_task: None,
@@ -1260,6 +1323,7 @@ impl Editor {
         self.render_task = None;
         self.thumb_task = None;
         self.thumbs_pending.clear();
+        (self.resting, self.rest_view, self.rest_task) = (false, None, None);
     }
 
     /// Close the document and go back to the gallery (asking first if there are unsaved changes).
@@ -1408,6 +1472,8 @@ impl Editor {
                 doc.order = order.clone();
             }
         }
+        // What was placed on a turned page was placed on it as it was shown.
+        self.turn_pages(&entry.turns);
         let page_count = self.doc.as_ref().map_or(0, |d| d.page_count());
         let mut next_id = self.next_id;
         self.items = recents::restore_items(entry, page_count, || {
@@ -1498,6 +1564,166 @@ impl Editor {
         self.doc.is_some() && self.editing.is_none() && self.field_editing.is_none() && self.find.as_ref().is_some_and(|f| f.focused)
     }
 
+    /// The app's menus, for the window to draw: the ones the app set up, as
+    /// the system keeps them where it has no menu bar to show them in.
+    fn own_menus(&self, cx: &App) -> Vec<OwnedMenu> {
+        cx.get_menus().filter(|menus| !menus.is_empty()).unwrap_or_else(|| app_menus(false).into_iter().map(Menu::owned).collect())
+    }
+
+    /// Open the first of the window's own menus (F10), or close the one that is open.
+    fn toggle_app_menu(&mut self, cx: &mut Context<Self>) {
+        if !self.own_menu_bar {
+            return;
+        }
+        let open = self.app_menu_open.is_none();
+        self.finish_editing(cx);
+        self.close_menus();
+        self.app_menu_open = open.then_some(0);
+        cx.notify();
+    }
+
+    /// Do what an item of the window's own menus says, as the menu bar would.
+    fn run_menu_command(&mut self, action: Box<dyn gpui::Action>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menus();
+        window.focus(&self.focus);
+        window.dispatch_action(action, cx);
+        cx.notify();
+    }
+
+    /// The app's menus where there is no menu bar for them (Windows, Linux):
+    /// a row of their names, each opening its menu. It is always there, so
+    /// nothing else moves. While a menu is open, the pointer opens the others
+    /// as it passes over their names.
+    fn render_app_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.own_menu_bar {
+            return None;
+        }
+        let open = self.app_menu_open;
+        let menus = self.own_menus(cx);
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let mut bar = div().flex().flex_none().items_center().gap_0p5().h(px(32.)).px_1p5().bg(ui::chrome_bg()).border_b_1().border_color(ui::border());
+        for (index, menu) in menus.iter().enumerate() {
+            let mut name = ui::button_base(("app-menu-name", index))
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .text_sm()
+                .text_color(ui::text_secondary())
+                .hover(|s| s.bg(ui::hover_bg()).text_color(ui::text_primary()))
+                .when(open == Some(index), |d| d.bg(ui::pressed_bg()).text_color(ui::text_primary()))
+                .child(menu.name.clone())
+                .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                    if *over && this.app_menu_open.is_some_and(|open| open != index) {
+                        (this.app_menu_open, this.app_menu_item) = (Some(index), None);
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    // (A press on the name of the open menu has closed it: it is a press outside the menu.)
+                    if !std::mem::take(&mut this.menu_dismissed) {
+                        this.finish_editing(cx);
+                        this.close_menus();
+                        this.app_menu_open = Some(index);
+                        cx.notify();
+                    }
+                }));
+            if open == Some(index) {
+                let mut panel = ui::menu_panel().min_w(px(230.));
+                for (n, item) in menu.items.iter().enumerate() {
+                    panel = match item {
+                        OwnedMenuItem::Action { name, action, .. } => {
+                            let keys = keymap.bindings_for_action(action.as_ref()).next().map(|b| shortcut_label(b.keystrokes(), cfg!(target_os = "macos")));
+                            let action = action.boxed_clone();
+                            panel.child(
+                                ui::menu_command(("app-menu-item", n), name.clone(), keys, self.app_menu_item == Some(n))
+                                    .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                                        if *over && this.app_menu_item != Some(n) {
+                                            this.app_menu_item = Some(n);
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.run_menu_command(action.boxed_clone(), window, cx)
+                                    })),
+                            )
+                        }
+                        OwnedMenuItem::Separator => panel.child(ui::menu_separator()),
+                        // (The app's menus have neither menus within them nor ones of the system's.)
+                        OwnedMenuItem::Submenu(_) | OwnedMenuItem::SystemMenu(_) => panel,
+                    };
+                }
+                name = name.child(self.floating_menu(panel, false, cx));
+            }
+            bar = bar.child(name);
+        }
+        Some(bar.into_any_element())
+    }
+
+    /// ⌥⌘G: ask for the number of a page to go to.
+    fn start_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.finish_editing(cx);
+        self.close_menus();
+        self.unfocus_find();
+        window.focus(&self.focus);
+        self.goto = Some(String::new());
+        cx.notify();
+    }
+
+    /// Go to the page whose number was typed: the nearest there is, if there
+    /// is none with that number.
+    fn submit_goto(&mut self, cx: &mut Context<Self>) {
+        let count = self.doc.as_ref().map_or(0, |d| d.page_count());
+        let Some(number) = self.goto.take().and_then(|text| text.parse::<usize>().ok()).filter(|_| count > 0) else { return };
+        let page = number.clamp(1, count) - 1;
+        self.scroll_to_page(page, cx);
+        self.status = format!("Page {} of {count}", page + 1).into();
+    }
+
+    /// The box the page number is typed into.
+    fn render_goto_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.goto.clone()?;
+        let count = self.doc.as_ref()?.page_count();
+        let bar = ui::text_field(ui::accent())
+            .id("goto-bar")
+            .gap_1p5()
+            .h(px(36.))
+            .shadow(ui::ring())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().flex_none().text_color(ui::text_secondary()).child("Go to page"))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .min_w(px(28.))
+                    .text_color(ui::text_primary())
+                    .when(!text.is_empty(), |d| d.child(text))
+                    .child(ui::caret(px(15.)).flex_none()),
+            )
+            .child(div().flex_none().text_xs().text_color(ui::text_tertiary()).child(format!("of {count}")))
+            .child(
+                ui::icon_button("goto-close", "close")
+                    .size(px(24.))
+                    .flex_none()
+                    .tooltip(ui::tooltip("Close", Some("Esc")))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.goto = None;
+                        cx.notify();
+                    })),
+            );
+        // Under the find bar, when that is open too.
+        let top = if self.find.is_some() { 56. } else { 12. };
+        Some(div().absolute().top(px(top)).right(px(20.)).child(bar).into_any_element())
+    }
+
     /// ⌘F: look for text in the document, or among the recent documents when none is open.
     fn start_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.doc.is_none() {
@@ -1577,7 +1803,7 @@ impl Editor {
     /// looking through each as it arrives.
     fn read_text(&mut self, cx: &mut Context<Self>) {
         let Some(doc) = &self.doc else { return };
-        let unread: Vec<usize> = (0..doc.text.len()).filter(|&i| doc.text[i].is_none()).collect();
+        let unread: Vec<(usize, u8)> = (0..doc.text.len()).filter(|&i| doc.text[i].is_none()).map(|i| (i, doc.loaded.turns[i])).collect();
         if unread.is_empty() || self.text_task.is_some() {
             return;
         }
@@ -1792,7 +2018,7 @@ impl Editor {
             (0..doc.order.len()).filter(|&p| p.abs_diff(current) <= THUMBS_AROUND || in_rail.get(p).is_some_and(|&shown| shown)).collect();
         wanted.sort_by_key(|&position| position.abs_diff(current));
         let wanted: Vec<usize> = wanted.into_iter().map(|position| doc.order[position]).collect();
-        if doc.pages.iter().filter(|page| page.thumb.is_some()).count() > THUMBS_KEPT {
+        if self.resting || doc.pages.iter().filter(|page| page.thumb.is_some()).count() > THUMBS_KEPT {
             let mut keep = vec![false; doc.pages.len()];
             wanted.iter().for_each(|&i| keep[i] = true);
             for (page, _) in doc.pages.iter_mut().zip(keep).filter(|(_, keep)| !keep) {
@@ -1807,7 +2033,8 @@ impl Editor {
             return;
         }
         let path = doc.path.clone();
-        let pages: Vec<(usize, f32)> = missing.iter().map(|&i| (i, THUMB_RENDER_PX / doc.loaded.pages[i].width.max(1.))).collect();
+        let pages: Vec<(usize, f32, u8)> =
+            missing.iter().map(|&i| (i, THUMB_RENDER_PX / doc.loaded.pages[i].width.max(1.), doc.loaded.turns[i])).collect();
         let pdf = doc.loaded.pdf.clone();
         self.thumbs_pending = missing;
         // (This replaces `thumb_task`, which stops the render it was waiting for.)
@@ -1839,15 +2066,19 @@ impl Editor {
         let fits = |drawn: f32| drawn >= scale * 0.95 && drawn <= scale * 1.5;
         let current = self.current_page().unwrap_or(0);
         let budget = self.render_budget;
+        // At rest, just the pages in the view.
+        let in_view = self.resting.then(|| self.pages_in_view(current));
         let Some(doc) = &mut self.doc else { return };
         // The displayed pages to have drawn (original indices): the page in view
         // first, then outwards, for as far as the budget goes.
         let sizes: Vec<(f32, f32)> = doc.geoms().map(|g| (g.width, g.height)).collect();
-        let near = pages_in_budget(&sizes, current, scale, budget);
+        let near = in_view.unwrap_or_else(|| pages_in_budget(&sizes, current, scale, budget));
+        let partial = near.len() < doc.order.len();
+        // (At rest nothing is chosen again until the view moves: see `watch_rest`.)
         self.drawn_around =
-            (near.len() < doc.order.len()).then(|| DrawnAround { page: current, slack: (near.len() / 4).max(1), order: doc.order.clone() });
+            (partial && !self.resting).then(|| DrawnAround { page: current, slack: (near.len() / 4).max(1), order: doc.order.clone() });
         let near: Vec<usize> = near.into_iter().map(|position| doc.order[position]).collect();
-        if self.drawn_around.is_some() {
+        if partial {
             // The others give up their bitmaps.
             let mut keep = vec![false; doc.pages.len()];
             near.iter().for_each(|&i| keep[i] = true);
@@ -1859,6 +2090,11 @@ impl Editor {
             }
         }
         let stale: Vec<usize> = near.into_iter().filter(|&i| !fits(doc.pages[i].rendered_scale)).collect();
+        if stale.is_empty() {
+            // Whatever is still being drawn isn't wanted any more.
+            self.render_task = None;
+            return;
+        }
         // Nothing to do, either, if the render under way is drawing them sharply
         // enough: when a document opens, the zoom that fits the window is only
         // known a frame after its pages were first asked for.
@@ -1873,17 +2109,21 @@ impl Editor {
         let settle = stale.iter().all(|&i| doc.pages[i].image.is_some());
         let pdf = doc.loaded.pdf.clone();
         let path = doc.path.clone();
+        let pages: Vec<(usize, f32, u8)> = stale.into_iter().map(|index| (index, scale, doc.loaded.turns[index])).collect();
         self.render_task = Some(cx.spawn_in(window, async move |this, cx| {
             if settle {
                 cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
             }
-            let pages = stale.into_iter().map(|index| (index, scale)).collect();
             let (mut rendered, _rendering) = render_in_background(pdf, pages, cx.background_executor());
             while let Some((index, page)) = rendered.next().await {
                 let Some(image) = page.and_then(to_render_image) else { continue };
                 let ok = this.update_in(cx, |this, window, cx| {
                     let Some(doc) = this.doc.as_mut().filter(|d| d.path == path) else { return false };
                     let page = &mut doc.pages[index];
+                    // Not one that has been let go, or turned, since it was asked for.
+                    if page.requested_scale != scale {
+                        return true;
+                    }
                     if let Some(old) = page.image.replace(image) {
                         cx.drop_image(old, Some(window));
                     }
@@ -1972,6 +2212,7 @@ impl Editor {
         let loaded = doc.loaded.clone();
         let imports = doc.imports_in_use();
         let order = doc.order.clone();
+        let turns = doc.loaded.turns.clone();
         let page_count = order.len();
         let items = self.items.clone();
         let form = doc.loaded.form.clone();
@@ -2006,6 +2247,7 @@ impl Editor {
                 items: items.clone(),
                 watermark: watermark.clone(),
                 order: order.clone(),
+                turns,
                 fields: values.clone(),
             };
             // Remembered by name: the values that differ from the file's own.
@@ -2061,7 +2303,7 @@ impl Editor {
                         thumbnail,
                     });
                     let reordered = Some(saved.order.as_slice()).filter(|o| !o.iter().enumerate().all(|(i, &p)| i == p));
-                    match recents::record(this.recents.clone(), &original, &output, page_count, reordered, &imports, contents) {
+                    match recents::record(this.recents.clone(), &original, &output, page_count, reordered, &saved.turns, &imports, contents) {
                         Ok(entries) => {
                             this.recents = entries;
                             this.share(cx);
@@ -2115,6 +2357,62 @@ impl Editor {
                     let title = if to == SaveTo::File { "Couldn't save the PDF" } else { "Couldn't copy the PDF" };
                     this.show_error(title, &format!("{e:#}"), window, cx)
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// ⌘P: print the document as it would be saved, with everything on it. What
+    /// is printed is never protected: the document is open, and paper has no password.
+    fn print(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_editing(cx);
+        self.close_menus();
+        let Some(doc) = &self.doc else { return };
+        if std::mem::replace(&mut self.printing, true) {
+            return;
+        }
+        let name = file_name(doc.last_output.as_ref().unwrap_or(&doc.path));
+        let loaded = doc.loaded.clone();
+        let order = doc.order.clone();
+        let items = self.items.clone();
+        let form = doc.loaded.form.clone();
+        let values = self.fields.clone();
+        let watermark = self.watermark.clone();
+        let metrics = self.metrics;
+        self.status = "Getting the document ready to print…".into();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let written = cx
+                .background_executor()
+                .spawn(async move {
+                    let edits = pdf::Edits {
+                        order: &order,
+                        items: &items,
+                        watermark: watermark.as_ref(),
+                        metrics,
+                        password: None,
+                        form: &form,
+                        values: &values,
+                    };
+                    loaded.save(&edits)
+                })
+                .await;
+            let Ok(parent) = this.update_in(cx, |_, window, _| print::Parent::of(window)) else { return };
+            // The dialog is put up from here, not from inside an update: the
+            // system may draw the window again while it does.
+            let handed = written.and_then(|written| print::print(&written.bytes, &name, parent));
+            this.update_in(cx, |this, window, cx| {
+                this.printing = false;
+                match handed {
+                    Ok(None) => this.status = format!("Printing {name}").into(),
+                    Ok(Some(copy)) => {
+                        cx.open_with_system(&copy);
+                        this.status = format!("Opened {name} in your PDF viewer: print it from there").into();
+                    }
+                    Err(e) => this.show_error("Couldn't print the PDF", &format!("{e:#}"), window, cx),
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -2245,6 +2543,7 @@ impl Editor {
             items: self.items.clone(),
             watermark: self.watermark.clone(),
             order: self.doc.as_ref().map(|d| d.order.clone()).unwrap_or_default(),
+            turns: self.doc.as_ref().map(|d| d.loaded.turns.clone()).unwrap_or_default(),
             fields: self.fields.clone(),
         }
     }
@@ -2256,6 +2555,7 @@ impl Editor {
         self.watermark = snapshot.watermark;
         if let Some(doc) = self.doc.as_mut().filter(|_| !snapshot.order.is_empty()) {
             doc.order = snapshot.order;
+            self.turn_pages(&snapshot.turns);
         }
         if snapshot.fields.len() == self.fields.len() {
             self.fields = snapshot.fields;
@@ -2593,6 +2893,82 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     /// Delete page `page` (and the fields on it). Undoable.
+    /// Turn a page (the one in view, if none is named) a quarter turn:
+    /// clockwise, or the other way. What is drawn on it turns with it.
+    fn rotate_page(&mut self, page: Option<usize>, clockwise: bool, cx: &mut Context<Self>) {
+        let Some(page) = page.or_else(|| self.current_page()) else { return };
+        let Some((source, geom, mut turns)) =
+            self.doc.as_ref().and_then(|d| Some((*d.order.get(page)?, d.geom(page)?.clone(), d.loaded.turns.clone())))
+        else {
+            return;
+        };
+        self.finish_editing(cx);
+        self.close_menus();
+        self.checkpoint();
+        let quarters = if clockwise { 1 } else { 3 };
+        turns[source] = (turns[source] + quarters) % 4;
+        self.turn_pages(&turns);
+        let mut items = std::mem::take(&mut self.items);
+        for item in items.iter_mut().filter(|item| item.page == page) {
+            item.turn(quarters, geom.width, geom.height);
+            self.clamp_item(item);
+        }
+        self.items = items;
+        self.drag = None;
+        self.status = format!(
+            "Turned page {} {}. Press {} to turn it back.",
+            page + 1,
+            if clockwise { "to the right" } else { "to the left" },
+            ui::keys("⌘Z")
+        )
+        .into();
+        cx.notify();
+    }
+
+    /// Have the document's pages turned as `turns` says (quarter turns
+    /// clockwise, by original index), and with them their pictures and what
+    /// is known of them. (Not what has been placed on them: see `rotate_page`.)
+    fn turn_pages(&mut self, turns: &[u8]) {
+        let Some(doc) = &mut self.doc else { return };
+        let mut turned = false;
+        for source in 0..doc.loaded.pages.len() {
+            let wanted = turns.get(source).copied().unwrap_or(0) % 4;
+            let quarters = (wanted + 4 - doc.loaded.turns[source]) % 4;
+            if quarters == 0 {
+                continue;
+            }
+            turned = true;
+            doc.loaded.turn(source, quarters);
+            // The pictures there are turn too, so the page never shows the wrong way round.
+            let view = &mut doc.pages[source];
+            for image in [&mut view.image, &mut view.thumb] {
+                if let Some(old) = image.take() {
+                    *image = turned_image(&old, quarters);
+                    self.retired.push(old);
+                }
+            }
+            if view.image.is_none() {
+                view.rendered_scale = 0.;
+            }
+            // Whatever was being drawn of it is of the page as it was.
+            view.requested_scale = view.rendered_scale;
+            doc.text[source] = None;
+        }
+        if !turned {
+            return;
+        }
+        (self.render_task, self.thumb_task, self.text_task) = (None, None, None);
+        self.thumbs_pending.clear();
+        self.redraw_pages = true;
+        self.text_selection = None;
+        // Each page size has its own picture of the watermark.
+        self.watermark_preview.requested = None;
+        if let Some(find) = &mut self.find {
+            find.hits.clear();
+            find.current = None;
+        }
+    }
+
     fn delete_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let Some(count) = self.doc.as_ref().map(|d| d.page_count()) else { return };
         if page >= count {
@@ -2761,6 +3137,9 @@ impl Editor {
         doc.pages.extend((first..count).map(|_| PageView { image: None, thumb: None, rendered_scale: 0.0, requested_scale: 0.0 }));
         doc.text.extend((first..count).map(|_| None));
         doc.widgets = forms::widgets_by_page(&merged.form, count);
+        // (A page may have been turned while the others were being added.)
+        let mut merged = merged;
+        merged.set_turns(&doc.loaded.turns);
         doc.loaded = merged;
         // The pages stay in the document from here on; undo only takes them out of `order`.
         let position = doc.order.len();
@@ -2842,6 +3221,53 @@ impl Editor {
             top += height + px(THUMB_GAP);
             block
         }))
+    }
+
+    /// The pages (positions) with any part in the view, the one that takes
+    /// most of it (`current`) first.
+    fn pages_in_view(&self, current: usize) -> Vec<usize> {
+        let viewport = self.pages_scroll.bounds();
+        let mut pages: Vec<usize> = self
+            .live_pages_bounds()
+            .enumerate()
+            .filter(|(position, b)| *position == current || (b.bottom() > viewport.top() && b.top() < viewport.bottom()))
+            .map(|(position, _)| position)
+            .collect();
+        pages.sort_by_key(|&position| position.abs_diff(current));
+        pages
+    }
+
+    /// Come to rest once the view has been still for a while: the pages
+    /// around it are let go, and their memory with them. Any move of the view
+    /// ends the rest, and they are drawn again.
+    fn watch_rest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = &self.doc else { return };
+        let (offset, size) = (self.pages_scroll.offset(), self.pages_scroll.bounds().size);
+        let same = |(o, z, s, order, turns): &ViewState| {
+            (*o, *z, *s) == (offset, self.zoom, size) && *order == doc.order && *turns == doc.loaded.turns
+        };
+        if self.rest_view.as_ref().is_some_and(same) {
+            return;
+        }
+        self.rest_view = Some((offset, self.zoom, size, doc.order.clone(), doc.loaded.turns.clone()));
+        if std::mem::take(&mut self.resting) {
+            self.ensure_rendered(window, cx);
+        }
+        self.rest_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(REST_AFTER).await;
+            let rested = this.update_in(cx, |this, window, cx| {
+                this.resting = true;
+                this.ensure_rendered(window, cx);
+                this.ensure_thumbnails(window, cx);
+                cx.notify();
+            });
+            if rested.is_ok() {
+                // Once the window has been drawn without them: what it showed
+                // last is kept until then.
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor().spawn(async { release_freed_memory() }).await;
+            }
+        }));
     }
 
     /// Keep the thumbnail of the page in view in sight: when scrolling the
@@ -3380,10 +3806,18 @@ impl Editor {
         self.watermark_menu_open = false;
         self.watermark_editing = false;
         self.choice_open = None;
+        self.goto = None;
+        (self.app_menu_open, self.app_menu_item) = (None, None);
     }
 
     fn any_menu_open(&self) -> bool {
-        self.zoom_menu_open || self.date_menu_open || self.shape_menu_open || self.help_menu_open || self.watermark_menu_open || self.choice_open.is_some()
+        self.zoom_menu_open
+            || self.date_menu_open
+            || self.shape_menu_open
+            || self.help_menu_open
+            || self.watermark_menu_open
+            || self.choice_open.is_some()
+            || self.app_menu_open.is_some()
     }
 
     fn toggle_help_menu(&mut self, cx: &mut Context<Self>) {
@@ -3610,6 +4044,35 @@ impl Editor {
         let ks = &event.keystroke;
         let shortcut = ks.modifiers.platform || ks.modifiers.control;
 
+        // An open menu of the window's own menu bar takes the keys: along the
+        // bar, up and down the menu, and Return for the item they are on.
+        if let Some(open) = self.app_menu_open {
+            let menus = self.own_menus(cx);
+            let commands: Vec<usize> = menus.get(open).map(|menu| commands_of(menu).map(|(n, ..)| n).collect()).unwrap_or_default();
+            let at = self.app_menu_item.and_then(|item| commands.iter().position(|&n| n == item));
+            match ks.key.as_str() {
+                "escape" => self.close_menus(),
+                "left" | "right" if !menus.is_empty() => {
+                    let step = if ks.key == "right" { 1 } else { menus.len() - 1 };
+                    (self.app_menu_open, self.app_menu_item) = (Some((open + step) % menus.len()), None);
+                }
+                "down" if !commands.is_empty() => self.app_menu_item = Some(commands[at.map_or(0, |at| (at + 1) % commands.len())]),
+                "up" if !commands.is_empty() => {
+                    self.app_menu_item = Some(commands[at.map_or(commands.len() - 1, |at| (at + commands.len() - 1) % commands.len())])
+                }
+                "enter" => {
+                    let chosen = menus.get(open).and_then(|menu| commands_of(menu).find(|(n, ..)| Some(*n) == self.app_menu_item));
+                    if let Some((_, _, action)) = chosen {
+                        self.run_menu_command(action.boxed_clone(), window, cx);
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         // The password prompt takes all typing while it's open. Its text goes
         // straight in (no input method), as in system password fields.
         if let Some(prompt) = &mut self.password_prompt {
@@ -3650,6 +4113,27 @@ impl Editor {
                         prompt.text.clear();
                     }
                     prompt.text.push_str(&typed);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        // And the page to go to: a number.
+        if let Some(text) = &mut self.goto {
+            match ks.key.as_str() {
+                "escape" => self.goto = None,
+                "enter" => self.submit_goto(cx),
+                "backspace" => {
+                    text.pop();
+                }
+                _ if !shortcut => {
+                    let Some(typed) = ks.key_char.clone().filter(|c| c.chars().all(|c| c.is_ascii_digit())) else { return };
+                    if text.len() + typed.len() <= 7 {
+                        text.push_str(&typed);
+                    }
                 }
                 _ => return,
             }
@@ -3759,6 +4243,24 @@ impl Editor {
             cx.stop_propagation();
             return;
         }
+        // Through the document by the screenful, and to either end of it.
+        if self.doc.is_some() && !shortcut {
+            let (offset, max) = (self.pages_scroll.offset(), self.pages_scroll.max_offset().height);
+            let screen = self.pages_scroll.bounds().size.height * 0.9;
+            let y = match ks.key.as_str() {
+                "pagedown" => Some(offset.y - screen),
+                "pageup" => Some(offset.y + screen),
+                "home" => Some(px(0.)),
+                "end" => Some(-max),
+                _ => None,
+            };
+            if let Some(y) = y {
+                self.pages_scroll.set_offset(point(offset.x, y.clamp(-max, px(0.))));
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         let Some(id) = self.selected else {
             if ks.key == "escape" {
                 // Put the tool down; with none in hand, close the find bar.
@@ -3807,13 +4309,13 @@ impl Editor {
     fn render_titlebar(&self, client_decorated: bool, maximized: bool, window_h: Pixels, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let has_doc = self.doc.is_some();
         let (left_shown, right_shown) = (self.settings.show_left_sidebar, self.settings.show_right_sidebar);
-        let (title, subtitle) = match &self.doc {
+        // The page in view, of how many: pressed, it asks for a page to go to.
+        let (title, subtitle, edited) = match &self.doc {
             Some(doc) => {
-                let n = doc.page_count();
-                let pages = format!("{n} page{}", if n == 1 { "" } else { "s" });
-                (file_name(&doc.path), if self.dirty { format!("{pages} · Edited") } else { pages })
+                let pages = format!("Page {} of {}", self.current_page().unwrap_or(0) + 1, doc.page_count());
+                (file_name(&doc.path), pages, self.dirty.then_some("· Edited"))
             }
-            None => ("PatraPDF".to_string(), "No document".to_string()),
+            None => ("PatraPDF".to_string(), "No document".to_string(), None),
         };
 
         div()
@@ -3908,7 +4410,20 @@ impl Editor {
                                     .when(self.dirty, |d| {
                                         d.child(div().size(px(6.)).rounded_full().bg(ui::warning()))
                                     })
-                                    .child(subtitle),
+                                    .child(
+                                        div()
+                                            .id("page-in-view")
+                                            .flex_none()
+                                            .when(has_doc, |d| {
+                                                d.cursor(CursorStyle::PointingHand)
+                                                    .hover(|s| s.text_color(ui::text_primary()))
+                                                    .tooltip(ui::tooltip("Go to a page", Some("⌥⌘G")))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.start_goto(window, cx)))
+                                            })
+                                            .child(subtitle),
+                                    )
+                                    .children(edited),
                             ),
                     ),
             )
@@ -3979,6 +4494,17 @@ impl Editor {
                                         })),
                                 ),
                         )
+                        // The page in view, turned a quarter turn either way.
+                        .child(
+                            ui::icon_button("rotate-left", "rotate-left")
+                                .tooltip(ui::tooltip("Rotate the page left", Some("⌘L")))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rotate_page(None, false, cx))),
+                        )
+                        .child(
+                            ui::icon_button("rotate-right", "rotate-right")
+                                .tooltip(ui::tooltip("Rotate the page right", Some("⌘R")))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rotate_page(None, true, cx))),
+                        )
                         .child(ui::vertical_divider())
                         .child(
                             ui::icon_button("undo", "undo")
@@ -3991,13 +4517,6 @@ impl Editor {
                                 .tooltip(ui::tooltip("Redo", Some("⇧⌘Z")))
                                 .when(self.future.is_empty(), |b| b.opacity(0.4))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.redo(cx))),
-                        )
-                        .child(
-                            ui::icon_button("open", "open")
-                                .tooltip(ui::tooltip("Open another PDF", Some("⌘O")))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.request_open(None, window, cx)
-                                })),
                         )
                         .child(div().w(px(4.)))
                         .when(self.dirty, |d| {
@@ -4013,12 +4532,6 @@ impl Editor {
                             ui::icon_button("copy-pdf", "clipboard")
                                 .tooltip(ui::tooltip("Copy the finished PDF to the clipboard, to paste into an email, a chat or a folder", Some("⇧⌘C")))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(SaveTo::Clipboard, window, cx))),
-                        )
-                        .child(div().w(px(4.)))
-                        .child(
-                            ui::primary_button("save", "save", "Save PDF")
-                                .tooltip(ui::tooltip("Save a filled copy", Some("⌘S")))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(SaveTo::File, window, cx))),
                         )
                         .child(div().w(px(4.)))
                     })
@@ -5623,6 +6136,36 @@ impl Editor {
                                         .child(fields.to_string()),
                                 )
                             })
+                            // Turn it left or right, shown on hover (along the bottom).
+                            .children([false, true].map(|clockwise| {
+                                ui::button_base((if clockwise { "rotate-page-right" } else { "rotate-page-left" }, index))
+                                    .absolute()
+                                    .bottom(px(-8.))
+                                    .when(clockwise, |d| d.right(px(-8.)))
+                                    .when(!clockwise, |d| d.left(px(-8.)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(22.))
+                                    .rounded_full()
+                                    .bg(ui::hud_bg())
+                                    .border_1()
+                                    .border_color(rgba(0xffffff33))
+                                    .shadow(ui::card_shadow())
+                                    .cursor(CursorStyle::PointingHand)
+                                    .opacity(0.)
+                                    .group_hover("thumb", |s| s.opacity(1.))
+                                    .hover(|s| s.bg(ui::accent()))
+                                    .tooltip(ui::tooltip(
+                                        format!("Rotate page {} {}", index + 1, if clockwise { "right" } else { "left" }),
+                                        Some(if clockwise { "⌘R" } else { "⌘L" }),
+                                    ))
+                                    .child(ui::icon(if clockwise { "rotate-right" } else { "rotate-left" }, gpui::white()).size(px(13.)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.rotate_page(Some(index), clockwise, cx);
+                                    }))
+                            }))
                             // Delete, shown on hover (top-left; the field count sits top-right).
                             .when(can_delete, |d| {
                                 d.child(
@@ -6167,6 +6710,7 @@ impl Editor {
             .child(scrollbar("pages", Axis::Vertical, true, &self.pages_scroll, &self.scrollbar_held, cx.entity_id()))
             .child(scrollbar("pages", Axis::Horizontal, true, &self.pages_scroll, &self.scrollbar_held, cx.entity_id()))
             .children(self.render_find_bar(cx))
+            .children(self.render_goto_bar(cx))
             .when_some(hint, |d, (icon_name, text)| {
                 d.child(
                     div().absolute().bottom(px(20.)).left_0().right_0().flex().justify_center().child(
@@ -6217,6 +6761,18 @@ impl Render for Editor {
                 _ => {}
             }
         }
+        for image in std::mem::take(&mut self.retired) {
+            cx.drop_image(image, Some(window));
+        }
+        if std::mem::take(&mut self.redraw_pages) {
+            self.ensure_rendered(window, cx);
+            // Their text is where it was read, too.
+            if self.find.is_some() || self.tool == Tool::SelectText {
+                self.look_through(None, cx);
+                self.read_text(cx);
+            }
+        }
+        self.watch_rest(window, cx);
         // A long document's drawn pages follow the view, and the pages as they come and go.
         if let (Some(drawn), Some(doc)) = (&self.drawn_around, &self.doc) {
             if doc.order != drawn.order || self.current_page().is_some_and(|page| page.abs_diff(drawn.page) >= drawn.slack) {
@@ -6250,6 +6806,7 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &Save, window, cx| this.save(SaveTo::File, window, cx)))
             .on_action(cx.listener(|this, _: &SaveWithPassword, window, cx| this.save_with_new_password(SaveTo::File, window, cx)))
             .on_action(cx.listener(|this, _: &CopyPdf, window, cx| this.save(SaveTo::Clipboard, window, cx)))
+            .on_action(cx.listener(|this, _: &Print, window, cx| this.print(window, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo(cx)))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
@@ -6259,6 +6816,10 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &Find, window, cx| this.start_find(window, cx)))
             .on_action(cx.listener(|this, _: &FindNext, window, cx| this.find_step(true, window, cx)))
             .on_action(cx.listener(|this, _: &FindPrevious, window, cx| this.find_step(false, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToPage, window, cx| this.start_goto(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAppMenu, _, cx| this.toggle_app_menu(cx)))
+            .on_action(cx.listener(|this, _: &RotateLeft, _, cx| this.rotate_page(None, false, cx)))
+            .on_action(cx.listener(|this, _: &RotateRight, _, cx| this.rotate_page(None, true, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitWidth, window, cx| this.set_zoom_mode(ZoomMode::FitWidth, window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFitPage, window, cx| this.set_zoom_mode(ZoomMode::FitPage, window, cx)))
             .on_action(cx.listener(|this, _: &AddSignature, window, cx| this.add_signature_dialog(window, cx)))
@@ -6287,7 +6848,11 @@ impl Render for Editor {
                     cx.notify();
                 }
             }))
+            // The menus come under the window's title bar: which is the bar of
+            // tools itself, where the app draws its own (see `render_titlebar`).
+            .when(!client_decorated, |d| d.children(self.render_app_menu(cx)))
             .child(self.render_titlebar(client_decorated, window.is_maximized(), window.viewport_size().height, cx))
+            .when(client_decorated, |d| d.children(self.render_app_menu(cx)))
             .child(
                 div()
                     .flex()
@@ -6396,19 +6961,35 @@ fn relative_time(timestamp: i64) -> String {
 }
 
 /// Wrap a rendered page (already BGRA) as a GPUI image.
-/// Render pages (index and scale) of a document in the background, one after
+/// Render pages (index, scale and quarter turns) of a document in the background, one after
 /// the other and sharing what they have in common (see `pdf::render_pages`).
 /// They arrive as they finish, for as long as they're being received and the
 /// task is kept.
 fn render_in_background(
     pdf: Arc<hayro::hayro_syntax::Pdf>,
-    pages: Vec<(usize, f32)>,
+    pages: Vec<(usize, f32, u8)>,
     executor: &gpui::BackgroundExecutor,
 ) -> (mpsc::UnboundedReceiver<(usize, Option<pdf::RenderedPage>)>, Task<()>) {
     let (done, rendered) = mpsc::unbounded();
     let rendering = executor
         .spawn(async move { pdf::render_pages(&pdf, pages, |index, page| done.unbounded_send((index, page)).is_ok()) });
     (rendered, rendering)
+}
+
+/// The items of a menu that do something: where each is among the menu's
+/// items, its name, and what it does.
+fn commands_of(menu: &OwnedMenu) -> impl Iterator<Item = (usize, &str, &dyn gpui::Action)> {
+    menu.items.iter().enumerate().filter_map(|(n, item)| match item {
+        OwnedMenuItem::Action { name, action, .. } => Some((n, name.as_str(), action.as_ref())),
+        _ => None,
+    })
+}
+
+/// A picture of a page, turned `quarters` quarter turns clockwise.
+fn turned_image(image: &RenderImage, quarters: u8) -> Option<Arc<RenderImage>> {
+    let size = image.size(0);
+    let page = pdf::RenderedPage { width: size.width.0 as u32, height: size.height.0 as u32, bgra: image.as_bytes(0)?.to_vec() };
+    to_render_image(page.turned(quarters))
 }
 
 fn to_render_image(page: pdf::RenderedPage) -> Option<Arc<RenderImage>> {
@@ -6469,6 +7050,107 @@ fn stroke_path(bounds: Bounds<Pixels>, points: &[[f32; 2]], line: f32, arrow: Op
     builder.build().ok()
 }
 
+/// The app's menus. macOS shows them in its menu bar; on Windows and Linux,
+/// where there is none, each window has a menu bar of its own (see `render_app_menu`).
+/// `self_updating`: the app can update itself, so there is something to check for.
+pub fn app_menus(self_updating: bool) -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "PatraPDF".into(),
+            items: [MenuItem::action("About PatraPDF", About)]
+                .into_iter()
+                .chain(self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates)))
+                .chain([MenuItem::separator(), MenuItem::action("Quit PatraPDF", Quit)])
+                .collect(),
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Window", NewWindow),
+                MenuItem::action("Open…", Open),
+                MenuItem::action("Save As…", Save),
+                MenuItem::action("Save with Password…", SaveWithPassword),
+                MenuItem::action("Copy PDF to Clipboard", CopyPdf),
+                MenuItem::action("Print…", Print),
+                MenuItem::action("Discard Changes…", DiscardChanges),
+                MenuItem::action("Close Document", CloseDocument),
+                MenuItem::separator(),
+                MenuItem::action("Add Pages from PDF…", AddPages),
+                MenuItem::action("Add Signature Image…", AddSignature),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Undo", Undo),
+                MenuItem::action("Redo", Redo),
+                MenuItem::separator(),
+                MenuItem::action("Cut", Cut),
+                MenuItem::action("Copy", Copy),
+                MenuItem::action("Paste", Paste),
+                MenuItem::action("Duplicate", Duplicate),
+                MenuItem::separator(),
+                MenuItem::action("Find…", Find),
+                MenuItem::action("Find Next", FindNext),
+                MenuItem::action("Find Previous", FindPrevious),
+                MenuItem::action("Go to Page…", GoToPage),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::action("Actual Size", ZoomReset),
+                MenuItem::action("Fit Width", ZoomFitWidth),
+                MenuItem::action("Fit Page", ZoomFitPage),
+                MenuItem::separator(),
+                MenuItem::action("Rotate Left", RotateLeft),
+                MenuItem::action("Rotate Right", RotateRight),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
+                MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
+            ],
+        },
+        // macOS lists the open windows at the end of the menu with this name.
+        Menu {
+            name: "Window".into(),
+            items: vec![MenuItem::action("Minimize", MinimizeWindow), MenuItem::action(if cfg!(target_os = "macos") { "Zoom" } else { "Maximize" }, ZoomWindow)],
+        },
+        Menu {
+            name: "Help".into(),
+            items: vec![
+                MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
+                MenuItem::separator(),
+                MenuItem::action("Visit Website", VisitWebsite),
+            ],
+        },
+    ]
+}
+
+/// A key binding as a menu shows it: "Ctrl+Shift+S", or "⇧⌘S" on a Mac.
+fn shortcut_label(keys: &[gpui::KeybindingKeystroke], mac: bool) -> String {
+    let stroke = |stroke: &gpui::KeybindingKeystroke| {
+        let (modifiers, key) = (stroke.modifiers(), stroke.key());
+        let held = [
+            (modifiers.control, "⌃", "Ctrl"),
+            (modifiers.alt, "⌥", "Alt"),
+            (modifiers.shift, "⇧", "Shift"),
+            (modifiers.platform, "⌘", "Super"),
+        ];
+        let key = match key {
+            "pagedown" => "PgDn".to_string(),
+            "pageup" => "PgUp".to_string(),
+            "-" if !mac => "−".to_string(),
+            key if key.chars().count() == 1 => key.to_uppercase(),
+            key => key[..1].to_uppercase() + &key[1..],
+        };
+        let held = held.iter().filter(|held| held.0);
+        if mac { held.map(|held| held.1).chain([key.as_str()]).collect::<String>() } else { held.map(|held| held.2).chain([key.as_str()]).collect::<Vec<_>>().join("+") }
+    };
+    keys.iter().map(stroke).collect::<Vec<_>>().join(" ")
+}
+
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
@@ -6479,6 +7161,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-alt-s", SaveWithPassword, None),
         KeyBinding::new("secondary-shift-c", CopyPdf, None),
+        KeyBinding::new("secondary-p", Print, None),
         KeyBinding::new("secondary-z", Undo, None),
         KeyBinding::new("secondary-shift-z", Redo, None),
         KeyBinding::new("secondary-c", Copy, None),
@@ -6488,6 +7171,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-g", FindNext, None),
         KeyBinding::new("secondary-shift-g", FindPrevious, None),
+        KeyBinding::new("secondary-alt-g", GoToPage, None),
+        KeyBinding::new("secondary-l", RotateLeft, None),
+        KeyBinding::new("secondary-r", RotateRight, None),
         KeyBinding::new("secondary-1", ZoomFitWidth, None),
         KeyBinding::new("secondary-2", ZoomFitPage, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
@@ -6501,6 +7187,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-w", CloseDocument, None),
         KeyBinding::new("secondary-q", Quit, None),
     ]);
+    // Where the window draws the menus: the key that goes to the menu bar.
+    if draws_own_menus() {
+        cx.bind_keys([KeyBinding::new("f10", OpenAppMenu, None)]);
+    }
+}
+
+/// Whether windows draw the app's menus themselves: where there is no menu
+/// bar to put them in. (In a debug build a Mac can be made to, to look at them.)
+fn draws_own_menus() -> bool {
+    !cfg!(target_os = "macos") || (cfg!(debug_assertions) && std::env::var_os("PATRAPDF_MENU_BAR").is_some())
 }
 
 /// Open a PDF in a window: the one that already shows it, else one with nothing in
@@ -8060,6 +8756,350 @@ mod tests {
         assert_eq!(sharpness(&editor, cx), factor.max(1.));
     }
 
+    #[gpui::test]
+    fn pages_out_of_view_are_let_go_once_the_view_is_still(cx: &mut TestAppContext) {
+        const PAGES: usize = 40;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-rest.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+        editor.update(cx, |e, cx| e.scroll_to_page(20, cx));
+        cx.run_until_parked();
+        let drawn = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| {
+                let doc = e.doc.as_ref().unwrap();
+                (0..doc.order.len()).filter(|&p| doc.pages[doc.order[p]].image.is_some()).collect::<Vec<_>>()
+            })
+        };
+        let in_view = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| {
+                let mut pages = e.pages_in_view(e.current_page().unwrap());
+                pages.sort();
+                pages
+            })
+        };
+        let rest = |cx: &mut VisualTestContext| {
+            cx.executor().advance_clock(REST_AFTER + Duration::from_millis(500));
+            cx.run_until_parked();
+        };
+
+        // While it's being looked through, the pages around the view are drawn too.
+        let (around, seen) = (drawn(&editor, cx), in_view(&editor, cx));
+        assert!(around.contains(&20) && around.len() > seen.len(), "{around:?} drawn, {seen:?} in view");
+        editor.read_with(cx, |e, _| assert!(!e.resting));
+
+        // Left alone, only what is in view stays.
+        rest(cx);
+        assert_eq!(drawn(&editor, cx), seen);
+        editor.read_with(cx, |e, _| assert!(e.resting && e.render_task.is_none()));
+        // It stays that way however long, and when something else is drawn again (the pointer moves).
+        editor.update(cx, |_, cx| cx.notify());
+        rest(cx);
+        assert_eq!(drawn(&editor, cx), seen);
+
+        // As soon as the view moves, the pages around it are drawn again...
+        let viewport = editor.read_with(cx, |e, _| e.pages_scroll.bounds());
+        cx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            modifiers: Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let awake = drawn(&editor, cx);
+        assert!(awake.len() > seen.len() && seen.iter().all(|p| awake.contains(p)), "{awake:?}");
+        editor.read_with(cx, |e, _| assert!(!e.resting));
+        // ...and let go when it is still again. So is a page deleted out of the view's way.
+        rest(cx);
+        assert_eq!(drawn(&editor, cx), in_view(&editor, cx));
+        editor.update(cx, |e, cx| e.delete_page(20, cx));
+        cx.run_until_parked();
+        let after = drawn(&editor, cx);
+        assert!(in_view(&editor, cx).iter().all(|p| after.contains(p)), "what moved into view is drawn: {after:?}");
+
+        // Typing doesn't wake it: the view hasn't moved.
+        rest(cx);
+        let seen = in_view(&editor, cx);
+        let origin = editor.read_with(cx, |e, _| e.slot_bounds(e.current_page().unwrap()).unwrap().origin);
+        editor.update(cx, |e, _| e.tool = Tool::Text);
+        cx.simulate_click(origin + point(px(100.), px(150.)), Modifiers::none());
+        cx.simulate_input("still");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(e.resting && e.items.len() == 1));
+        assert_eq!(drawn(&editor, cx), seen);
+    }
+
+    #[gpui::test]
+    fn a_page_is_gone_to_by_number_and_by_key(cx: &mut TestAppContext) {
+        const PAGES: usize = 12;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-goto.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+        let current = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| e.current_page().unwrap())
+        };
+        assert_eq!(current(&editor, cx), 0);
+
+        // ⌥⌘G, a number, Return.
+        cx.dispatch_action(GoToPage);
+        cx.simulate_keystrokes("7 enter");
+        assert_eq!(current(&editor, cx), 6);
+        editor.read_with(cx, |e, _| assert!(e.goto.is_none() && e.items.is_empty()));
+
+        // Only digits are taken; a number past the end goes to the last page.
+        cx.dispatch_action(GoToPage);
+        cx.simulate_keystrokes("x 9 9 backspace 9 enter");
+        assert_eq!(current(&editor, cx), PAGES - 1);
+
+        // Esc, or Return with nothing typed, goes nowhere.
+        cx.dispatch_action(GoToPage);
+        cx.simulate_keystrokes("3 escape");
+        cx.dispatch_action(GoToPage);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(current(&editor, cx), PAGES - 1);
+        editor.read_with(cx, |e, _| assert!(e.goto.is_none()));
+
+        // Home and End go to the ends; Page Up and Down move by the screenful.
+        cx.simulate_keystrokes("home");
+        assert_eq!(current(&editor, cx), 0);
+        let top = editor.read_with(cx, |e, _| e.pages_scroll.offset().y);
+        cx.simulate_keystrokes("pagedown");
+        let (down, screen) = editor.read_with(cx, |e, _| (e.pages_scroll.offset().y, e.pages_scroll.bounds().size.height));
+        assert!(top - down > screen * 0.5 && top - down < screen, "{top:?} to {down:?} of {screen:?}");
+        cx.simulate_keystrokes("pageup");
+        assert_eq!(editor.read_with(cx, |e, _| e.pages_scroll.offset().y), top);
+        cx.simulate_keystrokes("end");
+        assert_eq!(current(&editor, cx), PAGES - 1);
+        let (at, max) = editor.read_with(cx, |e, _| (e.pages_scroll.offset().y, e.pages_scroll.max_offset().height));
+        assert_eq!(at, -max);
+    }
+
+    #[gpui::test]
+    fn printing_sends_the_finished_document(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-print.pdf");
+        std::fs::write(&path, long_pdf(3)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+
+        // Something on the first page, and the last page deleted.
+        let origin = page_origin(&editor, cx, 0);
+        editor.update(cx, |e, _| e.tool = Tool::Text);
+        cx.simulate_click(origin + point(px(100.), px(150.)), Modifiers::none());
+        cx.simulate_input("printed");
+        editor.update(cx, |e, cx| e.delete_page(2, cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(Print);
+        cx.run_until_parked();
+        let (name, bytes) = print::last_printed().expect("the document went to the printer");
+        assert_eq!(name, "long-print.pdf");
+        let printed = pdf::load(bytes).unwrap();
+        assert_eq!(printed.pages.len(), 2);
+        let mut found = 0;
+        search::read_pages(&printed.pdf, [(0, 0)], |_, page| {
+            found = page.find(&"printed".chars().collect::<Vec<_>>()).len();
+            true
+        });
+        assert_eq!(found, 1, "what was typed is on the printed page");
+        // Printing is not saving: the work is still there, and still unsaved.
+        editor.read_with(cx, |e, _| {
+            assert!(e.dirty && !e.printing && e.items.len() == 1);
+            assert!(e.status.contains("Printing"), "{}", e.status);
+        });
+    }
+
+    #[gpui::test]
+    fn pages_are_rotated_with_what_is_on_them(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let geoms = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| e.doc.as_ref().unwrap().geoms().map(|g| (g.width, g.height)).collect::<Vec<_>>())
+        };
+        // A picture's size, in the points of its page at 100%.
+        let shown = |editor: &Entity<Editor>, cx: &mut VisualTestContext, page: usize| {
+            editor.read_with(cx, |e, _| {
+                let doc = e.doc.as_ref().unwrap();
+                let view = &doc.pages[doc.order[page]];
+                let sizes = [&view.image, &view.thumb].map(|image| {
+                    let size = image.as_ref().expect("the page has its pictures").size(0);
+                    size.width.0 as f32 / size.height.0 as f32
+                });
+                (sizes, view.rendered_scale)
+            })
+        };
+        let before = geoms(&editor, cx);
+        let (w, h) = before[0];
+        assert!(h > w, "the first page stands upright");
+        let scale = shown(&editor, cx, 0).1;
+
+        // A box drawn in the top left corner of the first page, and some text.
+        let origin = page_origin(&editor, cx, 0);
+        editor.update(cx, |e, _| e.tool = Tool::Highlight);
+        cx.simulate_mouse_down(origin + point(px(20.), px(40.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(origin + point(px(120.), px(70.)), Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(origin + point(px(120.), px(70.)), MouseButton::Left, Modifiers::none());
+        editor.update(cx, |e, _| e.tool = Tool::Text);
+        cx.simulate_click(origin + point(px(300.), px(500.)), Modifiers::none());
+        cx.simulate_input("upright");
+        cx.simulate_keystrokes("escape escape");
+        cx.run_until_parked();
+        let placed = editor.read_with(cx, |e, _| e.items.iter().map(|i| (i.x, i.y, i.w, i.h)).collect::<Vec<_>>());
+        assert_eq!(placed.len(), 2);
+        let (bx, by, bw, bh) = placed[0];
+        assert!((bx - 20.).abs() < 1. && (by - 40.).abs() < 1. && (bw - 100.).abs() < 1. && (bh - 30.).abs() < 1., "{placed:?}");
+
+        // ⌘R turns the page in view to the right: it lies on its side, at once
+        // (its pictures are turned, not drawn again), and the box is in its top right corner.
+        cx.simulate_keystrokes("secondary-r");
+        assert_eq!(geoms(&editor, cx), [(h, w), before[1]]);
+        let ([image, thumb], drawn_at) = shown(&editor, cx, 0);
+        assert!((image - h / w).abs() < 0.01 && (thumb - h / w).abs() < 0.02 && drawn_at == scale, "{image} {thumb} {drawn_at}");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let (b, t) = (&e.items[0], &e.items[1]);
+            assert!((b.x - (h - by - bh)).abs() < 0.01 && (b.y - bx).abs() < 0.01 && (b.w, b.h) == (bh, bw), "{b:?}");
+            // The text is as it was typed, where it was on the page.
+            let (tx, ty, tw, th) = placed[1];
+            assert_eq!((t.w, t.h), (tw, th));
+            assert!((t.x + tw / 2. - (h - ty - th / 2.)).abs() < 0.01 && (t.y + th / 2. - (tx + tw / 2.)).abs() < 0.01, "{t:?}");
+            assert_eq!(e.doc.as_ref().unwrap().loaded.turns, [1, 0]);
+            assert!(e.dirty && e.status.contains("Turned page 1"), "{}", e.status);
+        });
+        let ([image, _], _) = shown(&editor, cx, 0);
+        assert!((image - h / w).abs() < 0.01, "still the right way round once everything has been drawn");
+
+        // Saved, the page lies on its side in the file, with the box where it is shown.
+        let out = test_dir().join("rotated.pdf");
+        editor.update_in(cx, |e, window, cx| e.save(SaveTo::File, window, cx));
+        cx.run_until_parked();
+        cx.simulate_new_path_selection({
+            let out = out.clone();
+            move |_| Some(out)
+        });
+        cx.run_until_parked();
+        let written = crate::pdf::load(std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((written.pages[0].width, written.pages[0].height), (h, w));
+        let page = crate::pdf::render_page(&written.pdf, 0, 1.0).unwrap();
+        let yellow = |x: f32, y: f32| {
+            let i = ((y as u32 * page.width + x as u32) * 4) as usize;
+            page.bgra[i] < 200 && page.bgra[i + 2] > 200
+        };
+        let (cx_, cy_) = (h - by - bh / 2., bx + bw / 2.);
+        assert!(yellow(cx_, cy_) && !yellow(cx_ - bh, cy_) && !yellow(cx_, cy_ + bw), "the highlight is where it was shown");
+        editor.read_with(cx, |e, _| {
+            assert!(!e.dirty);
+            assert_eq!(e.recents[0].turns, [1]);
+        });
+
+        // ⌘L turns it back to the left, and once more: now it lies on its other side.
+        cx.simulate_keystrokes("secondary-l secondary-l");
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.doc.as_ref().unwrap().loaded.turns, [3, 0]);
+            let b = &e.items[0];
+            assert!((b.x - by).abs() < 0.01 && (b.y - (w - bx - bw)).abs() < 0.01 && (b.w, b.h) == (bh, bw), "{b:?}");
+            assert!(e.dirty);
+        });
+        // Undo goes back a turn at a time: upright, with everything where it was put.
+        cx.simulate_keystrokes("secondary-z");
+        cx.run_until_parked();
+        assert_eq!(geoms(&editor, cx), before);
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.doc.as_ref().unwrap().loaded.turns, [0, 0]);
+            let b = &e.items[0];
+            assert!((b.x - bx).abs() < 0.01 && (b.y - by).abs() < 0.01 && (b.w - bw).abs() < 0.01 && (b.h - bh).abs() < 0.01, "{b:?}");
+        });
+        let ([image, thumb], _) = shown(&editor, cx, 0);
+        assert!((image - w / h).abs() < 0.01 && (thumb - w / h).abs() < 0.02);
+        // Discarding goes back to what was saved: turned to the right.
+        editor.update(cx, |e, cx| e.discard_changes(cx));
+        cx.run_until_parked();
+        assert_eq!(geoms(&editor, cx), [(h, w), before[1]]);
+        editor.read_with(cx, |e, _| assert!(!e.dirty && e.doc.as_ref().unwrap().loaded.turns == [1, 0]));
+
+        // Reopened from Recents, the original is turned again, and what was on it is in place.
+        let id = editor.read_with(cx, |e, _| e.recents[0].id.clone());
+        editor.update_in(cx, |e, window, cx| e.close_document(window, cx));
+        editor.update_in(cx, |e, window, cx| e.open_recent(&id, window, cx));
+        cx.run_until_parked();
+        assert_eq!(geoms(&editor, cx), [(h, w), before[1]]);
+        editor.read_with(cx, |e, _| {
+            let b = &e.items[0];
+            assert!((b.x - (h - by - bh)).abs() < 0.01 && (b.y - bx).abs() < 0.01 && (b.w, b.h) == (bh, bw), "{b:?}");
+            assert!(!e.dirty && e.items.len() == 2);
+        });
+        let ([image, thumb], _) = shown(&editor, cx, 0);
+        assert!((image - h / w).abs() < 0.01 && (thumb - h / w).abs() < 0.02, "drawn turned: {image} {thumb}");
+
+        // The rotated second page of the sample can be turned too, from its thumbnail's button.
+        editor.update(cx, |e, cx| e.rotate_page(Some(1), false, cx));
+        cx.run_until_parked();
+        assert_eq!(geoms(&editor, cx), [(h, w), (before[1].1, before[1].0)]);
+    }
+
+    #[gpui::test]
+    fn the_window_has_the_menus_where_there_is_no_menu_bar(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx);
+        let open = |cx: &mut VisualTestContext| editor.read_with(cx, |e, _| (e.app_menu_open, e.app_menu_item));
+        // Not on a Mac, which has a menu bar for them.
+        editor.update(cx, |e, _| e.own_menu_bar = false);
+        cx.dispatch_action(OpenAppMenu);
+        assert_eq!(open(cx), (None, None));
+
+        editor.update(cx, |e, cx| {
+            e.own_menu_bar = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let menus = editor.read_with(cx, |e, cx| e.own_menus(cx));
+        let names: Vec<&str> = menus.iter().map(|menu| menu.name.as_ref()).collect();
+        assert_eq!(names, ["PatraPDF", "File", "Edit", "View", "Window", "Help"]);
+
+        // The menu key opens the first menu; the arrows go along the bar (and round it), and down a menu.
+        cx.dispatch_action(OpenAppMenu);
+        cx.run_until_parked();
+        assert_eq!(open(cx), (Some(0), None));
+        cx.simulate_keystrokes("left");
+        assert_eq!(open(cx), (Some(5), None));
+        cx.simulate_keystrokes("right right");
+        assert_eq!(open(cx), (Some(1), None));
+        let file: Vec<(usize, &str)> = commands_of(&menus[1]).map(|(n, name, _)| (n, name)).collect();
+        cx.simulate_keystrokes("up");
+        assert_eq!(open(cx).1, file.last().map(|(n, _)| *n), "up from the top is the last item, past the separator");
+        cx.simulate_keystrokes("down");
+        assert_eq!(open(cx).1, Some(file[0].0));
+        // Down to Print, and Return: the document goes to the printer, and the menu closes.
+        let print = file.iter().position(|(_, name)| *name == "Print…").unwrap();
+        (0..print).for_each(|_| cx.simulate_keystrokes("down"));
+        assert_eq!(open(cx).1, Some(file[print].0));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(open(cx), (None, None));
+        assert!(print::last_printed().is_some());
+
+        // Esc closes it; while it is open, nothing else gets the keys.
+        cx.dispatch_action(OpenAppMenu);
+        cx.simulate_keystrokes("right right right down");
+        cx.simulate_keystrokes("x pagedown");
+        assert_eq!(open(cx).0, Some(3));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(open(cx), (None, None));
+        editor.read_with(cx, |e, _| assert!(e.items.is_empty() && e.pages_scroll.offset().y == px(0.)));
+
+        // Each item shows the keys that do the same.
+        let keys = |keys: &str, mac: bool| shortcut_label(gpui::KeyBinding::new(keys, Print, None).keystrokes(), mac);
+        assert_eq!(keys("ctrl-shift-s", false), "Ctrl+Shift+S");
+        assert_eq!(keys("ctrl-alt-g", false), "Ctrl+Alt+G");
+        assert_eq!(keys("ctrl--", false), "Ctrl+−");
+        assert_eq!(keys("f10", false), "F10");
+        assert_eq!(keys("cmd-shift-z", true), "⇧⌘Z");
+        assert_eq!(keys("cmd-alt-g", true), "⌥⌘G");
+    }
+
     #[test]
     fn page_ranges_are_read_as_typed() {
         assert_eq!(parse_page_ranges("1-3, 5", 6), Ok(vec![0, 1, 2, 4]));
@@ -8574,6 +9614,7 @@ mod tests {
             ],
             watermark: Some(Watermark { text: "COPY".into(), ..Watermark::default() }),
             order: Some(vec![1, 0]),
+            turns: Vec::new(),
             fields: Vec::new(),
         }];
 

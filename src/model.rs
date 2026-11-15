@@ -34,6 +34,35 @@ pub struct PageGeom {
     pub view_to_user: [f64; 6],
 }
 
+/// Where a point of a `width` × `height` page goes when the page is turned
+/// `quarters` quarter turns clockwise: `[a b c d e f]`, from the page's view
+/// space to the turned page's.
+pub fn turn(quarters: u8, width: f64, height: f64) -> [f64; 6] {
+    match quarters % 4 {
+        0 => [1., 0., 0., 1., 0., 0.],
+        1 => [0., 1., -1., 0., height, 0.],
+        2 => [-1., 0., 0., -1., width, height],
+        _ => [0., -1., 1., 0., 0., width],
+    }
+}
+
+/// The matrix that does `first` and then `then`.
+fn compose(then: [f64; 6], first: [f64; 6]) -> [f64; 6] {
+    let ([a, b, c, d, e, f], [a2, b2, c2, d2, e2, f2]) = (then, first);
+    [a * a2 + c * b2, b * a2 + d * b2, a * c2 + c * d2, b * c2 + d * d2, a * e2 + c * f2 + e, b * e2 + d * f2 + f]
+}
+
+impl PageGeom {
+    /// This page turned `quarters` quarter turns clockwise.
+    pub fn turned(&self, quarters: u8) -> PageGeom {
+        let quarters = quarters % 4;
+        let (width, height) = if quarters % 2 == 1 { (self.height, self.width) } else { (self.width, self.height) };
+        // Back from the turned page to this one, then on to the file's space.
+        let back = turn(4 - quarters, width as f64, height as f64);
+        PageGeom { width, height, view_to_user: compose(self.view_to_user, back) }
+    }
+}
+
 /// A signature (or any stamp image) from the signature library.
 #[derive(Debug)]
 pub struct Signature {
@@ -122,6 +151,35 @@ pub struct Item {
 impl Item {
     pub fn is_text(&self) -> bool {
         matches!(self.kind, ItemKind::Text { .. })
+    }
+
+    /// Follow its page (`width` × `height`) as that is turned `quarters`
+    /// quarter turns clockwise. What is drawn on the page turns with it. What
+    /// is to be read (text, a signature, a check mark) stays the right way
+    /// up, where it was on the page.
+    pub fn turn(&mut self, quarters: u8, width: f32, height: f32) {
+        let quarters = quarters % 4;
+        let [a, b, c, d, e, f] = turn(quarters, width as f64, height as f64).map(|v| v as f32);
+        let to = |x: f32, y: f32| (a * x + c * y + e, b * x + d * y + f);
+        if matches!(self.kind, ItemKind::Text { .. } | ItemKind::Image { .. } | ItemKind::Check) {
+            let (x, y) = to(self.x + self.w / 2., self.y + self.h / 2.);
+            (self.x, self.y) = (x - self.w / 2., y - self.h / 2.);
+            return;
+        }
+        let (corner, opposite) = (to(self.x, self.y), to(self.x + self.w, self.y + self.h));
+        if let ItemKind::Stroke { points, .. } = &mut self.kind {
+            *points = points
+                .iter()
+                .map(|&[x, y]| match quarters {
+                    0 => [x, y],
+                    1 => [1. - y, x],
+                    2 => [1. - x, 1. - y],
+                    _ => [y, 1. - x],
+                })
+                .collect();
+        }
+        (self.x, self.y) = (corner.0.min(opposite.0), corner.1.min(opposite.1));
+        (self.w, self.h) = ((corner.0 - opposite.0).abs(), (corner.1 - opposite.1).abs());
     }
 
     pub fn is_redaction(&self) -> bool {
@@ -243,5 +301,52 @@ impl Default for TextMetrics {
         Self {
             baseline_ratio: (LINE_HEIGHT - 1.0) / 2.0 + 0.77,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_is_on_a_page_turns_with_it() {
+        // A 200 × 100 page with a box in its top left corner, turned to the right:
+        // the corner is now the top right one of a 100 × 200 page.
+        let boxed = |kind| Item { id: 1, page: 0, x: 10., y: 20., w: 60., h: 30., kind };
+        let mut highlight = boxed(ItemKind::Highlight { color: 0 });
+        highlight.turn(1, 200., 100.);
+        assert_eq!((highlight.x, highlight.y, highlight.w, highlight.h), (50., 10., 30., 60.));
+        // To the left: the bottom left one.
+        let mut highlight = boxed(ItemKind::Highlight { color: 0 });
+        highlight.turn(3, 200., 100.);
+        assert_eq!((highlight.x, highlight.y, highlight.w, highlight.h), (20., 130., 30., 60.));
+
+        // A line from the box's top left to its bottom right keeps its ends,
+        // and four turns bring it back. (Each turn swaps the page's sides.)
+        let line = || boxed(ItemKind::Stroke { points: [[0., 0.], [1., 1.]].into(), color: 0, width: 2., arrow: true });
+        let ends = line().stroke_points();
+        let mut turned = line();
+        turned.turn(1, 200., 100.);
+        assert_eq!(turned.stroke_points(), ends.iter().map(|&(x, y)| (100. - y, x)).collect::<Vec<_>>());
+        for (w, h) in [(100., 200.), (200., 100.), (100., 200.)] {
+            turned.turn(1, w, h);
+        }
+        assert_eq!((turned.x, turned.y, turned.w, turned.h), (10., 20., 60., 30.));
+        assert_eq!(turned.stroke_points(), ends);
+
+        // Text stays the right way up, at the same place on the page.
+        let mut text = boxed(ItemKind::Text { text: "upright".into(), font_size: 12. });
+        text.turn(1, 200., 100.);
+        assert_eq!((text.w, text.h), (60., 30.));
+        assert_eq!((text.x + 30., text.y + 15.), (100. - 35., 40.));
+
+        // The page itself: turned right, its top left corner is where its bottom left one was.
+        let page = PageGeom { width: 200., height: 100., view_to_user: [1., 0., 0., -1., 0., 100.] };
+        let turned = page.turned(1);
+        assert_eq!((turned.width, turned.height), (100., 200.));
+        let [a, b, c, d, e, f] = turned.view_to_user;
+        let user = |x: f64, y: f64| (a * x + c * y + e, b * x + d * y + f);
+        assert_eq!((user(0., 0.), user(100., 0.), user(0., 200.)), ((0., 0.), (0., 100.), (200., 0.)));
+        assert_eq!(page.turned(4), page);
     }
 }

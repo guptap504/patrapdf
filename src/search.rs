@@ -11,7 +11,7 @@ use hayro::hayro_interpret::{
     TransformExt, interpret_page,
 };
 use hayro::hayro_syntax::Pdf;
-use hayro::kurbo::{BezPath, Point, Rect};
+use hayro::kurbo::{Affine, BezPath, Point, Rect};
 
 /// A box on a page: `[x, y, width, height]` in view space (points, from the top left).
 pub type Area = [f32; 4];
@@ -160,22 +160,26 @@ fn lines<'a>(areas: impl Iterator<Item = &'a Area>) -> Vec<Area> {
 /// Read the text of the given pages one after another, handing each to `each`
 /// as it's done; `each` says whether to go on. The fonts one page loads are
 /// kept for the rest.
-pub fn read_pages(pdf: &Pdf, pages: impl IntoIterator<Item = usize>, mut each: impl FnMut(usize, PageText) -> bool) {
+///
+/// A page is given by its index and the quarter turns clockwise it is shown with.
+pub fn read_pages(pdf: &Pdf, pages: impl IntoIterator<Item = (usize, u8)>, mut each: impl FnMut(usize, PageText) -> bool) {
     let cache = InterpreterCache::new();
-    for index in pages {
-        if !each(index, read_page(pdf, &cache, index)) {
+    for (index, turns) in pages {
+        if !each(index, read_page(pdf, &cache, index, turns)) {
             break;
         }
     }
 }
 
-fn read_page<'a>(pdf: &'a Pdf, cache: &InterpreterCache<'a>, index: usize) -> PageText {
+fn read_page<'a>(pdf: &'a Pdf, cache: &InterpreterCache<'a>, index: usize, turns: u8) -> PageText {
     let mut reader = Reader::default();
     if let Some(page) = pdf.pages().get(index) {
         let (width, height) = page.render_dimensions();
+        let turn = Affine::new(crate::model::turn(turns, width as f64, height as f64));
+        let (width, height) = if turns % 2 == 1 { (height, width) } else { (width, height) };
         // The same space the page is drawn in at 100%: view space.
         let mut context = Context::new(
-            page.initial_transform(true).to_kurbo(),
+            turn * page.initial_transform(true).to_kurbo(),
             Rect::new(0., 0., width as f64, height as f64),
             cache,
             page.xref(),
@@ -245,10 +249,30 @@ mod tests {
     }
 
     #[test]
+    fn the_text_of_a_turned_page_is_where_it_is_shown() {
+        let (pdf, cache) = (sample(), InterpreterCache::new());
+        // All of what a phrase covers, as one box.
+        let around = |text: &PageText, phrase: &str| {
+            let found = text.find(&fold(phrase));
+            assert_eq!(found.len(), 1, "{phrase} is on the page once");
+            let (x0, y0, x1, y1) = found[0].iter().fold((f32::MAX, f32::MAX, 0f32, 0f32), |(x0, y0, x1, y1), &[x, y, w, h]| {
+                (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))
+            });
+            [x0, y0, x1 - x0, y1 - y0]
+        };
+        // The first page is 612 × 792; turned to the right, what was `y` down it is `792 - y` across.
+        let [x, y, w, h] = around(&read_page(&pdf, &cache, 0, 0), "NAME");
+        for (turns, there) in [(1, [792. - y - h, x, h, w]), (2, [612. - x - w, 792. - y - h, w, h]), (3, [y, 612. - x - w, h, w])] {
+            let turned = around(&read_page(&pdf, &cache, 0, turns), "NAME");
+            turned.iter().zip(there).for_each(|(a, b)| assert!((a - b).abs() < 0.01, "turned {turns}: {turned:?} for {there:?}"));
+        }
+    }
+
+    #[test]
     fn text_is_read_with_where_it_is() {
         let pdf = sample();
         let mut pages = Vec::new();
-        read_pages(&pdf, 0..2, |index, text| {
+        read_pages(&pdf, [(0, 0), (1, 0)], |index, text| {
             pages.push((index, text));
             true
         });
@@ -270,7 +294,7 @@ mod tests {
 
     #[test]
     fn phrases_match_whatever_their_case_and_spacing() {
-        let text = &read_page(&sample(), &InterpreterCache::new(), 0);
+        let text = &read_page(&sample(), &InterpreterCache::new(), 0, 0);
         assert_eq!(text.find(&fold("page   1")).len(), 1);
         assert_eq!(text.find(&fold("PAGE 1 - name:")).len(), 1);
         assert_eq!(text.find(&fold("e")).len(), 2, "every occurrence");
@@ -323,7 +347,7 @@ mod tests {
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).unwrap();
         let pdf = Pdf::new(bytes).unwrap_or_else(|_| panic!("the sample doesn't open"));
-        let text = read_page(&pdf, &InterpreterCache::new(), 0);
+        let text = read_page(&pdf, &InterpreterCache::new(), 0, 0);
         assert_eq!(text.text(0..usize::MAX), "First Line\nSecond");
         assert_eq!(text.find(&fold("line second")).len(), 1);
     }

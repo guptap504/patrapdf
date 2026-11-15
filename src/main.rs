@@ -2,6 +2,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
+#[cfg(target_os = "macos")]
+mod alloc;
 mod assets;
 mod clipboard;
 mod editor;
@@ -10,6 +12,7 @@ mod forms;
 mod gestures;
 mod model;
 mod pdf;
+mod print;
 mod recents;
 mod scrollbar;
 mod search;
@@ -21,13 +24,14 @@ mod updater;
 use std::path::PathBuf;
 
 use futures::StreamExt;
-use gpui::{Application, Menu, MenuItem};
+use gpui::Application;
 
-use editor::{
-    About, AddPages, AddSignature, CheckForUpdates, CloseDocument, Copy, CopyPdf, Cut, DiscardChanges, Duplicate, Find, FindNext, FindPrevious, KeyboardShortcuts, MinimizeWindow, NewWindow, Open,
-    Paste, Quit, Redo, Save, SaveWithPassword, ToggleLeftSidebar, ToggleRightSidebar, Undo, VisitWebsite, ZoomFitPage, ZoomFitWidth, ZoomIn, ZoomOut,
-    ZoomReset, ZoomWindow,
-};
+use editor::{NewWindow, Quit};
+
+/// See `alloc.rs`: what the pictures of pages take is given back when they go.
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: alloc::Returning = alloc::Returning;
 
 fn main() {
     // The PDFs to open, each in a window of its own.
@@ -58,73 +62,7 @@ fn main() {
                 }
             })
         });
-        cx.set_menus(vec![
-            Menu {
-                name: "PatraPDF".into(),
-                items: [MenuItem::action("About PatraPDF", About)]
-                    .into_iter()
-                    .chain(self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates)))
-                    .chain([MenuItem::separator(), MenuItem::action("Quit PatraPDF", Quit)])
-                    .collect(),
-            },
-            Menu {
-                name: "File".into(),
-                items: vec![
-                    MenuItem::action("New Window", NewWindow),
-                    MenuItem::action("Open…", Open),
-                    MenuItem::action("Save As…", Save),
-                    MenuItem::action("Save with Password…", SaveWithPassword),
-                    MenuItem::action("Copy PDF to Clipboard", CopyPdf),
-                    MenuItem::action("Discard Changes…", DiscardChanges),
-                    MenuItem::action("Close Document", CloseDocument),
-                    MenuItem::separator(),
-                    MenuItem::action("Add Pages from PDF…", AddPages),
-                    MenuItem::action("Add Signature Image…", AddSignature),
-                ],
-            },
-            Menu {
-                name: "Edit".into(),
-                items: vec![
-                    MenuItem::action("Undo", Undo),
-                    MenuItem::action("Redo", Redo),
-                    MenuItem::separator(),
-                    MenuItem::action("Cut", Cut),
-                    MenuItem::action("Copy", Copy),
-                    MenuItem::action("Paste", Paste),
-                    MenuItem::action("Duplicate", Duplicate),
-                    MenuItem::separator(),
-                    MenuItem::action("Find…", Find),
-                    MenuItem::action("Find Next", FindNext),
-                    MenuItem::action("Find Previous", FindPrevious),
-                ],
-            },
-            Menu {
-                name: "View".into(),
-                items: vec![
-                    MenuItem::action("Zoom In", ZoomIn),
-                    MenuItem::action("Zoom Out", ZoomOut),
-                    MenuItem::action("Actual Size", ZoomReset),
-                    MenuItem::action("Fit Width", ZoomFitWidth),
-                    MenuItem::action("Fit Page", ZoomFitPage),
-                    MenuItem::separator(),
-                    MenuItem::action("Toggle Left Sidebar", ToggleLeftSidebar),
-                    MenuItem::action("Toggle Right Sidebar", ToggleRightSidebar),
-                ],
-            },
-            // macOS lists the open windows at the end of the menu with this name.
-            Menu {
-                name: "Window".into(),
-                items: vec![MenuItem::action("Minimize", MinimizeWindow), MenuItem::action("Zoom", ZoomWindow)],
-            },
-            Menu {
-                name: "Help".into(),
-                items: vec![
-                    MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
-                    MenuItem::separator(),
-                    MenuItem::action("Visit Website", VisitWebsite),
-                ],
-            },
-        ]);
+        cx.set_menus(editor::app_menus(self_updating));
 
         if let Err(e) = editor::open_editor(cx, initial) {
             eprintln!("failed to open window: {e:#}");

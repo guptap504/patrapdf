@@ -29,7 +29,11 @@ pub struct LoadedPdf {
     /// needed (to open the file, or to save it), so they're parsed only once.
     parsed: Arc<OnceLock<Document>>,
     pub pdf: Arc<Pdf>,
+    /// The pages as they are shown: as the file has them, turned by `turns`.
     pub pages: Vec<PageGeom>,
+    /// The quarter turns clockwise each page has been given since it was
+    /// opened (0 to 3). Saved copies have their pages turned the same.
+    pub turns: Vec<u8>,
     /// The password the file was opened with, if it needed one. Saved copies
     /// are protected with it too.
     pub password: Option<String>,
@@ -49,7 +53,35 @@ impl LoadedPdf {
 
     /// Produce the edited copy of this document (see [`apply`]).
     pub fn save(&self, edits: &Edits) -> Result<Written> {
-        apply(self.document()?, &self.pages, edits)
+        apply(self.document()?, &self.pages, &self.turns, edits)
+    }
+
+    /// Turn a page `quarters` quarter turns clockwise (3 is one the other
+    /// way). The form fields on it turn with it.
+    pub fn turn(&mut self, page: usize, quarters: u8) {
+        let quarters = quarters % 4;
+        if quarters == 0 || page >= self.pages.len() {
+            return;
+        }
+        let was = self.pages[page].clone();
+        self.pages[page] = was.turned(quarters);
+        self.turns[page] = (self.turns[page] + quarters) % 4;
+        if self.form.iter().flat_map(|field| &field.widgets).any(|widget| widget.page == page) {
+            let now = &self.pages[page];
+            for widget in Arc::make_mut(&mut self.form).iter_mut().flat_map(|field| &mut field.widgets) {
+                if widget.page == page {
+                    widget.follow_page(&was, now);
+                }
+            }
+        }
+    }
+
+    /// Have every page turned as `turns` says (pages it doesn't reach: not at all).
+    pub fn set_turns(&mut self, turns: &[u8]) {
+        for page in 0..self.pages.len() {
+            let wanted = turns.get(page).copied().unwrap_or(0) % 4;
+            self.turn(page, (wanted + 4 - self.turns[page]) % 4);
+        }
     }
 
     /// This document with pages of others added after its own: for each of
@@ -68,6 +100,7 @@ impl LoadedPdf {
             bail!("the pages could not be added to this PDF");
         }
         merged.password = self.password.clone();
+        merged.set_turns(&self.turns);
         Ok(merged)
     }
 }
@@ -179,6 +212,7 @@ fn load_inner(bytes: Vec<u8>, password: Option<&str>, hide_fields: bool) -> Resu
         bytes,
         parsed: Arc::new(parsed.map(OnceLock::from).unwrap_or_default()),
         pdf: Arc::new(pdf),
+        turns: vec![0; pages.len()],
         pages,
         password,
         form: Arc::new(form),
@@ -247,22 +281,48 @@ pub struct RenderedPage {
     pub bgra: Vec<u8>,
 }
 
+impl RenderedPage {
+    /// The picture turned `quarters` quarter turns clockwise.
+    pub fn turned(self, quarters: u8) -> RenderedPage {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let quarters = quarters % 4;
+        if quarters == 0 || self.bgra.len() != w * h * 4 {
+            return self;
+        }
+        let (width, height) = if quarters == 2 { (w, h) } else { (h, w) };
+        let mut bgra = vec![0; self.bgra.len()];
+        for (y, row) in bgra.chunks_exact_mut(width * 4).enumerate() {
+            for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+                // Where this pixel was before the turn.
+                let (from_x, from_y) = match quarters {
+                    1 => (y, h - 1 - x),
+                    2 => (w - 1 - x, h - 1 - y),
+                    _ => (w - 1 - y, x),
+                };
+                let from = (from_y * w + from_x) * 4;
+                pixel.copy_from_slice(&self.bgra[from..from + 4]);
+            }
+        }
+        RenderedPage { width: width as u32, height: height as u32, bgra }
+    }
+}
+
 pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Option<RenderedPage> {
     render(pdf, &RenderCache::new(), index, scale, false)
 }
 
-/// Render several pages (index and scale) of a document, handing each to
-/// `each` as it's done; `each` says whether to go on. What drawing one page
-/// works out (the document's fonts, glyph shapes and bitmaps, colour
-/// profiles) is kept for the rest of them.
+/// Render several pages of a document (index, scale, and the quarter turns
+/// clockwise to show it with), handing each to `each` as it's done; `each`
+/// says whether to go on. What drawing one page works out (the document's
+/// fonts, glyph shapes and bitmaps, colour profiles) is kept for the rest of them.
 pub fn render_pages(
     pdf: &Pdf,
-    pages: impl IntoIterator<Item = (usize, f32)>,
+    pages: impl IntoIterator<Item = (usize, f32, u8)>,
     mut each: impl FnMut(usize, Option<RenderedPage>) -> bool,
 ) {
     let cache = RenderCache::new();
-    for (index, scale) in pages {
-        if !each(index, render(pdf, &cache, index, scale, false)) {
+    for (index, scale, turns) in pages {
+        if !each(index, render(pdf, &cache, index, scale, false).map(|page| page.turned(turns))) {
             break;
         }
     }
@@ -405,18 +465,21 @@ pub struct Written {
 /// [`apply`] to a file's bytes, for tests (the app saves a [`LoadedPdf`]).
 #[cfg(test)]
 pub fn save(original: &[u8], source_pages: &[PageGeom], edits: &Edits) -> Result<Written> {
-    apply(open_document(original)?, source_pages, edits)
+    apply(open_document(original)?, source_pages, &[], edits)
 }
 
 /// Produce the edited copy of a document: a new PDF with the form filled in,
 /// the watermark and all overlay items burned into the page content, and then
 /// any redactions applied.
 ///
-/// `source_pages` are the original document's pages; `edits.order` lists, for
-/// each page of the output, which original page it is (pages left out are
-/// deleted). Item page numbers refer to positions in `order`.
-fn apply(mut doc: Document, source_pages: &[PageGeom], edits: &Edits) -> Result<Written> {
+/// `source_pages` are the original document's pages as they are shown, which
+/// is turned by `turns` (quarter turns clockwise, for each that has been
+/// turned); `edits.order` lists, for each page of the output, which original
+/// page it is (pages left out are deleted). Item page numbers refer to
+/// positions in `order`.
+fn apply(mut doc: Document, source_pages: &[PageGeom], turns: &[u8], edits: &Edits) -> Result<Written> {
     let Edits { order, items, watermark, metrics, password, form, values } = *edits;
+    turn_pages(&mut doc, turns)?;
     let identity = order.len() == source_pages.len() && order.iter().enumerate().all(|(i, &p)| i == p);
     let pages: Vec<PageGeom> = if identity {
         source_pages.to_vec()
@@ -899,6 +962,26 @@ impl Copier<'_> {
         self.queue.push(id);
         Some(new)
     }
+}
+
+/// Turn pages by quarter turns clockwise (`turns[i]` for page `i`): each is
+/// shown that much further round than the file had it.
+fn turn_pages(doc: &mut Document, turns: &[u8]) -> Result<()> {
+    if turns.iter().all(|turns| turns % 4 == 0) {
+        return Ok(());
+    }
+    let ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
+    for (&id, &turns) in ids.iter().zip(turns).filter(|(_, turns)| *turns % 4 != 0) {
+        let own = doc.get_dictionary(id)?.get(b"Rotate").ok().cloned();
+        let was = own.or_else(|| inherited(doc, id, "Rotate")).and_then(|o| match doc.dereference(&o).ok()?.1 {
+            Object::Integer(degrees) => Some(*degrees),
+            Object::Real(degrees) => Some(*degrees as i64),
+            _ => None,
+        });
+        let degrees = (was.unwrap_or(0) + 90 * i64::from(turns % 4)).rem_euclid(360);
+        doc.get_dictionary_mut(id)?.set("Rotate", degrees);
+    }
+    Ok(())
 }
 
 /// The value of `key` inherited from the page's ancestors, if any.
@@ -1863,7 +1946,7 @@ pub(crate) mod tests {
         let other = render_page(&reloaded.pdf, 1, 1.0).unwrap();
         assert_eq!(other.bgra, render_page(&loaded.pdf, 1, 1.0).unwrap().bgra);
         let mut found = 0;
-        crate::search::read_pages(&reloaded.pdf, [0], |_, text| {
+        crate::search::read_pages(&reloaded.pdf, [(0, 0)], |_, text| {
             found = text.find(&crate::search::fold("page 1 - name")).len();
             true
         });
@@ -2211,6 +2294,111 @@ pub(crate) mod tests {
         // The border is as wide as the widget says (1 when it doesn't say).
         assert_eq!(name.widgets[0].border_width, 2.);
         assert_eq!(upright.widgets[0].border_width, 0., "no border colour, no border");
+    }
+
+    /// How much of two pictures of a page differs by more than the smoothing
+    /// of an edge does.
+    fn difference(a: &RenderedPage, b: &RenderedPage) -> f32 {
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let far = a.bgra.chunks_exact(4).zip(b.bgra.chunks_exact(4)).filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 96));
+        far.count() as f32 / (a.width * a.height) as f32
+    }
+
+    #[test]
+    fn a_turned_page_is_saved_the_way_it_is_shown() {
+        let bytes = sample_pdf();
+        let original = load(bytes.clone()).unwrap();
+        // (The second page is one the file already shows turned, and cropped.)
+        for page in 0..2 {
+            for quarters in 1..4u8 {
+                let mut loaded = original.clone();
+                loaded.turn(page, quarters);
+                assert_eq!(loaded.turns[page], quarters);
+                let shown = loaded.pages[page].clone();
+                let was = &original.pages[page];
+                let sides = if quarters == 2 { (was.width, was.height) } else { (was.height, was.width) };
+                assert_eq!((shown.width, shown.height), sides);
+                let picture = render_page(&original.pdf, page, 1.0).unwrap().turned(quarters);
+
+                // Saved, the page is in the file the way it was shown: its
+                // size, where everything on it is, and how it looks.
+                let saved = load(loaded.save(&Edits { order: &[0, 1], ..Edits::default() }).unwrap().bytes).unwrap();
+                assert_eq!((saved.pages[page].width, saved.pages[page].height), sides);
+                for (saved, shown) in saved.pages[page].view_to_user.iter().zip(shown.view_to_user) {
+                    assert!((saved - shown).abs() < 1e-6, "page {page} turned {quarters}: {:?} for {shown:?}", saved);
+                }
+                assert_eq!(saved.pages[1 - page], original.pages[1 - page], "the other page is as it was");
+                let d = difference(&render_page(&saved.pdf, page, 1.0).unwrap(), &picture);
+                assert!(d < 0.01, "page {page} turned {quarters} looks different saved: {d}");
+
+                // What is put on it goes where it was put, whichever way it is written.
+                let (x, y) = (shown.width * 0.5, shown.height * 0.25);
+                let boxed = |kind| Item { id: 1, page, x: x - 20., y: y - 10., w: 40., h: 20., kind };
+                for kind in [ItemKind::Redact { fill: RedactFill::Black }, ItemKind::Outline { oval: false, color: 0x0000ff, width: 6. }] {
+                    let redacted = matches!(kind, ItemKind::Redact { .. });
+                    let edits = Edits { order: &[0, 1], items: &[boxed(kind)], ..Edits::default() };
+                    let saved = load(loaded.save(&edits).unwrap().bytes).unwrap();
+                    let with = render_page(&saved.pdf, page, 1.0).unwrap();
+                    let pixel = |x: f32, y: f32| {
+                        let i = ((y as u32 * with.width + x as u32) * 4) as usize;
+                        [with.bgra[i + 2], with.bgra[i + 1], with.bgra[i]]
+                    };
+                    if redacted {
+                        assert_eq!(pixel(x, y), [0, 0, 0], "page {page} turned {quarters}: the middle of the box");
+                        assert_eq!(pixel(x - 17., y - 7.), [0, 0, 0]);
+                        assert_eq!(pixel(x + 17., y + 7.), [0, 0, 0]);
+                    } else {
+                        // The four sides of the rectangle, and nothing in the middle of it.
+                        for (dx, dy) in [(-18., 0.), (18., 0.), (0., -8.), (0., 8.)] {
+                            assert_eq!(pixel(x + dx, y + dy), [0, 0, 255], "page {page} turned {quarters}: side {dx} {dy}");
+                        }
+                    }
+                    let d = difference(&with, &picture);
+                    assert!(d > 0. && d < 0.03, "page {page} turned {quarters}: the rest of the page is as it was ({d})");
+                }
+            }
+        }
+
+        // Four quarter turns is no turn; turned back, the page is as it was.
+        let mut loaded = original.clone();
+        (0..4).for_each(|_| loaded.turn(1, 1));
+        loaded.turn(0, 3);
+        loaded.turn(0, 1);
+        assert_eq!(loaded.turns, [0, 0]);
+        for (turned, was) in loaded.pages.iter().zip(&original.pages) {
+            assert_eq!((turned.width, turned.height), (was.width, was.height));
+            turned.view_to_user.iter().zip(was.view_to_user).for_each(|(a, b)| assert!((a - b).abs() < 1e-9));
+        }
+        loaded.set_turns(&[2]);
+        assert_eq!(loaded.turns, [2, 0]);
+    }
+
+    #[test]
+    fn form_fields_turn_with_their_page() {
+        let original = load(sample_form()).unwrap();
+        for quarters in 1..4u8 {
+            let mut loaded = original.clone();
+            (0..loaded.pages.len()).for_each(|page| loaded.turn(page, quarters));
+            // As another app (and this one, opening the copy) finds them on the turned pages.
+            let saved = load(loaded.save(&Edits { order: &[0, 1], ..Edits::default() }).unwrap().bytes).unwrap();
+            assert_eq!(saved.form.len(), loaded.form.len());
+            let mut compared = 0;
+            for (turned, read) in loaded.form.iter().flat_map(|f| &f.widgets).zip(saved.form.iter().flat_map(|f| &f.widgets)) {
+                for (turned, read) in turned.rect.iter().zip(read.rect) {
+                    assert!((turned - read).abs() < 1e-3, "turned {quarters}: {:?} for {:?}", turned, read);
+                }
+                assert_eq!((turned.upright, turned.size, turned.rotation), (read.upright, read.size, read.rotation));
+                compared += 1;
+            }
+            assert!(compared > 4);
+        }
+        // A quarter turn stands the first page's fields on end, and rights the one on the page that was turned.
+        let mut loaded = original.clone();
+        (0..2).for_each(|page| loaded.turn(page, 3));
+        let (name, _) = value_of(&loaded.form, "name");
+        assert!(!name.widgets[0].upright && name.widgets[0].rect[2] < name.widgets[0].rect[3]);
+        let (page2, _) = value_of(&loaded.form, "page2");
+        assert!(page2.widgets[0].upright && page2.widgets[0].rect[2] > page2.widgets[0].rect[3]);
     }
 
     /// Fields and their values as another app would read them from `pdf`.
