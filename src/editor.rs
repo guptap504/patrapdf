@@ -11,7 +11,7 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
+    AnyElement, AnyWindowHandle, App, Axis, Bounds, ClickEvent, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable,
     FontWeight, Global, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PathPromptOptions, Pixels, Point, PromptLevel, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Task, WeakEntity, Window, DispatchPhase, actions, anchored, canvas, deferred, div, font, img, point, prelude::*, px, rgb, rgba,
@@ -27,6 +27,7 @@ use crate::fonts::FontBook;
 use crate::forms::{self, FieldKind, FieldValue};
 use crate::pdf::{self, LoadedPdf};
 use crate::recents::{self, RecentEntry};
+use crate::scrollbar::{self, scrollbar};
 use crate::clipboard;
 use crate::search;
 use crate::gestures;
@@ -729,6 +730,13 @@ pub struct Editor {
     /// The first thumbnail as last painted, which the others are placed from
     /// (see `thumb_tops`).
     painted_thumb: Rc<Cell<Option<PaintedThumb>>>,
+    /// The page whose thumbnail the rail was last brought to (see `follow_in_rail`).
+    rail_page: Option<usize>,
+    /// Scroll state of the signature list and of the gallery of recent documents.
+    signatures_scroll: ScrollHandle,
+    gallery_scroll: ScrollHandle,
+    /// The scroll bar being dragged.
+    scrollbar_held: scrollbar::Held,
     /// The zoom the pages were last painted at.
     painted_zoom: Rc<Cell<f32>>,
     pan: Option<PanState>,
@@ -869,6 +877,10 @@ impl Editor {
             painted_scroll: Rc::new(Cell::new(Point::default())),
             thumbs_scroll: ScrollHandle::new(),
             painted_thumb: Rc::default(),
+            rail_page: None,
+            signatures_scroll: ScrollHandle::new(),
+            gallery_scroll: ScrollHandle::new(),
+            scrollbar_held: Rc::default(),
             painted_zoom: Rc::new(Cell::new(0.)),
             pan: None,
             _pinch_task: {
@@ -1152,6 +1164,8 @@ impl Editor {
         self.dirty = false;
         self.render_task = None;
         self.pages_scroll.set_offset(point(px(0.), px(0.)));
+        self.thumbs_scroll.set_offset(point(px(0.), px(0.)));
+        self.rail_page = None;
         self.ensure_rendered(window, cx);
         self.render_thumbnails(window, cx);
         cx.notify();
@@ -2795,6 +2809,33 @@ impl Editor {
             top += height + px(THUMB_GAP);
             block
         }))
+    }
+
+    /// Keep the thumbnail of the page in view in sight: when scrolling the
+    /// document brings another page into view, the rail is scrolled by as
+    /// little as shows that page's thumbnail whole. Only then, so the rail can
+    /// be scrolled away from it to look through the other pages.
+    fn follow_in_rail(&mut self) {
+        let current = self.current_page().filter(|_| self.settings.show_right_sidebar);
+        if current == self.rail_page {
+            return;
+        }
+        if let Some(page) = current {
+            let viewport = self.thumbs_scroll.bounds();
+            let thumb = self.thumb_tops().filter(|_| viewport.size.height > px(0.)).and_then(|mut tops| tops.nth(page));
+            // The rail hasn't been laid out yet (it has just been shown): once it has.
+            let Some((top, height)) = thumb else { return };
+            let margin = px(THUMB_GAP).min((viewport.size.height - height) / 2.).max(px(0.));
+            let shift = if top < viewport.top() + margin {
+                viewport.top() + margin - top
+            } else {
+                (viewport.bottom() - margin - top - height).min(px(0.))
+            };
+            let offset = self.thumbs_scroll.offset();
+            let y = (offset.y + shift).clamp(-self.thumbs_scroll.max_offset().height, px(0.));
+            self.thumbs_scroll.set_offset(point(offset.x, y));
+        }
+        self.rail_page = current;
     }
 
     /// Which thumbnails to draw (see `DRAWN_MARGIN`). The first always is: the
@@ -4747,67 +4788,74 @@ impl Editor {
             )
             .child(
                 div()
-                    .id("sig-list")
-                    .flex()
-                    .flex_col()
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .gap_2()
-                    .px_3()
-                    .pb_3()
-                    .when(empty, |d| {
-                        d.child(
-                            div()
-                                .id("add-sig-empty")
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .gap_2()
-                                .px_4()
-                                .py_5()
-                                .rounded_lg()
-                                .border_1()
-                                .border_dashed()
-                                .border_color(ui::border_strong())
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(ui::surface()).border_color(ui::accent()))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(40.))
-                                        .rounded_full()
-                                        .bg(ui::accent_soft())
-                                        .child(ui::icon("signature", ui::accent()).size(px(20.))),
-                                )
-                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Add your signature"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_center()
-                                        .text_color(ui::text_tertiary())
-                                        .child("PNG or JPG. The paper background is removed automatically."),
-                                )
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_signature_dialog(window, cx))),
-                        )
-                    })
-                    .children(cards)
-                    .when(!empty, |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .gap_1p5()
-                                .pt_1()
-                                .text_xs()
-                                .text_color(ui::text_tertiary())
-                                .child(ui::icon("upload", ui::text_tertiary()).size(px(13.)))
-                                .child("Drag onto a page to sign"),
-                        )
-                    }),
+                    .child(
+                    div()
+                        .id("sig-list")
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.signatures_scroll)
+                        .gap_2()
+                        .px_3()
+                        .pb_3()
+                        .when(empty, |d| {
+                            d.child(
+                                div()
+                                    .id("add-sig-empty")
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_4()
+                                    .py_5()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_dashed()
+                                    .border_color(ui::border_strong())
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(ui::surface()).border_color(ui::accent()))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .size(px(40.))
+                                            .rounded_full()
+                                            .bg(ui::accent_soft())
+                                            .child(ui::icon("signature", ui::accent()).size(px(20.))),
+                                    )
+                                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Add your signature"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_center()
+                                            .text_color(ui::text_tertiary())
+                                            .child("PNG or JPG. The paper background is removed automatically."),
+                                    )
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_signature_dialog(window, cx))),
+                            )
+                        })
+                        .children(cards)
+                        .when(!empty, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_1p5()
+                                    .pt_1()
+                                    .text_xs()
+                                    .text_color(ui::text_tertiary())
+                                    .child(ui::icon("upload", ui::text_tertiary()).size(px(13.)))
+                                    .child("Drag onto a page to sign"),
+                            )
+                        })
+                    )
+                    .child(scrollbar("signatures", Axis::Vertical, false, &self.signatures_scroll, &self.scrollbar_held, cx.entity_id())),
             )
     }
 
@@ -5317,81 +5365,88 @@ impl Editor {
             .child(div().text_xs().text_color(ui::text_tertiary()).child("or drop a file here"));
 
         div()
-            .id("gallery")
+            .relative()
             .flex_1()
             .h_full()
-            .overflow_y_scroll()
-            // Clicking anywhere else leaves the search box (keeping the search).
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.recents_search_focused {
-                        this.recents_search_focused = false;
-                        cx.notify();
-                    }
-                }),
-            )
-            .bg(ui::canvas_bg())
-            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(ui::accent_soft()))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_6()
-                    .px_10()
-                    .py_8()
+                    .id("gallery")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.gallery_scroll)
+                    // Clicking anywhere else leaves the search box (keeping the search).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            if this.recents_search_focused {
+                                this.recents_search_focused = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .bg(ui::canvas_bg())
+                    .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(ui::accent_soft()))
                     .child(
                         div()
                             .flex()
-                            .items_end()
-                            .justify_between()
-                            .gap_4()
+                            .flex_col()
+                            .gap_6()
+                            .px_10()
+                            .py_8()
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
-                                    .gap_1()
+                                    .items_end()
+                                    .justify_between()
+                                    .gap_4()
                                     .child(
                                         div()
-                                            .text_xl()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(ui::text_primary())
-                                            .child("Recent documents"),
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xl()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(ui::text_primary())
+                                                    .child("Recent documents"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(ui::text_secondary())
+                                                    .child("Reopen a document to keep editing. The fields you placed stay editable."),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .text_sm()
-                                            .text_color(ui::text_secondary())
-                                            .child("Reopen a document to keep editing. The fields you placed stay editable."),
+                                            .flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(self.render_recents_search(cx))
+                                            .child(
+                                                ui::icon_button("recents-clear", "trash")
+                                                    .size(px(32.))
+                                                    .tooltip(ui::tooltip("Clear Recents…", None))
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.clear_recents(window, cx))),
+                                            ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(self.render_recents_search(cx))
-                                    .child(
-                                        ui::icon_button("recents-clear", "trash")
-                                            .size(px(32.))
-                                            .tooltip(ui::tooltip("Clear Recents…", None))
-                                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.clear_recents(window, cx))),
-                                    ),
-                            ),
+                            .when(searching && cards.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .py_10()
+                                        .text_center()
+                                        .text_sm()
+                                        .text_color(ui::text_secondary())
+                                        .child(format!("No recent documents match “{}”", self.recents_query.trim())),
+                                )
+                            })
+                            .child(div().flex().flex_wrap().gap_5().when(!searching, |d| d.child(open_tile)).children(cards)),
                     )
-                    .when(searching && cards.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .py_10()
-                                .text_center()
-                                .text_sm()
-                                .text_color(ui::text_secondary())
-                                .child(format!("No recent documents match “{}”", self.recents_query.trim())),
-                        )
-                    })
-                    .child(div().flex().flex_wrap().gap_5().when(!searching, |d| d.child(open_tile)).children(cards)),
             )
+            .child(scrollbar("gallery", Axis::Vertical, false, &self.gallery_scroll, &self.scrollbar_held, cx.entity_id()))
             .into_any_element()
     }
 
@@ -5585,10 +5640,8 @@ impl Editor {
             .id("thumb-rail")
             .flex()
             .flex_col()
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .items_center()
-            .w_full()
             .overflow_y_scroll()
             .track_scroll(&self.thumbs_scroll)
             .gap(px(THUMB_GAP))
@@ -5634,7 +5687,15 @@ impl Editor {
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.add_pages(window, cx))),
                     ),
             )
-            .child(list)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(list)
+                    .child(scrollbar("thumbs", Axis::Vertical, false, &self.thumbs_scroll, &self.scrollbar_held, cx.entity_id())),
+            )
             .into_any_element()
     }
 
@@ -6069,6 +6130,8 @@ impl Editor {
                             .children(page_elements),
                     ),
             )
+            .child(scrollbar("pages", Axis::Vertical, true, &self.pages_scroll, &self.scrollbar_held, cx.entity_id()))
+            .child(scrollbar("pages", Axis::Horizontal, true, &self.pages_scroll, &self.scrollbar_held, cx.entity_id()))
             .children(self.render_find_bar(cx))
             .when_some(hint, |d, (icon_name, text)| {
                 d.child(
@@ -6126,6 +6189,7 @@ impl Render for Editor {
                 self.ensure_rendered(window, cx);
             }
         }
+        self.follow_in_rail();
         // A sidebar came or went: this frame lays the page view out at its new
         // size, and the next one can fit the zoom to it.
         if std::mem::take(&mut self.refit) {
@@ -7693,6 +7757,191 @@ mod tests {
             assert_eq!(e.page_gap_at(top + height / 2. + px(1.)), 3);
             assert_eq!(e.page_gap_at(top - px(1.)), 2);
         });
+    }
+
+    #[gpui::test]
+    fn the_thumbnail_rail_follows_the_page_in_view(cx: &mut TestAppContext) {
+        const PAGES: usize = 40;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-rail.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| {
+            e.settings.show_right_sidebar = true;
+            e.open_path(path, window, cx);
+        });
+        cx.run_until_parked();
+        // Whether a page's thumbnail is in sight, whole.
+        let in_sight = |editor: &Entity<Editor>, cx: &mut VisualTestContext, page: usize| {
+            editor.read_with(cx, |e, _| {
+                let (top, height) = e.thumb_tops().unwrap().nth(page).unwrap();
+                let viewport = e.thumbs_scroll.bounds();
+                top >= viewport.top() && top + height <= viewport.bottom()
+            })
+        };
+        let rail = |editor: &Entity<Editor>, cx: &mut VisualTestContext| editor.read_with(cx, |e, _| e.thumbs_scroll.offset().y);
+        assert!(in_sight(&editor, cx, 0) && !in_sight(&editor, cx, 30));
+        assert_eq!(rail(&editor, cx), px(0.));
+
+        // Scrolling the document down brings the rail along, and back up.
+        editor.update(cx, |e, cx| e.scroll_to_page(30, cx));
+        cx.run_until_parked();
+        assert!(in_sight(&editor, cx, 30), "the rail is at {:?}", rail(&editor, cx));
+        editor.read_with(cx, |e, _| assert!(e.drawn_thumbs()[30], "and the thumbnail is drawn"));
+        editor.update(cx, |e, cx| e.scroll_to_page(12, cx));
+        cx.run_until_parked();
+        assert!(in_sight(&editor, cx, 12) && !in_sight(&editor, cx, 30));
+
+        // With the wheel too, a page at a time.
+        let viewport = editor.read_with(cx, |e, _| e.pages_scroll.bounds());
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-400.))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            let current = editor.read_with(cx, |e, _| e.current_page().unwrap());
+            assert!(in_sight(&editor, cx, current), "page {current}'s thumbnail is out of sight");
+        }
+        let current = editor.read_with(cx, |e, _| e.current_page().unwrap());
+        assert!(current > 20, "the wheel scrolled the document to page {current}");
+
+        // The rail can be scrolled away from that page, to look through the
+        // others: it stays where it's put until another page comes into view.
+        editor.update(cx, |e, cx| {
+            e.thumbs_scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(rail(&editor, cx), px(0.));
+        assert!(!in_sight(&editor, cx, current));
+        editor.update(cx, |e, cx| e.scroll_to_page(current + 1, cx));
+        cx.run_until_parked();
+        assert!(in_sight(&editor, cx, current + 1));
+
+        // Hidden and shown again, it is where the document is.
+        cx.dispatch_action(ToggleRightSidebar);
+        cx.run_until_parked();
+        editor.update(cx, |e, cx| e.scroll_to_page(3, cx));
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleRightSidebar);
+        cx.run_until_parked();
+        assert!(in_sight(&editor, cx, 3), "the rail is at {:?}", rail(&editor, cx));
+
+        // Another document starts at the top.
+        editor.update(cx, |e, cx| e.scroll_to_page(35, cx));
+        cx.run_until_parked();
+        assert!(rail(&editor, cx) < px(0.));
+        let path = test_dir().join("long-rail-2.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.open_path(path, window, cx));
+        cx.run_until_parked();
+        assert_eq!(rail(&editor, cx), px(0.));
+        assert!(in_sight(&editor, cx, 0));
+    }
+
+    #[gpui::test]
+    fn scroll_bars_scroll_the_pages_and_the_rail(cx: &mut TestAppContext) {
+        const PAGES: usize = 40;
+        let (editor, cx) = setup(cx);
+        let path = test_dir().join("long-bars.pdf");
+        std::fs::write(&path, long_pdf(PAGES)).unwrap();
+        editor.update_in(cx, |e, window, cx| {
+            e.settings.show_right_sidebar = true;
+            e.open_path(path, window, cx);
+        });
+        cx.run_until_parked();
+        // Zoomed in, the pages scroll both ways.
+        editor.update_in(cx, |e, window, cx| e.set_zoom(3.0, window, cx));
+        cx.run_until_parked();
+        let pages = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+            editor.read_with(cx, |e, _| (e.pages_scroll.offset(), e.pages_scroll.max_offset(), e.pages_scroll.bounds()))
+        };
+        let (start, max, viewport) = pages(&editor, cx);
+        assert!(max.width > px(0.) && max.height > px(0.));
+        let half = px(scrollbar::STRIP / 2.);
+        let none = Modifiers::none();
+
+        // Pressing the strip down the right edge brings the bar there: near the end of the document.
+        let low = point(viewport.right() - half, viewport.bottom() - px(60.));
+        cx.simulate_mouse_down(low, MouseButton::Left, none);
+        cx.run_until_parked();
+        let (jumped, _, _) = pages(&editor, cx);
+        assert!(jumped.y < -max.height * 0.8 && jumped.x == start.x, "{jumped:?} of {max:?}");
+        editor.read_with(cx, |e, _| assert!(e.pan.is_none() && e.items.is_empty(), "the press is the bar's alone"));
+        // Dragged from there, the document follows: up, down to the end and no further.
+        cx.simulate_mouse_move(low - point(px(0.), px(200.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        let (dragged, _, _) = pages(&editor, cx);
+        assert!(dragged.y > jumped.y && dragged.y < px(0.), "{dragged:?} after {jumped:?}");
+        cx.simulate_mouse_move(low + point(px(-300.), px(900.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0, point(start.x, -max.height));
+        // All the way up, the bar is at the top again.
+        cx.simulate_mouse_move(point(low.x, viewport.top() - px(500.)), MouseButton::Left, none);
+        cx.simulate_mouse_up(point(low.x, viewport.top() - px(500.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0, point(start.x, px(0.)));
+        // Let go, it stays put.
+        cx.simulate_mouse_move(low, None, none);
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0, point(start.x, px(0.)));
+        editor.read_with(cx, |e, _| assert!(e.scrollbar_held.get().is_none()));
+
+        // Taken hold of, the bar doesn't jump: it moves as far as it's dragged.
+        let top = point(viewport.right() - half, viewport.top() + px(10.));
+        cx.simulate_mouse_down(top, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0.y, px(0.));
+        cx.simulate_mouse_move(top + point(px(0.), px(50.)), MouseButton::Left, none);
+        cx.simulate_mouse_up(top + point(px(0.), px(50.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        let (held, _, _) = pages(&editor, cx);
+        assert!(held.y < px(0.) && held.y > -max.height / 2., "{held:?} of {max:?}");
+
+        // The same along the bottom edge, which stops short of the corner.
+        let right = point(viewport.right() - px(60.), viewport.bottom() - half);
+        cx.simulate_mouse_down(right, MouseButton::Left, none);
+        cx.simulate_mouse_move(right + point(px(400.), px(0.)), MouseButton::Left, none);
+        cx.simulate_mouse_up(right + point(px(400.), px(0.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0, point(-max.width, held.y));
+        editor.read_with(cx, |e, _| assert!(e.pan.is_none() && e.items.is_empty()));
+
+        // The wheel scrolls over a bar as anywhere else.
+        cx.simulate_event(ScrollWheelEvent {
+            position: top,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            modifiers: none,
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert_eq!(pages(&editor, cx).0.y, held.y - px(120.));
+
+        // The rail has one too, and scrolling it leaves the document where it is.
+        let (before, _, _) = pages(&editor, cx);
+        let rail = editor.read_with(cx, |e, _| e.thumbs_scroll.bounds());
+        let low = point(rail.right() - half, rail.bottom() - px(40.));
+        cx.simulate_mouse_down(low, MouseButton::Left, none);
+        cx.simulate_mouse_move(low + point(px(0.), px(300.)), MouseButton::Left, none);
+        cx.simulate_mouse_up(low + point(px(0.), px(300.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.thumbs_scroll.offset().y, -e.thumbs_scroll.max_offset().height);
+            assert!(e.drawn_thumbs()[PAGES - 1], "the last thumbnails are drawn");
+            assert_eq!(e.pages_scroll.offset(), before);
+        });
+
+        // At a zoom where everything fits across, there is no bar along the bottom:
+        // a press there is the page view's, as before.
+        editor.update_in(cx, |e, window, cx| e.set_zoom(0.5, window, cx));
+        cx.run_until_parked();
+        let (_, max, viewport) = pages(&editor, cx);
+        assert_eq!(max.width, px(0.));
+        cx.simulate_mouse_down(point(viewport.left() + px(60.), viewport.bottom() - half), MouseButton::Left, none);
+        editor.read_with(cx, |e, _| assert!(e.pan.is_some() && e.scrollbar_held.get().is_none()));
+        cx.simulate_mouse_up(point(viewport.left() + px(60.), viewport.bottom() - half), MouseButton::Left, none);
     }
 
     #[test]

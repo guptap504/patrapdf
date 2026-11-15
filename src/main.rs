@@ -11,6 +11,7 @@ mod gestures;
 mod model;
 mod pdf;
 mod recents;
+mod scrollbar;
 mod search;
 mod settings;
 mod signatures;

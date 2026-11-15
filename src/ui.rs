@@ -89,6 +89,15 @@ pub fn hover_bg() -> Hsla {
 pub fn pressed_bg() -> Hsla {
     pick(0x00000017, 0xffffff24)
 }
+/// A scroll bar: `active` under the pointer, or while it's dragged. A grey
+/// that shows on the canvas and on a page alike, whatever is on the page.
+pub fn scrollbar(active: bool) -> Hsla {
+    if active { pick(0x6a6a70ff, 0x9c9ca4ff) } else { pick(0x8e8e94d9, 0x7a7a82d9) }
+}
+/// The hairline around a scroll bar, which sets it off from a page as grey as it is.
+pub fn scrollbar_edge() -> Hsla {
+    pick(0xffffff80, 0x00000059)
+}
 /// `surface` under the pointer, and pressed. Opaque, unlike `hover_bg`, for
 /// controls that float over other content.
 pub fn surface_hover() -> Hsla {

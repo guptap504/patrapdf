@@ -32,6 +32,11 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.5.2" date="2026-11-15">
+      <description>
+        <p>Scroll bars, and the page thumbnails follow the document as it is scrolled.</p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-11-14">
       <description>
         <p>Select text: drag over the document's text, or double-click a word, and copy it.</p>
