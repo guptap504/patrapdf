@@ -23,7 +23,7 @@ A small desktop app (Rust + [GPUI](https://gpui.rs)) for filling in, signing, re
 - **Copy text.** Pick the Select text tool, drag over the document's text (or double-click a word), and copy it (⌘C / Ctrl+C).
 - **Several documents at once**, each in its own window.
 - **Copy the finished PDF to the clipboard** instead of saving it, and paste it straight into an email, a chat or a folder.
-- **Print** the finished document (⌘P / Ctrl+P). On macOS this is the system's print dialog; on Windows and Linux the finished PDF opens in your PDF viewer, to print from there.
+- **Print** the finished document (⌘P / Ctrl+P) from the system's print dialog. On Linux that is the desktop's own, through its print portal; on a desktop without one, the finished PDF opens in your PDF viewer, to print from there.
 - **Menus** for everything: in the menu bar on macOS, and in a menu bar at the top of each window on Windows and Linux (F10 opens it).
 - **Recents.** Saved documents appear in a searchable gallery and reopen with everything you placed still editable.
 - **Automatic updates** on macOS, Windows and the AppImage, verified against the project's signing key.

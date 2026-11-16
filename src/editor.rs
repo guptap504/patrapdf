@@ -825,7 +825,8 @@ pub struct Editor {
     /// The page whose thumbnail the rail was last brought to (see `follow_in_rail`).
     rail_page: Option<usize>,
     /// Scroll state of the signature list and of the gallery of recent documents.
-    signatures_scroll: ScrollHandle,
+    /// The left pane: the tools and the signatures scroll together.
+    sidebar_scroll: ScrollHandle,
     gallery_scroll: ScrollHandle,
     /// The scroll bar being dragged.
     scrollbar_held: scrollbar::Held,
@@ -987,7 +988,7 @@ impl Editor {
             thumbs_scroll: ScrollHandle::new(),
             painted_thumb: Rc::default(),
             rail_page: None,
-            signatures_scroll: ScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
             gallery_scroll: ScrollHandle::new(),
             scrollbar_held: Rc::default(),
             painted_zoom: Rc::new(Cell::new(0.)),
@@ -1611,7 +1612,7 @@ impl Editor {
     /// The app's menus, for the window to draw: the ones the app set up, as
     /// the system keeps them where it has no menu bar to show them in.
     fn own_menus(&self, cx: &App) -> Vec<OwnedMenu> {
-        cx.get_menus().filter(|menus| !menus.is_empty()).unwrap_or_else(|| app_menus(false).into_iter().map(Menu::owned).collect())
+        cx.get_menus().filter(|menus| !menus.is_empty()).unwrap_or_else(|| app_menus(false, true).into_iter().map(Menu::owned).collect())
     }
 
     /// Open the first of the window's own menus (F10), or close the one that is open.
@@ -2451,12 +2452,17 @@ impl Editor {
             let Ok(parent) = this.update_in(cx, |_, window, _| print::Parent::of(window)) else { return };
             // The dialog is put up from here, not from inside an update: the
             // system may draw the window again while it does.
-            let handed = written.and_then(|written| print::print(&written.bytes, &name, parent));
+            let handed = match written {
+                Ok(written) => print::print(written.bytes, &name, parent).await,
+                Err(e) => Err(e),
+            };
             this.update_in(cx, |this, window, cx| {
                 this.printing = false;
                 match handed {
-                    Ok(None) => this.status = format!("Printing {name}").into(),
-                    Ok(Some(copy)) => {
+                    Ok(print::Outcome::Asked) => this.status = format!("Printing {name}").into(),
+                    Ok(print::Outcome::Sent) => this.status = format!("Sent {name} to the printer").into(),
+                    Ok(print::Outcome::Cancelled) => this.status = format!("{name} was not printed").into(),
+                    Ok(print::Outcome::Kept(copy)) => {
                         cx.open_with_system(&copy);
                         this.status = format!("Opened {name} in your PDF viewer: print it from there").into();
                     }
@@ -4869,13 +4875,6 @@ impl Editor {
                             .tooltip(ui::tooltip(if left_shown { "Hide left sidebar" } else { "Show left sidebar" }, Some("⌘B")))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_left_sidebar(cx))),
                     )
-                    .when(has_doc, |d| {
-                        d.child(
-                            ui::icon_button("home", "grid")
-                                .tooltip(ui::tooltip("All documents", Some("⌘W")))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.request_close(window, cx))),
-                        )
-                    })
                     .child(
                         div()
                             .flex()
@@ -5812,24 +5811,26 @@ impl Editor {
             .collect();
         let empty = cards.is_empty();
 
-        div()
+        // All of the pane scrolls as one, the tools with the signatures: in a
+        // window too short for it, every part of it can still be reached.
+        let rule = || div().flex_none().mx_4().h(px(1.)).bg(ui::border());
+        let list = div()
+            .id("sidebar-list")
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .bg(ui::sidebar_bg())
-            .border_r_1()
-            .border_color(ui::border())
-            .child(self.render_fill_section(cx))
-            .child(div().mx_4().h(px(1.)).bg(ui::border()))
-            .child(self.render_annotate_section(cx))
-            .child(div().mx_4().h(px(1.)).bg(ui::border()))
-            .child(self.render_protect_section(cx))
-            .child(div().mx_4().h(px(1.)).bg(ui::border()))
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .child(div().flex_none().child(self.render_fill_section(cx)))
+            .child(rule())
+            .child(div().flex_none().child(self.render_annotate_section(cx)))
+            .child(rule())
+            .child(div().flex_none().child(self.render_protect_section(cx)))
+            .child(rule())
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .justify_between()
                     .px_4()
@@ -5860,18 +5861,11 @@ impl Editor {
                     ),
             )
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
                     div()
                         .id("sig-list")
                         .flex()
                         .flex_col()
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.signatures_scroll)
+                        .flex_none()
                         .gap_2()
                         .px_3()
                         .pb_3()
@@ -5926,10 +5920,19 @@ impl Editor {
                                     .child(ui::icon("upload", ui::text_tertiary()).size(px(13.)))
                                     .child("Drag onto a page to sign"),
                             )
-                        })
-                    )
-                    .child(scrollbar("signatures", Axis::Vertical, false, &self.signatures_scroll, &self.scrollbar_held, cx.entity_id())),
-            )
+                        }),
+            );
+
+        div()
+            .relative()
+            .flex_none()
+            .w(px(SIDEBAR_W))
+            .h_full()
+            .bg(ui::sidebar_bg())
+            .border_r_1()
+            .border_color(ui::border())
+            .child(list)
+            .child(scrollbar("sidebar", Axis::Vertical, false, &self.sidebar_scroll, &self.scrollbar_held, cx.entity_id()))
     }
 
     fn render_item(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -7645,19 +7648,22 @@ fn stroke_path(bounds: Bounds<Pixels>, points: &[[f32; 2]], line: f32, arrow: Op
 /// The app's menus. macOS shows them in its menu bar; on Windows and Linux,
 /// where there is none, each window has a menu bar of its own (see `render_app_menu`).
 /// `self_updating`: the app can update itself, so there is something to check for.
-pub fn app_menus(self_updating: bool) -> Vec<Menu> {
-    vec![
-        Menu {
-            name: "PatraPDF".into(),
-            items: [MenuItem::action("About PatraPDF", About)]
-                .into_iter()
-                .chain(self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates)))
-                .chain([MenuItem::separator(), MenuItem::action("Quit PatraPDF", Quit)])
-                .collect(),
-        },
+/// `in_window`: they are for a window to draw. A Mac's menu bar starts with a
+/// menu named after the app, for what is about the app itself. Windows and
+/// Linux have no such menu: there the menus start with File, which ends with
+/// leaving the app, and Help has the rest.
+pub fn app_menus(self_updating: bool, in_window: bool) -> Vec<Menu> {
+    let about = || MenuItem::action("About PatraPDF", About);
+    let check_for_updates = || self_updating.then(|| MenuItem::action("Check for Updates…", CheckForUpdates));
+    let own = Menu {
+        name: "PatraPDF".into(),
+        items: [about()].into_iter().chain(check_for_updates()).chain([MenuItem::separator(), MenuItem::action("Quit PatraPDF", Quit)]).collect(),
+    };
+    let leave = [MenuItem::separator(), MenuItem::action(if cfg!(target_os = "windows") { "Exit" } else { "Quit" }, Quit)];
+    let menus = vec![
         Menu {
             name: "File".into(),
-            items: vec![
+            items: [
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("Open…", Open),
                 MenuItem::action("Save As…", Save),
@@ -7665,11 +7671,14 @@ pub fn app_menus(self_updating: bool) -> Vec<Menu> {
                 MenuItem::action("Copy PDF to Clipboard", CopyPdf),
                 MenuItem::action("Print…", Print),
                 MenuItem::action("Discard Changes…", DiscardChanges),
-                MenuItem::action("Close Document", CloseDocument),
+                MenuItem::action("Show All Documents", CloseDocument),
                 MenuItem::separator(),
                 MenuItem::action("Add Pages from PDF…", AddPages),
                 MenuItem::action("Add Signature Image…", AddSignature),
-            ],
+            ]
+            .into_iter()
+            .chain(in_window.then_some(leave).into_iter().flatten())
+            .collect(),
         },
         Menu {
             name: "Edit".into(),
@@ -7723,13 +7732,13 @@ pub fn app_menus(self_updating: bool) -> Vec<Menu> {
         },
         Menu {
             name: "Help".into(),
-            items: vec![
-                MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
-                MenuItem::separator(),
-                MenuItem::action("Visit Website", VisitWebsite),
-            ],
+            items: [MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts), MenuItem::separator(), MenuItem::action("Visit Website", VisitWebsite)]
+                .into_iter()
+                .chain(in_window.then(|| check_for_updates().into_iter().chain([MenuItem::separator(), about()])).into_iter().flatten())
+                .collect(),
         },
-    ]
+    ];
+    (!in_window).then_some(own).into_iter().chain(menus).collect()
 }
 
 /// A key binding as a menu shows it: "Ctrl+Shift+S", or "⇧⌘S" on a Mac.
@@ -7800,7 +7809,7 @@ pub fn bind_keys(cx: &mut App) {
 
 /// Whether windows draw the app's menus themselves: where there is no menu
 /// bar to put them in. (In a debug build a Mac can be made to, to look at them.)
-fn draws_own_menus() -> bool {
+pub fn draws_own_menus() -> bool {
     !cfg!(target_os = "macos") || (cfg!(debug_assertions) && std::env::var_os("PATRAPDF_MENU_BAR").is_some())
 }
 
@@ -7859,6 +7868,32 @@ pub fn request_quit(cx: &mut App) {
     });
 }
 
+/// The size of the first window, on a screen with room for it, and the least a window can be made.
+const FIRST_WINDOW_SIZE: gpui::Size<Pixels> = size(px(1240.), px(900.));
+const LEAST_WINDOW_SIZE: gpui::Size<Pixels> = size(px(760.), px(520.));
+
+/// What of a screen's width and height a window can't have. A screen's bounds
+/// take in the taskbar, and the title bar and frame the system puts around a
+/// window are outside the size the window is asked for: half of this is left
+/// above the window and half below. (A Mac's window has its title bar within
+/// it, and the system keeps it below the menu bar: little is needed there.)
+const SCREEN_TAKEN: gpui::Size<Pixels> = size(px(48.), px(if cfg!(target_os = "macos") { 56. } else { 128. }));
+
+/// The first window, in the middle of the screen with these bounds and no
+/// larger than it has room for: all of it is on the screen, also on a
+/// laptop's that is 768 points high, or fewer.
+fn first_window_bounds(screen: Bounds<Pixels>) -> Bounds<Pixels> {
+    const AROUND: gpui::Size<Pixels> = SCREEN_TAKEN;
+    let fitted = |wanted: Pixels, room: Pixels, least: Pixels| wanted.min(room).max(least.min(wanted));
+    Bounds::centered_at(
+        screen.center(),
+        size(
+            fitted(FIRST_WINDOW_SIZE.width, screen.size.width - AROUND.width, LEAST_WINDOW_SIZE.width),
+            fitted(FIRST_WINDOW_SIZE.height, screen.size.height - AROUND.height, LEAST_WINDOW_SIZE.height),
+        ),
+    )
+}
+
 /// Where a new window goes: a step down and to the right of the one in front, so
 /// that neither hides the other, or the middle of the screen for the first.
 fn new_window_bounds(cx: &mut App) -> Bounds<Pixels> {
@@ -7874,7 +7909,10 @@ fn new_window_bounds(cx: &mut App) -> Bounds<Pixels> {
             .flatten()
     });
     let Some((front, display)) = front else {
-        return Bounds::centered(None, size(px(1240.), px(900.)), cx);
+        return match cx.primary_display() {
+            Some(display) => first_window_bounds(display.bounds()),
+            None => Bounds { origin: point(px(0.), px(0.)), size: FIRST_WINDOW_SIZE },
+        };
     };
     let taken: Vec<Point<Pixels>> =
         cx.windows().into_iter().filter_map(|window| window.update(cx, |_, window, _| window.bounds().origin).ok()).collect();
@@ -7908,7 +7946,7 @@ pub fn open_editor(cx: &mut App, initial: Option<PathBuf>) -> anyhow::Result<gpu
             // do client-side decorations; then the app draws the controls itself.
             window_decorations: Some(gpui::WindowDecorations::Server),
             app_id: Some(crate::about::APP_ID.into()),
-            window_min_size: Some(size(px(760.), px(520.))),
+            window_min_size: Some(LEAST_WINDOW_SIZE),
             ..Default::default()
         },
         |window, cx| {
@@ -9886,17 +9924,27 @@ mod tests {
         cx.run_until_parked();
         let menus = editor.read_with(cx, |e, cx| e.own_menus(cx));
         let names: Vec<&str> = menus.iter().map(|menu| menu.name.as_ref()).collect();
-        assert_eq!(names, ["PatraPDF", "File", "Edit", "View", "Page", "Window", "Help"]);
+        // No menu named after the app, as a Mac's menu bar has: File ends with leaving the app, Help is about it.
+        assert_eq!(names, ["File", "Edit", "View", "Page", "Window", "Help"]);
+        let titles = |menu: &OwnedMenu| commands_of(menu).map(|(_, name, _)| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(titles(&menus[0]).last().map(String::as_str), Some(if cfg!(target_os = "windows") { "Exit" } else { "Quit" }));
+        assert!(titles(&menus[0]).iter().any(|name| name == "Show All Documents"));
+        assert_eq!(titles(&menus[5]), ["Keyboard Shortcuts", "Visit Website", "About PatraPDF"]);
+        let updating: Vec<OwnedMenu> = app_menus(true, true).into_iter().map(Menu::owned).collect();
+        assert_eq!(titles(&updating[5]), ["Keyboard Shortcuts", "Visit Website", "Check for Updates…", "About PatraPDF"]);
+        let bar: Vec<OwnedMenu> = app_menus(true, false).into_iter().map(Menu::owned).collect();
+        assert_eq!(titles(&bar[0]), ["About PatraPDF", "Check for Updates…", "Quit PatraPDF"]);
+        assert_eq!((titles(&bar[1]).last().map(String::as_str), titles(&bar[6]).len()), (Some("Add Signature Image…"), 2));
 
         // The menu key opens the first menu; the arrows go along the bar (and round it), and down a menu.
         cx.dispatch_action(OpenAppMenu);
         cx.run_until_parked();
         assert_eq!(open(cx), (Some(0), None));
         cx.simulate_keystrokes("left");
-        assert_eq!(open(cx), (Some(6), None));
-        cx.simulate_keystrokes("right right");
-        assert_eq!(open(cx), (Some(1), None));
-        let file: Vec<(usize, &str)> = commands_of(&menus[1]).map(|(n, name, _)| (n, name)).collect();
+        assert_eq!(open(cx), (Some(5), None));
+        cx.simulate_keystrokes("right");
+        assert_eq!(open(cx), (Some(0), None));
+        let file: Vec<(usize, &str)> = commands_of(&menus[0]).map(|(n, name, _)| (n, name)).collect();
         cx.simulate_keystrokes("up");
         assert_eq!(open(cx).1, file.last().map(|(n, _)| *n), "up from the top is the last item, past the separator");
         cx.simulate_keystrokes("down");
@@ -9927,6 +9975,24 @@ mod tests {
         assert_eq!(keys("f10", false), "F10");
         assert_eq!(keys("cmd-shift-z", true), "⇧⌘Z");
         assert_eq!(keys("cmd-alt-g", true), "⌥⌘G");
+    }
+
+    #[test]
+    fn the_first_window_is_no_larger_than_the_screen_has_room_for() {
+        let on = |width: f32, height: f32| first_window_bounds(Bounds { origin: point(px(100.), px(50.)), size: size(px(width), px(height)) });
+        // A large screen: the size it is meant to be, in the middle.
+        let large = on(2560., 1440.);
+        assert_eq!((large.size, large.center()), (FIRST_WINDOW_SIZE, point(px(1380.), px(770.))));
+        // A laptop's, or one scaled up: all of the window is on it, with room for a taskbar and a title bar.
+        for (width, height) in [(1366., 768.), (1280., 720.), (1536., 864.), (1024., 768.)] {
+            let (screen, window) = (Bounds { origin: point(px(100.), px(50.)), size: size(px(width), px(height)) }, on(width, height));
+            assert!(window.size.width <= FIRST_WINDOW_SIZE.width && window.size.height <= FIRST_WINDOW_SIZE.height, "{window:?}");
+            let (above, below) = (window.top() - screen.top(), screen.bottom() - window.bottom());
+            assert!(above >= SCREEN_TAKEN.height / 2. && below >= SCREEN_TAKEN.height / 2., "{window:?} on {screen:?}");
+            assert!(window.left() >= screen.left() && window.right() <= screen.right(), "{window:?} on {screen:?}");
+        }
+        // Never smaller than a window can be made.
+        assert_eq!(on(640., 480.).size, LEAST_WINDOW_SIZE);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "patrapdf"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fill in, sign, redact and watermark PDFs on your own computer."
@@ -33,15 +33,26 @@ subsetter = "0.2.6"
 unicode-bidi = "0.3"
 getrandom = "0.3"
 arboard = { version = "3.7.0", default-features = false }
+# The window a system dialog is shown on, as the system knows it. GPUI already uses this crate.
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 
-# Trackpad pinch-to-zoom, sent to the window it was made over. GPUI already uses
-# objc 0.2 and raw-window-handle 0.6, so these add no new crate.
+# Trackpad pinch-to-zoom, sent to the window it was made over, and the print
+# dialog. GPUI already uses objc 0.2, so this adds no new crate.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
-raw-window-handle = "0.6"
+
+# The print dialog, and what goes to the printer chosen in it. GPUI already
+# uses this version of the crate: these are a few more of its modules.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs"] }
+
+# The desktop's print dialog, through its portal. GPUI already uses this
+# version of the crate, set up the same way, for the Open and Save dialogs.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
 
 # Windows: icon and version info in the .exe (see build.rs).
 [target.'cfg(windows)'.build-dependencies]

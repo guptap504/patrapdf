@@ -4296,10 +4296,11 @@ dependencies = [
 
 [[package]]
 name = "patrapdf"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "ashpd 0.11.1",
  "chrono",
  "fontdb 0.23.0",
  "futures",
@@ -4320,6 +4321,7 @@ dependencies = [
  "subsetter",
  "unicode-bidi",
  "ureq",
+ "windows 0.61.3",
  "winresource",
  "zip",
 ]

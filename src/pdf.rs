@@ -351,6 +351,34 @@ impl RenderedPage {
     }
 }
 
+/// A finished PDF as pictures of its pages: for a printer that is told what
+/// goes on the paper dot by dot, as Windows' are.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct Pictures(Pdf);
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl Pictures {
+    pub fn of(bytes: Vec<u8>) -> Result<Self> {
+        Pdf::new(bytes).map(Self).map_err(|e| anyhow!("could not read the PDF to print: {e:?}"))
+    }
+
+    /// The width and height of each page in points, as it is shown.
+    pub fn sizes(&self) -> Vec<(f32, f32)> {
+        self.0.pages().iter().map(|page| page.render_dimensions()).collect()
+    }
+
+    /// A page drawn at `scale` pixels to the point.
+    pub fn page(&self, index: usize, scale: f32) -> Option<RenderedPage> {
+        render_page(&self.0, index, scale)
+    }
+}
+
+// (They are drawn on a thread of their own.)
+const _: fn() = || {
+    fn sent_between_threads<T: Send>() {}
+    sent_between_threads::<Pictures>();
+};
+
 pub fn render_page(pdf: &Pdf, index: usize, scale: f32) -> Option<RenderedPage> {
     render(pdf, &RenderCache::new(), index, scale, false)
 }
@@ -1848,6 +1876,20 @@ pub(crate) mod tests {
     use crate::model::Signature;
 
     /// Two pages: a plain Letter page, and a rotated page with an offset crop box.
+    #[test]
+    fn a_finished_pdf_is_drawn_page_by_page_for_a_printer_that_takes_pictures() {
+        let pictures = Pictures::of(sample_pdf()).unwrap();
+        let sizes = pictures.sizes();
+        assert!(!sizes.is_empty());
+        for (index, (width, height)) in sizes.iter().enumerate() {
+            let page = pictures.page(index, 2.).expect("the page is drawn");
+            assert_eq!((page.width, page.height), ((width * 2.).round() as u32, (height * 2.).round() as u32));
+            assert_eq!(page.bgra.len(), (page.width * page.height * 4) as usize);
+        }
+        assert!(pictures.page(sizes.len(), 1.).is_none());
+        assert!(Pictures::of(b"not a pdf".to_vec()).is_err());
+    }
+
     pub(crate) fn sample_pdf() -> Vec<u8> {
         let mut doc = Document::with_version("1.7");
         let pages_id = doc.new_object_id();

@@ -63,7 +63,7 @@ fn main() {
                 }
             })
         });
-        cx.set_menus(editor::app_menus(self_updating));
+        cx.set_menus(editor::app_menus(self_updating, editor::draws_own_menus()));
 
         if let Err(e) = editor::open_editor(cx, initial) {
             eprintln!("failed to open window: {e:#}");

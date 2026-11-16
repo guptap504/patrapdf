@@ -32,6 +32,14 @@
     <mediatype>application/pdf</mediatype>
   </provides>
   <releases>
+    <release version="0.8.0" date="2026-11-16">
+      <description>
+        <p>Print from the system's print dialog on Windows and Linux too. Where a Linux desktop has none, the finished PDF still opens in your PDF viewer.</p>
+        <p>On Windows and Linux the menus start with File: leaving the app is at the end of it, and checking for updates and About are in Help.</p>
+        <p>The first window is no larger than the screen has room for, and all of the left pane scrolls, not only the signatures.</p>
+        <p>Show All Documents is in the File menu, no longer a button in the toolbar.</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-11-15">
       <description>
         <p>Clean up scans and photos of pages, as a phone's scanner does: crop a page by dragging its corners, and it is pulled straight.</p>
